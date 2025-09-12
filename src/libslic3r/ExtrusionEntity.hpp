@@ -141,6 +141,9 @@ public:
     // Orca: Used for inner/outer/inner mode - classic perimeter generator
     int inset_idx = -1;
 
+    // PPS: This part is necessary to determine the filling line in the wall generation sequence (Odd-Even). It is used to change the extrusion density and speed.
+    bool  is_even = 0;
+
     static std::string role_to_string(ExtrusionRole role);
     static ExtrusionRole string_to_role(const std::string_view role);
 };
@@ -157,7 +160,9 @@ public:
     float width;
     // Height of the extrusion, used for visualization purposes.
     float height;
-
+    // PPS: This part is necessary to determine the filling line in the wall generation sequence (Odd-Even).
+    // It is used to change the extrusion density and speed of any inner walls.
+    bool is_even = 0;
     //These properties are just for staggered perimeter production.
     float z_offset; //z_offset to be multiplied to the layer height, default is 0
     float extrusion_multiplier; //increase in extrusion, default is 1
@@ -176,6 +181,7 @@ public:
         , m_no_extrusion(rhs.m_no_extrusion)
 		, z_offset(rhs.z_offset)
 		, extrusion_multiplier(rhs.extrusion_multiplier)
+        , is_even(rhs.is_even)
     {}
     ExtrusionPath(ExtrusionPath &&rhs)
         : polyline(std::move(rhs.polyline))
@@ -187,6 +193,7 @@ public:
         , m_no_extrusion(rhs.m_no_extrusion)
 		, z_offset(rhs.z_offset)
 		, extrusion_multiplier(rhs.extrusion_multiplier)
+        , is_even(rhs.is_even)
     {}
     ExtrusionPath(const Polyline &polyline, const ExtrusionPath &rhs)
         : polyline(polyline)
@@ -198,6 +205,7 @@ public:
         , m_no_extrusion(rhs.m_no_extrusion)
 		, z_offset(rhs.z_offset)
 		, extrusion_multiplier(rhs.extrusion_multiplier)
+        , is_even(rhs.is_even)
     {}
     ExtrusionPath(Polyline &&polyline, const ExtrusionPath &rhs)
         : polyline(std::move(polyline))
@@ -209,6 +217,7 @@ public:
         , m_no_extrusion(rhs.m_no_extrusion)
 		, z_offset(rhs.z_offset)
 		, extrusion_multiplier(rhs.extrusion_multiplier)
+        , is_even(rhs.is_even)
     {}
 
     ExtrusionPath& operator=(const ExtrusionPath& rhs) {
@@ -221,6 +230,7 @@ public:
         this->polyline = rhs.polyline;
         this->z_offset = rhs.z_offset;
         this->extrusion_multiplier = rhs.extrusion_multiplier;
+        this->is_even = rhs.is_even;
         return *this;
     }
     ExtrusionPath& operator=(ExtrusionPath&& rhs) {
@@ -233,6 +243,7 @@ public:
         this->polyline = std::move(rhs.polyline);
         this->z_offset = rhs.z_offset;
         this->extrusion_multiplier = rhs.extrusion_multiplier;
+        this->is_even = rhs.is_even;
         return *this;
     }
 
