@@ -41,6 +41,9 @@ ctest --test-dir ./tests/fff_print
 - Core algorithms: `src/libslic3r/` (GCode/, Fill/, Support/, Geometry/, Format/, Arachne/)
 - Printer profiles: `resources/profiles/[manufacturer].json`
 
+The pipeline steps, where a new setting has to be registered, and the rules for printing at more than
+one Z within a layer are in [src/libslic3r/AGENTS.md](src/libslic3r/AGENTS.md).
+
 ## Critical Constraints
 
 - **Backward compatibility required** for .3mf project files and printer profiles
