@@ -97,6 +97,25 @@ static bool detect_steep_overhang(const PrintRegionConfig *config,
     return false;
 }
 
+// ORCA: sub-layered walls. The band passes print the outermost walls at sub-layer heights, so drop
+// them from the layer's own perimeters once the wall ordering has been applied - that way the kept
+// walls stay in the order wall_sequence asked for. Thin walls carry no inset index and come from the
+// outermost onion step, so the band passes own those too.
+static void drop_sublayer_band_walls(ExtrusionEntityCollection &entities, int drop)
+{
+    if (drop <= 0)
+        return;
+    ExtrusionEntitiesPtr kept;
+    kept.reserve(entities.entities.size());
+    for (ExtrusionEntity *entity : entities.entities) {
+        if (entity->inset_idx >= drop)
+            kept.emplace_back(entity);
+        else
+            delete entity;
+    }
+    entities.entities = std::move(kept);
+}
+
 static ExtrusionEntityCollection traverse_loops(const PerimeterGenerator &perimeter_generator, const PerimeterGeneratorLoops &loops, ThickPolylines &thin_walls,
     bool &steep_overhang_contour, bool &steep_overhang_hole, bool reverse_thin_wall_hole)
 {
@@ -563,6 +582,11 @@ static ExtrusionEntityCollection traverse_extrusions(const PerimeterGenerator& p
                 }
                 assert(extrusion_loop.paths.front().first_point() == extrusion_loop.paths.back().last_point());
                 extrusion_coll.append(std::move(extrusion_loop));
+                // ORCA: carry the wall's distance from the surface onto the emitted entity, as the
+                // classic generator does. It cannot be recovered from the role, which does not
+                // distinguish a first inner wall from a second. Set before the reversal below, which
+                // permutes the collection.
+                extrusion_coll.entities.back()->inset_idx = extrusion->inset_idx;
                 // Orca: Reverse the order of paths for thin wall holes. We define thin wall hole as a hole with only one perimeter.
                 const bool thin_wall_hole = !pg_extrusion.is_contour && pg_extrusions.size() == 2;
                 if (thin_wall_hole && perimeter_generator.config->wall_sequence != WallSequence::OuterInner)
@@ -582,12 +606,14 @@ static ExtrusionEntityCollection traverse_extrusions(const PerimeterGenerator& p
                 for (auto it_path = std::next(paths.begin()); it_path != paths.end(); ++it_path) {
                     if (multi_path.paths.back().last_point() != it_path->first_point()) {
                         extrusion_coll.append(ExtrusionMultiPath(std::move(multi_path)));
+                        extrusion_coll.entities.back()->inset_idx = extrusion->inset_idx;
                         multi_path = ExtrusionMultiPath();
                     }
                     multi_path.paths.emplace_back(std::move(*it_path));
                 }
 
                 extrusion_coll.append(ExtrusionMultiPath(std::move(multi_path)));
+                extrusion_coll.entities.back()->inset_idx = extrusion->inset_idx;
             }
         }
     }
@@ -1263,6 +1289,9 @@ std::tuple<std::vector<ExtrusionPaths>, Polygons> generate_extra_perimeters_over
 
 void PerimeterGenerator::apply_extra_perimeters(ExPolygons &infill_area)
 {
+    // ORCA: extra overhang perimeters cover the infill area, which the core pass owns.
+    if (this->sublayer_band_walls > 0)
+        return;
     if (!m_spiral_vase && this->lower_slices != nullptr && this->config->detect_overhang_wall && this->config->extra_perimeters_on_overhangs &&
         this->config->wall_loops > 0 && this->layer_id > this->object_config->raft_layers) {
         // Generate extra perimeters on overhang areas, and cut them to these parts only, to save print time and material
@@ -1399,8 +1428,10 @@ void PerimeterGenerator::process_classic()
     // ORCA: neither one-wall option has a surface to act on without the shell behind it, see
     // has_top_shell_layers() / has_bottom_shell_layers(). Gated here so every use below - including the
     // topmost and first layers - sees the same answer.
-    const bool only_one_wall_top         = this->config->only_one_wall_top && has_top_shell_layers(*this->config);
-    const bool only_one_wall_first_layer = this->config->only_one_wall_first_layer && has_bottom_shell_layers(*this->config);
+    // ORCA: a band pass generates a fixed number of outermost walls from a sub-slice of the layer;
+    // both one-wall options reduce the wall count of the layer as a whole, so the core pass owns them.
+    const bool only_one_wall_top         = this->sublayer_band_walls == 0 && this->config->only_one_wall_top && has_top_shell_layers(*this->config);
+    const bool only_one_wall_first_layer = this->sublayer_band_walls == 0 && this->config->only_one_wall_first_layer && has_bottom_shell_layers(*this->config);
     for (size_t order_idx = 0; order_idx < surface_order.size(); order_idx++) {
         const Surface &surface = all_surfaces[surface_order[order_idx]];
         // detect how many perimeters must be generated for this island
@@ -1408,6 +1439,9 @@ void PerimeterGenerator::process_classic()
         int sparse_infill_density = this->config->sparse_infill_density.value;
         if (this->config->alternate_extra_wall && this->layer_id % 2 == 1 && !m_spiral_vase && sparse_infill_density > 0) // add alternating extra wall
             loop_number++;
+        // ORCA: a band pass only produces the outermost walls, which the core pass then drops.
+        if (this->sublayer_band_walls > 0)
+            loop_number = std::min(loop_number, this->sublayer_band_walls - 1);
         if (this->layer_id == object_config->raft_layers && only_one_wall_first_layer)
             loop_number = 0;
         // Set the topmost layer to be one wall
@@ -1512,7 +1546,9 @@ void PerimeterGenerator::process_classic()
                         -float(distance + min_spacing / 2. - 1.),
                         float(min_spacing / 2. - 1.));
                     // look for gaps
-                    if (has_gap_fill)
+                    // ORCA: the gaps behind a wall the band passes print belong to those passes, which
+                    // rediscover them from their own sub-slice and fill them at the sub-layer height.
+                    if (has_gap_fill && i > this->sublayer_drop_walls)
                         // not using safety offset here would "detect" very narrow gaps
                         // (but still long enough to escape the area threshold) that gap fill
                         // won't be able to fill but we'd still remove from infill area
@@ -1804,6 +1840,8 @@ void PerimeterGenerator::process_classic()
                 }
             }
             
+            drop_sublayer_band_walls(entities, this->sublayer_drop_walls);
+
             // append perimeters for this slice as a collection
             if (! entities.empty())
                 this->loops->append(entities);
@@ -1978,6 +2016,10 @@ void PerimeterGenerator::add_infill_contour_for_arachne( ExPolygons        infil
 // Orca: sacrificial bridge layer algorithm ported from SuperSlicer
 void PerimeterGenerator::process_no_bridge(Surfaces& all_surfaces, coord_t perimeter_spacing, coord_t ext_perimeter_width)
 {
+    // ORCA: counterbore hole bridging reshapes the surfaces to support the infill above them, which
+    // the core pass owns; a band pass must keep the sub-slice contour it was handed.
+    if (this->sublayer_band_walls > 0)
+        return;
 
     if (this->config->counterbore_hole_bridging == chbNone)
         return; // return if counterbore hole is not enabled
@@ -2382,8 +2424,10 @@ void PerimeterGenerator::process_arachne()
     // ORCA: neither one-wall option has a surface to act on without the shell behind it, see
     // has_top_shell_layers() / has_bottom_shell_layers(). Gated here so every use below - including the
     // topmost and first layers - sees the same answer.
-    const bool only_one_wall_top         = this->config->only_one_wall_top && has_top_shell_layers(*this->config);
-    const bool only_one_wall_first_layer = this->config->only_one_wall_first_layer && has_bottom_shell_layers(*this->config);
+    // ORCA: a band pass generates a fixed number of outermost walls from a sub-slice of the layer;
+    // both one-wall options reduce the wall count of the layer as a whole, so the core pass owns them.
+    const bool only_one_wall_top         = this->sublayer_band_walls == 0 && this->config->only_one_wall_top && has_top_shell_layers(*this->config);
+    const bool only_one_wall_first_layer = this->sublayer_band_walls == 0 && this->config->only_one_wall_first_layer && has_bottom_shell_layers(*this->config);
     // we need to process each island separately because we might have different
     // extra perimeters for each one
     for (const Surface& surface : all_surfaces) {
@@ -2393,6 +2437,9 @@ void PerimeterGenerator::process_arachne()
         int sparse_infill_density = this->config->sparse_infill_density.value;
         if (this->config->alternate_extra_wall && this->layer_id % 2 == 1 && !m_spiral_vase && sparse_infill_density > 0) // add alternating extra wall
             loop_number++;
+        // ORCA: a band pass only produces the outermost walls, which the core pass then drops.
+        if (this->sublayer_band_walls > 0)
+            loop_number = std::min(loop_number, this->sublayer_band_walls - 1);
 
         // Set the bottommost layer to be one wall
         const bool is_bottom_layer = (this->layer_id == object_config->raft_layers) ? true : false;
@@ -2742,7 +2789,9 @@ void PerimeterGenerator::process_arachne()
                 reorient_perimeters(extrusion_coll, steep_overhang_contour, steep_overhang_hole,
                                     this->config->overhang_reverse_internal_only);
             }
-            this->loops->append(extrusion_coll);
+            drop_sublayer_band_walls(extrusion_coll, this->sublayer_drop_walls);
+            if (! extrusion_coll.empty())
+                this->loops->append(extrusion_coll);
         }
 
         const coord_t spacing = (perimeters.size() == 1) ? ext_perimeter_spacing2 : perimeter_spacing;

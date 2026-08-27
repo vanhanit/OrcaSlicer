@@ -82,6 +82,7 @@ void LayerRegion::slices_to_fill_surfaces_clipped()
 void LayerRegion::make_perimeters(const SurfaceCollection &slices, const LayerRegionPtrs &compatible_regions, SurfaceCollection* fill_surfaces, ExPolygons* fill_no_overlap)
 {
     this->perimeters.clear();
+    this->sublayer_perimeters.clear();
     this->thin_fills.clear();
 
     const PrintConfig       &print_config  = this->layer()->object()->print()->config();
@@ -135,10 +136,76 @@ void LayerRegion::make_perimeters(const SurfaceCollection &slices, const LayerRe
     g.overhang_flow         = this->bridging_flow(frPerimeter, object_config.thick_bridges);
     g.solid_infill_flow     = this->flow(frSolidInfill);
 
-    if (this->layer()->object()->config().wall_generator.value == PerimeterGeneratorType::Arachne && !spiral_mode)
+    const bool arachne = this->layer()->object()->config().wall_generator.value == PerimeterGeneratorType::Arachne && !spiral_mode;
+
+    // Orca: sub-layered walls. The band passes below print the outermost loops at the sub-layer
+    // heights, so the core run must not emit them as well.
+    const int band_walls = this->layer()->wall_sub_slices.empty() || spiral_mode
+        ? 0
+        : std::clamp(region_config.wall_sublayer_loops.value, 0, region_config.wall_loops.value);
+    g.sublayer_drop_walls = band_walls;
+
+    if (arachne)
         g.process_arachne();
     else
         g.process_classic();
+
+    if (band_walls == 0)
+        return;
+
+    // One wall generator run per sub-layer, each fed the mesh re-sliced at that sub-layer's height.
+    // Overhangs and bridges are classified against the sub-layer below, so a wall that is supported
+    // by the pass beneath it is no longer treated as an overhang of the whole layer.
+    const Layer *layer = this->layer();
+    this->sublayer_perimeters.resize(layer->wall_sub_slices.size());
+    for (size_t k = 0; k < layer->wall_sub_slices.size(); ++ k) {
+        const WallSubSlice &sub = layer->wall_sub_slices[k];
+
+        ExPolygons band_expolygons;
+        for (const LayerRegion *layerm : compatible_regions) {
+            const int band_region_id = layerm->region().print_object_region_id();
+            if (band_region_id >= 0 && size_t(band_region_id) < sub.region_slices.size())
+                append(band_expolygons, sub.region_slices[band_region_id]);
+        }
+        if (band_expolygons.empty())
+            continue;
+
+        SurfaceCollection band_slices;
+        band_slices.append(offset_ex(union_ex(band_expolygons), ClipperSafetyOffset), stInternal);
+
+        // Discarded: the fill areas and the extra perimeters belong to the core run, which sees the
+        // whole layer. Only the gap fill is kept, appended after the walls of this same sub-layer.
+        ExtrusionEntityCollection band_gap_fill;
+        SurfaceCollection         band_fill_surfaces;
+        ExPolygons                band_fill_no_overlap;
+
+        PerimeterGenerator bg(
+            &band_slices, &compatible_regions, sub.height, sub.slice_z, this->flow(frPerimeter, sub.height),
+            &region_config, &object_config, &print_config, spiral_mode, model_rotation_rad,
+            &this->sublayer_perimeters[k], &band_gap_fill, &band_fill_surfaces, &band_fill_no_overlap);
+
+        bg.lower_slices = k > 0                                          ? &layer->wall_sub_slices[k - 1].merged
+            : layer->lower_layer == nullptr                              ? nullptr
+            : layer->lower_layer->wall_sub_slices.empty()                ? &layer->lower_layer->lslices
+                                                                         : &layer->lower_layer->wall_sub_slices.back().merged;
+        if (layer->upper_layer != nullptr) {
+            bg.upper_slices             = &layer->upper_layer->lslices;
+            bg.upper_slices_same_region = &layer->upper_layer->get_region(region_id)->slices;
+        }
+        bg.layer_id              = (int) layer->id();
+        bg.sublayer_band_walls   = band_walls;
+        bg.ext_perimeter_flow    = this->flow(frExternalPerimeter, sub.height);
+        // Bridge flow is a thread diameter rather than a layer height, so it is not scaled down.
+        bg.overhang_flow         = this->bridging_flow(frPerimeter, object_config.thick_bridges);
+        bg.solid_infill_flow     = this->flow(frSolidInfill, sub.height);
+
+        if (arachne)
+            bg.process_arachne();
+        else
+            bg.process_classic();
+
+        this->sublayer_perimeters[k].append(std::move(band_gap_fill.entities));
+    }
 }
 
 #if 1
