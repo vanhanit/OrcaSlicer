@@ -1,0 +1,355 @@
+#include <catch2/catch_all.hpp>
+
+#include "libslic3r/libslic3r.h"
+#include "libslic3r/GCodeReader.hpp"
+#include "libslic3r/Layer.hpp"
+#include "libslic3r/Print.hpp"
+
+#include "test_helpers.hpp"
+
+#include <algorithm>
+#include <string>
+#include <vector>
+
+using namespace Slic3r;
+using namespace Slic3r::Test;
+
+namespace {
+
+// The extruding Z values of one layer, in the order they are printed, split on the layer change tag
+// the G-code carries once per layer. Consecutive duplicates are collapsed, so each entry is a Z the
+// nozzle actually moved to in order to print something.
+std::vector<std::vector<double>> extruding_zs_per_layer(const std::string &gcode)
+{
+    std::vector<std::vector<double>> layers;
+    GCodeReader                      reader;
+    reader.parse_buffer(gcode, [&layers](GCodeReader &self, const GCodeReader::GCodeLine &line) {
+        if (line.comment().find("LAYER_CHANGE") != std::string_view::npos) {
+            layers.emplace_back();
+            return;
+        }
+        if (layers.empty() || ! line.extruding(self))
+            return;
+        const double z = self.z();
+        if (layers.back().empty() || layers.back().back() != z)
+            layers.back().emplace_back(z);
+    });
+    return layers;
+}
+
+// Distinct Z values of one layer, ascending.
+std::vector<double> distinct_sorted(std::vector<double> zs)
+{
+    std::sort(zs.begin(), zs.end());
+    zs.erase(std::unique(zs.begin(), zs.end()), zs.end());
+    return zs;
+}
+
+// Smallest X reached while extruding at each Z, which tracks how far the outer wall has moved inward.
+std::map<double, double> min_x_by_z(const std::string &gcode)
+{
+    std::map<double, double> min_x;
+    GCodeReader              reader;
+    reader.parse_buffer(gcode, [&min_x](GCodeReader &self, const GCodeReader::GCodeLine &line) {
+        if (! line.extruding(self) || line.dist_XY(self) <= 0)
+            return;
+        const double z = self.z();
+        auto         it = min_x.find(z);
+        if (it == min_x.end())
+            min_x.emplace(z, self.x());
+        else
+            it->second = std::min(it->second, double(self.x()));
+    });
+    return min_x;
+}
+
+// 0.2mm layers with z_hop off, so a recorded Z is always a printing Z.
+DynamicPrintConfig base_config(const char *sublayer_height, const char *wall_generator)
+{
+    DynamicPrintConfig config = DynamicPrintConfig::full_print_config();
+    config.set_deserialize_strict({{"layer_height", "0.2"},
+                                   {"initial_layer_print_height", "0.2"},
+                                   {"wall_loops", "3"},
+                                   {"z_hop", "0"},
+                                   {"skirt_loops", "0"},
+                                   {"wall_generator", wall_generator},
+                                   {"wall_sublayer_height", sublayer_height}});
+    return config;
+}
+
+} // namespace
+
+TEST_CASE("Sub-layered walls leave the G-code unchanged when disabled", "[WallSublayers]")
+{
+    // The regression guarantee: with the feature off, every move must be exactly what it was before
+    // the feature existed. Comments carrying the export timestamp and the process-wide object id
+    // counter differ between any two slices, so compare the commands only.
+    auto commands = [](const std::string &gcode) {
+        std::vector<std::string> out;
+        GCodeReader              reader;
+        reader.parse_buffer(gcode, [&out](GCodeReader &, const GCodeReader::GCodeLine &line) {
+            if (! line.cmd().empty())
+                out.emplace_back(line.raw());
+        });
+        return out;
+    };
+
+    const std::string with_defaults = slice({cube(20)}, {{"layer_height", "0.2"}, {"z_hop", "0"}});
+    const std::string explicitly_off =
+        slice({cube(20)}, {{"layer_height", "0.2"}, {"z_hop", "0"}, {"wall_sublayer_height", "0"}, {"wall_sublayer_loops", "1"}});
+
+    REQUIRE(! with_defaults.empty());
+    CHECK(commands(with_defaults) == commands(explicitly_off));
+}
+
+TEST_CASE("Sub-layered walls print each layer at several ascending Z heights", "[WallSublayers]")
+{
+    const auto wall_generator = GENERATE("arachne", "classic");
+    // 0.2mm layers split by a 0.05mm sub-layer height give 4 passes of 0.05mm each.
+    const std::string gcode = slice({cube(20)}, base_config("0.05", wall_generator));
+    REQUIRE(! gcode.empty());
+
+    const auto layers = extruding_zs_per_layer(gcode);
+    REQUIRE(layers.size() > 2);
+
+    INFO("wall_generator=" << wall_generator);
+    // The first layer is bonded to the bed and is never subdivided.
+    CHECK(distinct_sorted(layers.front()).size() == 1);
+
+    const std::vector<double> zs = distinct_sorted(layers[1]);
+    REQUIRE(zs.size() == 4);
+    for (int k = 0; k < 4; ++ k)
+        REQUIRE_THAT(zs[k], Catch::Matchers::WithinAbs(0.2 + 0.05 * (k + 1), 1e-6));
+    // The topmost pass lands exactly on the layer's own print_z, so the walls finish flush with the
+    // inner walls and the infill printed there.
+    REQUIRE_THAT(zs.back(), Catch::Matchers::WithinAbs(0.4, 1e-6));
+}
+
+TEST_CASE("Sub-layered walls never move the nozzle back down within a layer", "[WallSublayers]")
+{
+    // The collision-avoidance contract: Z is monotonically non-decreasing across a whole layer,
+    // supports included, so the nozzle never crosses material it has already laid.
+    const std::string gcode = slice({TestMesh::overhang}, {{"layer_height", "0.2"},
+                                                           {"initial_layer_print_height", "0.2"},
+                                                           {"wall_loops", "3"},
+                                                           {"z_hop", "0"},
+                                                           {"enable_support", "1"},
+                                                           {"wall_sublayer_height", "0.1"}});
+    REQUIRE(! gcode.empty());
+
+    const auto layers = extruding_zs_per_layer(gcode);
+    REQUIRE(layers.size() > 2);
+    for (size_t i = 0; i < layers.size(); ++ i) {
+        for (size_t k = 1; k < layers[i].size(); ++ k) {
+            INFO("layer " << i << " step " << k << ": " << layers[i][k - 1] << " -> " << layers[i][k]);
+            REQUIRE(layers[i][k] >= layers[i][k - 1] - EPSILON);
+        }
+    }
+}
+
+TEST_CASE("Sub-layered walls report the sub-layer height rather than the layer height", "[WallSublayers]")
+{
+    // The height tag drives the preview and the time estimate, so a thinner pass has to say so.
+    const std::string gcode = slice({cube(20)}, base_config("0.05", "arachne"));
+
+    REQUIRE(! gcode.empty());
+    CHECK(gcode.find(";HEIGHT:0.05") != std::string::npos);
+    CHECK(gcode.find(";HEIGHT:0.2") != std::string::npos);
+}
+
+TEST_CASE("Sub-layered walls follow the model between sub-layers on a slope", "[WallSublayers]")
+{
+    // The point of re-slicing: on a sloped surface each pass must sit at its own contour rather than
+    // repeat the layer's. A pyramid narrows with height, so within one layer each successive pass has
+    // to start further inward than the one below it.
+    const std::string gcode = slice({TestMesh::pyramid}, base_config("0.05", "arachne"));
+    REQUIRE(! gcode.empty());
+
+    const auto layers = extruding_zs_per_layer(gcode);
+    const auto min_x  = min_x_by_z(gcode);
+    REQUIRE(layers.size() > 4);
+
+    // Take a layer from the middle of the slope, away from the tip where the walls merge.
+    const std::vector<double> zs = distinct_sorted(layers[layers.size() / 3]);
+    REQUIRE(zs.size() == 4);
+
+    bool any_moved_inward = false;
+    for (size_t k = 1; k < zs.size(); ++ k) {
+        const auto lower = min_x.find(zs[k - 1]);
+        const auto upper = min_x.find(zs[k]);
+        REQUIRE(lower != min_x.end());
+        REQUIRE(upper != min_x.end());
+        INFO("z " << zs[k - 1] << " min_x " << lower->second << " -> z " << zs[k] << " min_x " << upper->second);
+        // Never wider than the pass below it, and at least one pass is measurably narrower.
+        REQUIRE(upper->second >= lower->second - EPSILON);
+        any_moved_inward |= upper->second > lower->second + 0.001;
+    }
+    CHECK(any_moved_inward);
+}
+
+TEST_CASE("Sub-layered walls honor a sub-layer height given as a percentage", "[WallSublayers]")
+{
+    // The percentage resolves against the real layer height, so the same setting yields the same
+    // number of passes whatever that height is.
+    for (const char *layer_height : {"0.2", "0.1"}) {
+        DYNAMIC_SECTION("layer height " << layer_height)
+        {
+            const std::string gcode = slice({cube(20)}, {{"layer_height", layer_height},
+                                                        {"initial_layer_print_height", layer_height},
+                                                        {"wall_loops", "3"},
+                                                        {"z_hop", "0"},
+                                                        {"skirt_loops", "0"},
+                                                        {"wall_sublayer_height", "25%"}});
+            REQUIRE(! gcode.empty());
+            const auto layers = extruding_zs_per_layer(gcode);
+            REQUIRE(layers.size() > 2);
+            CHECK(distinct_sorted(layers[1]).size() == 4);
+        }
+    }
+}
+
+TEST_CASE("Sub-layered walls subdivide as many wall loops as asked for", "[WallSublayers]")
+{
+    // Two sub-layered loops means each pass prints an outer and an inner wall, and the layer's own
+    // pass is left with the walls beyond those two.
+    Print print;
+    Model model;
+    init_print({cube(20)}, print, model, {{"layer_height", "0.2"},
+                                          {"initial_layer_print_height", "0.2"},
+                                          {"wall_loops", "4"},
+                                          {"wall_sublayer_height", "0.1"},
+                                          {"wall_sublayer_loops", "2"}});
+    print.process();
+
+    const Layer *layer = print.objects().front()->layers()[2];
+    REQUIRE(layer->wall_sub_slices.size() == 2);
+
+    const LayerRegion *layerm = layer->regions().front();
+    REQUIRE(layerm->sublayer_perimeters.size() == 2);
+    for (const ExtrusionEntityCollection &pass : layerm->sublayer_perimeters)
+        CHECK(! pass.empty());
+
+    // Every loop the band passes print is gone from the layer's own perimeters, and the walls beyond
+    // them are still there. Counting the survivors matters: dropping the whole set would satisfy the
+    // inset check vacuously.
+    int kept = 0;
+    for (const ExtrusionEntity *ee : layerm->perimeters.entities)
+        for (const ExtrusionEntity *loop : static_cast<const ExtrusionEntityCollection *>(ee)->entities) {
+            CHECK(loop->inset_idx >= 2);
+            ++ kept;
+        }
+    CHECK(kept == 2);
+}
+
+TEST_CASE("Sub-layered walls span the layer and end at its print_z", "[WallSublayers]")
+{
+    Print print;
+    Model model;
+    init_print({cube(20)}, print, model, {{"layer_height", "0.2"},
+                                          {"initial_layer_print_height", "0.2"},
+                                          {"wall_sublayer_height", "0.05"}});
+    print.process();
+
+    const auto &layers = print.objects().front()->layers();
+    REQUIRE(layers.size() > 2);
+    // The first layer is excluded from the feature.
+    CHECK(layers.front()->wall_sub_slices.empty());
+
+    const Layer *layer = layers[2];
+    REQUIRE(layer->wall_sub_slices.size() == 4);
+    REQUIRE_THAT(layer->wall_sub_slices.back().print_z, Catch::Matchers::WithinAbs(layer->print_z, 1e-9));
+    REQUIRE_THAT(layer->wall_sub_slices.front().print_z - layer->wall_sub_slices.front().height,
+                 Catch::Matchers::WithinAbs(layer->bottom_z(), 1e-9));
+    for (const WallSubSlice &sub : layer->wall_sub_slices) {
+        REQUIRE_THAT(sub.height, Catch::Matchers::WithinAbs(0.05, 1e-9));
+        CHECK(! sub.merged.empty());
+    }
+}
+
+TEST_CASE("Sub-layered walls of every object are printed before the next pass starts", "[WallSublayers]")
+{
+    // Printing by layer, the passes have to be grouped across objects: if one object climbed to its
+    // layer top while another was still on its first pass, the nozzle would descend into it.
+    const std::string gcode = slice_two_cubes_apart(10, {{"layer_height", "0.2"},
+                                                         {"initial_layer_print_height", "0.2"},
+                                                         {"wall_loops", "3"},
+                                                         {"z_hop", "0"},
+                                                         {"skirt_loops", "0"},
+                                                         {"wall_sublayer_height", "0.1"}});
+    REQUIRE(! gcode.empty());
+
+    const auto layers = extruding_zs_per_layer(gcode);
+    REQUIRE(layers.size() > 2);
+    // Two objects at two sub-layer heights: had the passes not been grouped, the layer would show Z
+    // rising and falling repeatedly. Grouped, each Z is visited exactly once per layer.
+    for (size_t i = 1; i < layers.size(); ++ i) {
+        INFO("layer " << i << " visits " << layers[i].size() << " Z values");
+        REQUIRE(layers[i].size() == distinct_sorted(layers[i]).size());
+    }
+}
+
+TEST_CASE("Sub-layered walls are rejected together with spiral vase mode", "[WallSublayers]")
+{
+    // Spiral vase rewrites a layer around one continuous Z ramp and cannot express several passes.
+    // The GUI blocks this, but a per-object override reaches the slicer unchecked.
+    Print print;
+    Model model;
+    init_print({cube(20)}, print, model, {{"spiral_mode", "1"},
+                                          {"wall_loops", "1"},
+                                          {"top_shell_layers", "0"},
+                                          {"sparse_infill_density", "0"},
+                                          {"wall_sublayer_height", "0.05"}});
+
+    const auto err = print.validate();
+    INFO("validate: " << err.string);
+    CHECK(! err.string.empty());
+    CHECK(err.opt_key == "wall_sublayer_height");
+}
+
+TEST_CASE("Sub-layered walls still print when they replace every wall", "[WallSublayers]")
+{
+    // With as many sub-layered loops as there are walls, the layer's own perimeters end up empty and
+    // the passes are the region's only wall output. Nothing downstream may drop the object for that.
+    const std::string gcode = slice({cube(20)}, {{"layer_height", "0.2"},
+                                                 {"initial_layer_print_height", "0.2"},
+                                                 {"wall_loops", "1"},
+                                                 {"z_hop", "0"},
+                                                 {"skirt_loops", "0"},
+                                                 {"wall_sublayer_height", "0.1"},
+                                                 {"wall_sublayer_loops", "1"}});
+    REQUIRE(! gcode.empty());
+
+    const auto layers = extruding_zs_per_layer(gcode);
+    REQUIRE(layers.size() > 2);
+    CHECK(distinct_sorted(layers[1]).size() == 2);
+    CHECK(gcode.find(";HEIGHT:0.1") != std::string::npos);
+}
+
+TEST_CASE("Sub-layered walls hold up under every wall ordering", "[WallSublayers]")
+{
+    // The core pass drops its outermost loops after wall_sequence has ordered them, and
+    // inner-outer-inner reasons about the very inset indices being dropped. Infill-first moves the
+    // layer's own walls after the infill, which must not pull the passes along with them.
+    const auto wall_sequence  = GENERATE("inner wall/outer wall", "outer wall/inner wall", "inner-outer-inner wall");
+    const auto is_infill_first = GENERATE("0", "1");
+    INFO("wall_sequence=" << wall_sequence << " is_infill_first=" << is_infill_first);
+
+    const std::string gcode = slice({cube(20)}, {{"layer_height", "0.2"},
+                                                 {"initial_layer_print_height", "0.2"},
+                                                 {"wall_loops", "3"},
+                                                 {"z_hop", "0"},
+                                                 {"skirt_loops", "0"},
+                                                 {"wall_sequence", wall_sequence},
+                                                 {"is_infill_first", is_infill_first},
+                                                 {"wall_sublayer_height", "0.1"}});
+    REQUIRE(! gcode.empty());
+
+    const auto layers = extruding_zs_per_layer(gcode);
+    REQUIRE(layers.size() > 2);
+    // Still two passes per layer, still ascending, and the walls the passes do not cover survive.
+    CHECK(distinct_sorted(layers[1]).size() == 2);
+    for (size_t i = 0; i < layers.size(); ++ i)
+        for (size_t k = 1; k < layers[i].size(); ++ k)
+            REQUIRE(layers[i][k] >= layers[i][k - 1] - EPSILON);
+    CHECK(gcode.find(";TYPE:Inner wall") != std::string::npos);
+}
