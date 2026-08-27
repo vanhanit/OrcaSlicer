@@ -72,6 +72,11 @@ public:
     // (this collection contains only ExtrusionEntityCollection objects)
     ExtrusionEntityCollection   perimeters;
 
+    // Orca: sub-layered outer walls. One entry per sub-layer of Layer::wall_sub_slices, lowest
+    // first, holding the outermost walls generated from that sub-slice. Empty unless
+    // wall_sublayer_height is set. The loops these replace are absent from `perimeters`.
+    std::vector<ExtrusionEntityCollection> sublayer_perimeters;
+
     // ordered collection of extrusion paths to fill surfaces
     // (this collection contains only ExtrusionEntityCollection objects)
     ExtrusionEntityCollection   fills;
@@ -121,6 +126,26 @@ private:
     const PrintRegion *m_region;
 };
 
+// Orca: one sub-layer of a layer whose outermost walls are printed as a stack of thinner passes.
+// The mesh is re-sliced at slice_z, so a sloped surface gains real vertical resolution rather than
+// repeating the layer's contour. The last sub-layer of a layer ends exactly at the layer's print_z.
+struct WallSubSlice
+{
+    coordf_t                print_z;
+    coordf_t                slice_z;
+    coordf_t                height;
+    // Indexed by PrintRegion::print_object_region_id(), like Layer::m_regions.
+    std::vector<ExPolygons> region_slices;
+    // Union over the regions. Serves as the lower slices for the sub-layer above it, so overhangs
+    // and bridges are classified against what this sub-layer actually printed.
+    ExPolygons              merged;
+};
+
+// Orca: how many sub-layers a layer of the given height is split into for this region, 1 meaning the
+// walls print at the full layer height as usual. wall_sublayer_height is resolved against the real
+// layer height rather than the layer_height setting, so adaptive and per-range heights are honored.
+int wall_sublayer_count(const PrintRegionConfig &config, coordf_t layer_height);
+
 class Layer
 {
 public:
@@ -165,6 +190,11 @@ public:
     // BBS
     ExPolygons              loverhangs;
     BoundingBox             loverhangs_bbox;
+
+    // Orca: sub-layers this layer's outermost walls are split into, lowest first. Empty unless
+    // wall_sublayer_height is set for one of the regions, and always empty on the first layer.
+    std::vector<WallSubSlice> wall_sub_slices;
+
     size_t                  region_count() const { return m_regions.size(); }
     const LayerRegion*      get_region(int idx) const { return m_regions[idx]; }
     LayerRegion*            get_region(int idx) { return m_regions[idx]; }

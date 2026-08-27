@@ -538,6 +538,8 @@ private:
     std::vector<std::set<int>> detect_extruder_geometric_unprintables() const;
 
     void slice_volumes();
+    // Orca: re-slice the layers at the sub-layer heights their outermost walls are printed at.
+    void slice_wall_sublayers();
     //BBS
     ExPolygons _shrink_contour_holes(double contour_delta, double hole_delta, const ExPolygons& polys) const;
     // BBS

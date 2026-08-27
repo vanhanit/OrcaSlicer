@@ -136,6 +136,21 @@ ExPolygons Layer::merged(float offset_scaled) const
     return out;
 }
 
+int wall_sublayer_count(const PrintRegionConfig &config, coordf_t layer_height)
+{
+    if (config.wall_loops <= 0 || layer_height <= 0.)
+        return 1;
+    const double target = config.wall_sublayer_height.get_abs_value(layer_height);
+    if (target <= 0.)
+        return 1;
+    int n = std::clamp((int) std::lround(layer_height / target), 1, MAX_WALL_SUBLAYERS);
+    // A sub-layer thinner than this asks the extruder for an unprintable amount of material, so
+    // prefer fewer, thicker passes over honoring the requested height exactly.
+    while (n > 1 && layer_height / n < MIN_WALL_SUBLAYER_HEIGHT)
+        -- n;
+    return n;
+}
+
 bool Layer::is_perimeter_compatible(const Print& print, const PrintRegion& a, const PrintRegion& b)
 {
     const PrintRegionConfig& config       = a.config();
@@ -197,6 +212,7 @@ void Layer::make_perimeters()
     for (LayerRegionPtrs::iterator layerm = m_regions.begin(); layerm != m_regions.end(); ++ layerm)
     	if ((*layerm)->slices.empty()) {
  			(*layerm)->perimeters.clear();
+ 			(*layerm)->sublayer_perimeters.clear();
  			(*layerm)->fills.clear();
  			(*layerm)->thin_fills.clear();
     	} else {
@@ -223,6 +239,7 @@ void Layer::make_perimeters()
                     if (is_perimeter_compatible(*m_object->print(), this_region, other_region))
 		            {
 			 			other_layerm->perimeters.clear();
+			 			other_layerm->sublayer_perimeters.clear();
 			 			other_layerm->fills.clear();
 			 			other_layerm->thin_fills.clear();
 		                layerms.push_back(other_layerm);

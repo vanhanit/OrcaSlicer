@@ -1508,6 +1508,102 @@ void PrintObject::apply_conical_overhang() {
     }
 }
 
+// Orca: re-slice the mesh at the sub-layer heights the outermost walls are printed at, so a sloped
+// surface gains real vertical resolution instead of the layer's contour being repeated.
+// Runs as part of posPerimeters: it reads the slicing inputs but leaves the layer slices untouched,
+// which keeps the feature out of every other consumer of posSlice.
+void PrintObject::slice_wall_sublayers()
+{
+    for (Layer *layer : m_layers)
+        layer->wall_sub_slices.clear();
+
+    // The first layer is bonded to the bed or the raft and its height is dictated by adhesion, so it
+    // is never subdivided. Raft layers are support layers and never appear in m_layers.
+    std::vector<int> sublayer_counts(m_layers.size(), 1);
+    bool             any_subdivided = false;
+    for (size_t layer_idx = 1; layer_idx < m_layers.size(); ++ layer_idx) {
+        const Layer *layer = m_layers[layer_idx];
+        int          count = 1;
+        for (const LayerRegion *layerm : layer->regions())
+            count = std::max(count, wall_sublayer_count(layerm->region().config(), layer->height));
+        sublayer_counts[layer_idx] = count;
+        any_subdivided |= count > 1;
+    }
+    if (! any_subdivided)
+        return;
+
+    const Print *print               = this->print();
+    auto         throw_on_cancel     = [print]() { print->throw_if_canceled(); };
+
+    // One ascending list of sub-slice planes for the whole object, so the mesh is sliced once.
+    std::vector<float> slice_zs;
+    std::vector<size_t> zs_begin(m_layers.size(), 0);
+    for (size_t layer_idx = 0; layer_idx < m_layers.size(); ++ layer_idx) {
+        Layer    *layer = m_layers[layer_idx];
+        const int count = sublayer_counts[layer_idx];
+        zs_begin[layer_idx] = slice_zs.size();
+        if (count < 2)
+            continue;
+        const coordf_t sub_height = layer->height / count;
+        layer->wall_sub_slices.reserve(count);
+        for (int k = 0; k < count; ++ k) {
+            WallSubSlice sub;
+            sub.height  = sub_height;
+            // The topmost sub-layer ends exactly at the layer's print_z, so the walls finish flush
+            // with the inner walls and the infill that follow them.
+            sub.print_z = (k + 1 == count) ? layer->print_z : layer->bottom_z() + (k + 1) * sub_height;
+            sub.slice_z = layer->bottom_z() + (k + 0.5) * sub_height;
+            sub.region_slices.resize(m_shared_regions->all_regions.size());
+            slice_zs.emplace_back((float) sub.slice_z);
+            layer->wall_sub_slices.emplace_back(std::move(sub));
+        }
+    }
+    if (slice_zs.empty())
+        return;
+
+    BOOST_LOG_TRIVIAL(debug) << "Slicing sub-layers for sub-layered walls - begin";
+    std::vector<VolumeSlices> volume_slices = slice_volumes_inner(
+        print->config(), this->config(), this->trafo_centered(),
+        this->model_object()->volumes, m_shared_regions->layer_ranges, slice_zs, throw_on_cancel);
+
+    std::vector<std::vector<ExPolygons>> region_slices =
+        slices_to_regions(print->config(), *this, this->model_object()->volumes, *m_shared_regions, slice_zs,
+                          std::move(volume_slices), PrintObject::clip_multipart_objects, throw_on_cancel);
+    m_print->throw_if_canceled();
+
+    // Same XY compensation the layer slices get. Only the negative part is applied here, matching
+    // slice_volumes(); the positive part is already baked into the slicing offsets.
+    const size_t num_extruders     = print->config().filament_diameter.size();
+    const auto   xy_hole_scaled    = (num_extruders > 1 && this->is_mm_painted()) ? 0. : (double) scaled<float>(m_config.xy_hole_compensation.value);
+    const auto   xy_contour_scaled = (num_extruders > 1 && this->is_mm_painted()) ? 0. : (double) scaled<float>(m_config.xy_contour_compensation.value);
+
+    tbb::parallel_for(
+        tbb::blocked_range<size_t>(0, m_layers.size()),
+        [this, &region_slices, &zs_begin, xy_hole_scaled, xy_contour_scaled](const tbb::blocked_range<size_t> &range) {
+            for (size_t layer_idx = range.begin(); layer_idx < range.end(); ++ layer_idx) {
+                m_print->throw_if_canceled();
+                Layer *layer = m_layers[layer_idx];
+                for (size_t k = 0; k < layer->wall_sub_slices.size(); ++ k) {
+                    WallSubSlice &sub   = layer->wall_sub_slices[k];
+                    const size_t  z_idx = zs_begin[layer_idx] + k;
+                    ExPolygons    merged;
+                    for (size_t region_id = 0; region_id < region_slices.size(); ++ region_id) {
+                        ExPolygons slices = std::move(region_slices[region_id][z_idx]);
+                        if (xy_contour_scaled > 0 || xy_hole_scaled > 0)
+                            slices = this->_shrink_contour_holes(std::max(0., xy_contour_scaled), std::max(0., xy_hole_scaled), slices);
+                        if (xy_contour_scaled < 0 || xy_hole_scaled < 0)
+                            slices = this->_shrink_contour_holes(std::min(0., xy_contour_scaled), std::min(0., xy_hole_scaled), slices);
+                        append(merged, slices);
+                        sub.region_slices[region_id] = std::move(slices);
+                    }
+                    sub.merged = union_ex(merged);
+                }
+            }
+        });
+    m_print->throw_if_canceled();
+    BOOST_LOG_TRIVIAL(debug) << "Slicing sub-layers for sub-layered walls - end";
+}
+
 //BBS: this function is used to offset contour and holes of expolygons seperately by different value
 ExPolygons PrintObject::_shrink_contour_holes(double contour_delta, double hole_delta, const ExPolygons& polys) const
 {
