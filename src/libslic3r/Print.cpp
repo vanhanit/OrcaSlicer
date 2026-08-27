@@ -1424,6 +1424,35 @@ StringObjectException Print::validate(std::vector<StringObjectException> *warnin
         }
     }
 
+    // Orca: sub-layered walls. These combinations cannot be caught by the GUI, which never sees the
+    // per-object and per-modifier overrides.
+    for (const PrintObject *object : m_objects) {
+        const auto regions = object->all_regions();
+        bool sublayered = false, overhangs_made_printable = false, zaa = false;
+        for (const PrintRegion &region : regions) {
+            const PrintRegionConfig &config = region.config();
+            if (config.wall_sublayer_height.value <= 0. || config.wall_loops <= 0)
+                continue;
+            sublayered               = true;
+            overhangs_made_printable |= config.make_overhang_printable.value;
+            zaa                      |= config.zaa_enabled.value;
+        }
+        if (! sublayered)
+            continue;
+        if (m_config.spiral_mode)
+            return {L("Sub-layered outer walls are not compatible with spiral vase mode."), object, "wall_sublayer_height"};
+        if (object->model_object()->is_mm_painted())
+            // The sub-slices come straight from the model volumes, bypassing the multi-material
+            // segmentation the layer slices go through, so the painted colors would be lost.
+            return {L("Sub-layered outer walls are not compatible with multi-material painting."), object, "wall_sublayer_height"};
+        if (overhangs_made_printable)
+            warn(L("Sub-layered outer walls are sliced from the original model, so they do not follow the "
+                   "shape produced by making overhangs printable."), "wall_sublayer_height", object);
+        if (zaa)
+            warn(L("Sub-layered outer walls and Z anti-aliasing both refine the same surfaces; using them together "
+                   "gives little extra quality for the added print time."), "wall_sublayer_height", object);
+    }
+
     // Cache of layer height profiles for checking:
     // 1) Whether all layers are synchronized if printing with wipe tower and / or unsynchronized supports.
     // 2) Whether layer height is constant for Organic supports.
