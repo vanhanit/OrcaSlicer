@@ -2721,6 +2721,8 @@ void TabPrint::build()
         optgroup->append_single_option_line("wall_sequence", "quality_settings_wall_and_surfaces#walls-printing-order");
         optgroup->append_single_option_line("is_infill_first", "quality_settings_wall_and_surfaces#print-infill-first");
         optgroup->append_single_option_line("wall_direction", "quality_settings_wall_and_surfaces#wall-loop-direction");
+        optgroup->append_single_option_line("wall_sublayer_height", "quality_settings_wall_and_surfaces#sub-layered-outer-walls");
+        optgroup->append_single_option_line("wall_sublayer_loops", "quality_settings_wall_and_surfaces#sub-layered-outer-walls");
         optgroup->append_single_option_line("print_flow_ratio", "quality_settings_wall_and_surfaces#surface-flow-ratio");
         optgroup->append_single_option_line("top_solid_infill_flow_ratio", "quality_settings_wall_and_surfaces#surface-flow-ratio");
         optgroup->append_single_option_line("bottom_solid_infill_flow_ratio", "quality_settings_wall_and_surfaces#surface-flow-ratio");

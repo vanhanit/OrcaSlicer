@@ -2531,6 +2531,32 @@ void PrintConfigDef::init_fff_params()
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionEnum<WallDirection>(WallDirection::CounterClockwise));
 
+    def = this->add("wall_sublayer_height", coFloatOrPercent);
+    def->label = L("Outer wall sub-layer height");
+    def->category = L("Quality");
+    def->tooltip = L("Print the outermost walls in several thinner passes stacked within one layer, while inner walls "
+                     "and infill still print once at the full layer height. The model is re-sliced at every sub-layer "
+                     "height, so sloped surfaces gain real vertical resolution instead of repeating the same contour.\n\n"
+                     "This amount can be specified in millimeters or as a percentage of the current layer height. "
+                     "The layer height is divided into the nearest whole number of equal sub-layers, so the walls always "
+                     "finish flush with the top of the layer. Set to 0 to disable.\n\n"
+                     "Print time increases roughly in proportion to the number of sub-layers.");
+    def->sidetext = L("mm or %");
+    def->ratio_over = "layer_height";
+    def->min = 0;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloatOrPercent(0, false));
+
+    def = this->add("wall_sublayer_loops", coInt);
+    def->label = L("Sub-layered outer walls");
+    def->category = L("Quality");
+    def->tooltip = L("Number of outermost wall loops printed as sub-layer stacks. The remaining walls print once at the "
+                     "full layer height. Only used when the outer wall sub-layer height is set.");
+    def->min = 1;
+    def->max = 5;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionInt(1));
+
     def = this->add("extruder", coInt);
     def->gui_type = ConfigOptionDef::GUIType::i_enum_open;
     def->label = L("Extruder");
@@ -4988,6 +5014,10 @@ void PrintConfigDef::init_fff_params()
     def->set_default_value(new ConfigOptionStrings{"0,0", "\n0.2,0.4444", "\n0.4,0.6145", "\n0.6,0.7059", "\n0.8,0.7619", "\n1.5,0.8571", "\n2,0.8889", "\n3,0.9231", "\n5,0.9520", "\n10,1"});
 
     def = this->add("has_scarf_joint_seam", coBool);
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionBool(false));
+
+    def = this->add("has_sublayered_walls", coBool);
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionBool(false));
 

@@ -30,6 +30,12 @@
 
 namespace Slic3r {
 
+// Sub-layered outer walls: a layer is split into at most this many wall passes, and a pass is
+// never thinner than this, so a small wall_sublayer_height cannot explode the G-code or ask the
+// extruder for an unprintable amount of material.
+static constexpr int      MAX_WALL_SUBLAYERS       = 10;
+static constexpr coordf_t MIN_WALL_SUBLAYER_HEIGHT = 0.02;
+
 enum GCodeFlavor : unsigned char {
     gcfMarlinLegacy, 
     gcfKlipper, 
@@ -1417,6 +1423,8 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionBool,                is_infill_first))
     ((ConfigOptionBool,                small_area_infill_flow_compensation))
     ((ConfigOptionEnum<WallDirection>,  wall_direction))
+    ((ConfigOptionFloatOrPercent,      wall_sublayer_height))
+    ((ConfigOptionInt,                 wall_sublayer_loops))
 
     // Orca: other flow ratios (available for overriding, if set_other_flow_ratios is enabled)
     ((ConfigOptionFloat,                first_layer_flow_ratio))
@@ -1702,6 +1710,7 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionStrings,              small_area_infill_flow_compensation_model))
 
     ((ConfigOptionBool,                has_scarf_joint_seam))
+    ((ConfigOptionBool,                has_sublayered_walls))
 
     // Multi-nozzle + pre-heating + nozzle-change (nc) keys. Defaults are no-ops for existing
     // single-nozzle printers; new slicing paths gate on extruder_max_nozzle_count > 1.

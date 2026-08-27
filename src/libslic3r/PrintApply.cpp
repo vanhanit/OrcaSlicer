@@ -1253,6 +1253,22 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
         }
 
         BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ", has_scarf_joint_seam:" << has_scarf_joint_seam;
+
+        const auto opt_has_sublayered_walls = [](const DynamicConfig& c) {
+            const auto* opt = c.option<ConfigOptionFloatOrPercent>("wall_sublayer_height");
+            return opt != nullptr && opt->value > 0.;
+        };
+        const bool has_sublayered_walls = std::any_of(o.begin(), o.end(), [&new_full_config, &opt_has_sublayered_walls](ModelObject* obj) {
+            return obj->get_config_value<ConfigOptionFloatOrPercent>(new_full_config, "wall_sublayer_height")->value > 0. ||
+                   std::any_of(obj->volumes.begin(), obj->volumes.end(), [&opt_has_sublayered_walls](const ModelVolume* v) { return opt_has_sublayered_walls(v->config.get());}) ||
+                   std::any_of(obj->layer_config_ranges.begin(), obj->layer_config_ranges.end(), [&opt_has_sublayered_walls](const auto& r) { return opt_has_sublayered_walls(r.second.get());});
+        });
+
+        if (has_sublayered_walls) {
+            new_full_config.set("has_sublayered_walls", true);
+        }
+
+        BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ", has_sublayered_walls:" << has_sublayered_walls;
     }
 
     //apply extruder related values

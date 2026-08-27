@@ -253,7 +253,10 @@ bool Print::invalidate_state_by_config_options(const ConfigOptionResolver & /* n
         "filament_notes",
         "process_notes",
         "printer_notes",
-        "use_3mf"
+        "use_3mf",
+        // Derived from wall_sublayer_height during apply; that key already invalidates the
+        // perimeters, so this flag only has to reach the G-code and its processor tags.
+        "has_sublayered_walls"
     };
 
     static std::unordered_set<std::string> steps_ignore;
