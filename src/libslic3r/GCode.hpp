@@ -555,6 +555,14 @@ private:
         bool                first_visit;
     };
 
+    // Orca: sub-layered walls. Emits the outermost walls of every instance of this filament as a
+    // stack of passes at ascending sub-layer heights, ending at the layer's print_z. Runs before
+    // anything else of the layer so the nozzle never has to descend below what it already printed.
+    std::string     extrude_sublayer_walls(const Print& print, const std::vector<LayerToPrint>& layers,
+                                           const std::vector<InstanceToPrint>& instances_to_print,
+                                           const std::vector<InstanceVisit>& instance_visits,
+                                           const LayerTools& layer_tools, unsigned int extruder_id, coordf_t print_z);
+
     // One node of the island-level tour, also used as cache key: identity plus quantized position.
     struct IslandOrderNode
     {
@@ -752,6 +760,10 @@ private:
     // reports that sub-height as the effective extrusion height. Reset to 0 afterwards.
     double   m_sub_layer_flow_ratio = 0.0;
     double   m_sub_layer_height     = 0.0;
+    // Orca: set while emitting a sub-layered wall pass. Those walls carry their own sub-layer height
+    // and flow already, so only Z is driven from here; the flag suppresses the features that assume
+    // a wall spans the whole layer or that the rest of the layer is already printed.
+    bool     m_in_sublayer_wall_pass = false;
     bool m_need_change_layer_lift_z = false;
     int m_start_gcode_filament = -1;
     std::string m_filament_instances_code;

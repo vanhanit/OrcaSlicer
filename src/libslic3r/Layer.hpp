@@ -16,6 +16,7 @@ using LayerPtrs = std::vector<Layer*>;
 class LayerRegion;
 using LayerRegionPtrs = std::vector<LayerRegion*>;
 class PrintRegion;
+class PrintRegionConfig;
 class PrintObject;
 class Print;
 
