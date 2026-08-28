@@ -81,24 +81,47 @@ Two new inert-by-default members on `PerimeterGenerator`:
 - `sublayer_band_walls` (band mode): generate only this many outermost loops, from a sub-slice.
 - `sublayer_drop_walls` (core mode): drop loops with `inset_idx < this` from the output.
 
-The layer's own generator run is unchanged except for `sublayer_drop_walls`. Then one extra
-generator run per sub-slice produces that pass's outermost loops into
+The layer's own generator run differs only in `sublayer_drop_walls` and in being fed the layer's
+slice **clipped to the topmost sub-slice**. The core run prints at `print_z` and so does the topmost
+pass, whose contour is therefore the one the layer really presents there; built from the mid-height
+slice instead, the walls the core run is left with sit outside that contour once the contour recedes
+by more than a wall width across the layer — `(H/2)·tanθ > w`, a slope within about 13° of
+horizontal — and hang off the edge of the model. The clip is inert wherever the contour grows with
+Z, the topmost sub-slice then containing the layer's own slice, so overhangs are untouched. It is
+applied per surface, which preserves the surface type and the `extra_perimeters` grouping
+`Layer::make_perimeters` built.
+
+Then one extra generator run per sub-slice produces that pass's outermost loops into
 `LayerRegion::sublayer_perimeters[k]`, using flows built at the sub-layer height
 (`LayerRegion::flow(role, height)`), with the bridge flow left alone because it is a thread diameter
 rather than a layer height.
 
 Each pass keeps two things beyond its walls. Its **gap fill**, appended after the walls. And the
 **support fill** for the pass above it: the band of pass `k+1`'s walls lands on whatever pass `k`
-printed, so where the contour steps inward faster than the band is wide — a hole closing over within
-the layer, a near-horizontal ceiling — part of that band would hang over the void inside pass `k`.
-Pass `k` therefore fills `band(k+1) ∩ interior(k)` first, as `erSolidInfill` at the sub-layer height.
-The flow is deliberately *not* a bridging flow: a bridge thread is as thick as the nozzle and would
-stand proud of a pass a fraction of that height. An opening by one extrusion width discards strips
-narrower than a single line, which is what keeps the whole mechanism inert on ordinary geometry —
-a vertical wall repeats one contour and never triggers it.
+printed, so `needed = band(k+1) ∖ band(k)` is the footprint pass `k`'s own walls do not already
+provide, and pass `k` lays it down first. It arrives two ways, and both are filled:
+
+- `needed ∩ interior(k)` — the contour steps inward faster than the band is wide, so the next band
+  hangs over the void *inside* pass `k`. A hole closing over within the layer; a near-horizontal
+  ceiling.
+- `needed ∖ slice(k)`, less the material below the pass — a contour appears that pass `k` does not
+  have at all, so the next band stands over nothing whatsoever. The lip of a hole, where the profile
+  only starts being printed part way up the layer.
+
+The second case puts material **outside the model's own surface** at that height. That is deliberate:
+it is bounded by one sub-layer height and the width of the wall it holds up, and the alternative is
+extruding that wall into mid air. The opening by one extrusion width below is what confines it to
+geometry where a whole wall line would otherwise be unsupported.
+
+The fill goes down as `erSolidInfill` at the sub-layer height. The flow is deliberately *not* a
+bridging flow even for the second case: a bridge thread is as thick as the nozzle and would stand
+proud of a pass a fraction of that height. An opening by one extrusion width discards strips
+narrower than a single line, which is what keeps the whole mechanism inert on ordinary geometry — a
+vertical wall repeats one contour and never triggers it, and on a 45° slope the step per pass is a
+tenth of a line width.
 
 `interior(k)` is the pass generator's `fill_no_overlap` output and `band(k)` is the rest of the
-sub-slice, so the two are complementary by construction and no pass can fill outside its own walls.
+sub-slice, so the two are complementary by construction.
 
 **Why "generate normally, then drop" rather than shrinking the core region:**
 
@@ -106,8 +129,9 @@ sub-slice, so the two are complementary by construction and no pass can fill out
   "band width" offset is not well defined.
 - Inner wall positions, infill boundaries, `only_one_wall_top` splitting and the `wall_sequence`
   ordering (including inner-outer-inner, which reasons about `inset_idx` directly) are all computed
-  on the full wall set exactly as before, and only then are the band loops removed. That is what
-  makes the rest of the layer byte-identical to a non-subdivided print.
+  on the full wall set exactly as before, and only then are the band loops removed. With the feature
+  off nothing is clipped and no band is dropped, so the layer is byte-identical to a non-subdivided
+  print; with it on, the whole run moves to the clipped contour together and the walls stay nested.
 - Dropping after the ordering has been applied leaves `wall_sequence` in charge of the loops that
   remain.
 - The mid-layer slice the core is built from is at worst `(H/2)·tanθ` away from any sub-slice on a
@@ -208,13 +232,14 @@ counts them under Outer wall and Inner wall rather than on a row of their own.
 
 ## Known limitations
 
-- On a slope, the interface between the passes and the inner walls can be off by up to `(H/2)·tanθ`,
-  since the inner walls still derive from the layer's mid-height slice.
 - The support fill a pass prints for the pass above it goes down with the **wall** filament, the one
   that pass is printed with, not with `sparse_infill_filament`.
-- A pass whose wall band falls *outside* the material below it — the ceiling of a hole, where the
-  model gains area as Z rises — is still printed over the void. Nothing inside the layer can support
-  it: the fill that would anchor it is the layer's own bridge at `print_z`, above the pass.
+- On a shallow slope the support fill leaves the model's surface by up to one wall width, for the
+  height of one sub-layer, wherever that is what it takes to get material under the wall line above.
+  A hole gains a slight ledge at each lip rather than an unsupported wall.
+- Clipping the core run to the topmost sub-slice means that on a receding slope the layer's own
+  infill stops at the top contour rather than the mid-height one. The band between them is covered
+  by the passes' wall bands, which tile it as the contour sweeps.
 - With several filaments, a later extruder's passes can start below content an earlier extruder
   printed at `print_z` (wipe tower, supports on another filament). The lift-travel mitigates it, and
   `validate()` warns. This is the same exposure the existing mixed-color sub-layer feature accepts.
@@ -236,6 +261,10 @@ sphere:
   up": solid fill appears at sub-layer Z on the cone and nowhere on a cube.
 - "keep the layer's own infill out of their columns": the layer's fill area is strictly smaller with
   the feature on.
+- "support a wall line that stands over nothing": the same cone stood on its head, so every pass's
+  wall lands outside everything below it. Nothing is filled without the second case above.
+- "keep the layer's own walls inside the topmost pass": no `Inner wall` move at a given Z may reach
+  further out than the `Outer wall` at that same Z.
 - "are not slowed down as overhangs": on a sphere, over 90% of layers print every one of their passes
   at one feedrate. Measured against the layer below instead, only about two thirds do. Asserting the
   passes of a layer agree with *each other* is what makes this independent of how the estimator
