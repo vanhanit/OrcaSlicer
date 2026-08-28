@@ -162,9 +162,19 @@ void LayerRegion::make_perimeters(const SurfaceCollection &slices, const LayerRe
         pass_slices[k] = union_ex(expolygons);
     }
 
+    // The core run prints at print_z, and so does the topmost pass, whose contour is therefore the
+    // one the layer really presents there. Clipping to it keeps the walls the core run is left with
+    // nested inside the pass rather than positioned against the mid-height contour, which on a slope
+    // shallower than about 13 degrees puts them outside the surface altogether. Inert where the
+    // contour grows with Z, the topmost sub-slice then containing the layer's own slice.
+    SurfaceCollection core_slices;
+    if (band_walls > 0 && ! pass_slices.back().empty())
+        for (const Surface &surface : slices.surfaces)
+            core_slices.append(intersection_ex(surface.expolygon, pass_slices.back()), surface);
+
     PerimeterGenerator g(
         // input:
-        &slices,
+        band_walls > 0 && ! pass_slices.back().empty() ? &core_slices : &slices,
         &compatible_regions,
         this->layer()->height,
         this->layer()->slice_z,
