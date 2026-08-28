@@ -32,7 +32,6 @@ on:
      - ".github/workflows/build_*.yml"
      - 'build_linux.sh'
      - 'build_release_vs.bat'
-     - 'build_release_vs2022.bat'
      - 'build_release_macos.sh'
      - 'scripts/build_preset_cache.*'
      - 'scripts/flatpak/**'
