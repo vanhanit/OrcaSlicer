@@ -1,4 +1,11 @@
 @REM OrcaSlicer build script for Windows with VS auto-detect
+@REM
+@REM By default, auto-detects the latest installed Visual Studio (2019/2022/2026)
+@REM with the "Desktop development with C++" workload and uses its generator.
+@REM Pass vs2019, vs2022, or vs2026 as an argument to force a specific toolchain
+@REM instead, e.g.:
+@REM   build_release_vs.bat vs2022
+@REM   build_release_vs.bat vs2026 arm64 debug
 @echo off
 set WP=%CD%
 set _START_TIME=%TIME%
@@ -18,6 +25,15 @@ if /I "%2"=="x64" set arch=x64
 set USE_NINJA=0
 for %%a in (%*) do (
     if "%%a"=="-x" set USE_NINJA=1
+)
+
+@REM Optional toolchain override: pass vs2019, vs2022, or vs2026 to force that
+@REM generator instead of auto-detecting the latest installed one.
+set VS_OVERRIDE=
+for %%a in (%*) do (
+    if /I "%%a"=="vs2019" set VS_OVERRIDE=16
+    if /I "%%a"=="vs2022" set VS_OVERRIDE=17
+    if /I "%%a"=="vs2026" set VS_OVERRIDE=18
 )
 
 @REM Check for clang-cl option (-l). Combined with -x it also builds the deps with
@@ -45,11 +61,28 @@ if "%USE_NINJA%"=="1" (
     goto :generator_ready
 )
 
-@REM Detect Visual Studio version using msbuild
-echo Detecting Visual Studio version using msbuild...
+if defined VS_OVERRIDE set VS_MAJOR=%VS_OVERRIDE%
+if defined VS_OVERRIDE echo Toolchain override requested: VS_MAJOR=%VS_MAJOR%
+if defined VS_OVERRIDE goto :map_generator
 
-@REM Try to get MSBuild version - the output format varies by VS version
+@REM Detect the latest installed Visual Studio with the C++ workload via
+@REM vswhere, which -latest sorts by version so this always picks the newest
+@REM instance regardless of what happens to be first on PATH.
 set VS_MAJOR=
+set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
+if exist "%VSWHERE%" (
+    echo Detecting latest installed Visual Studio via vswhere...
+    for /f "usebackq tokens=1 delims=." %%i in (`"%VSWHERE%" -latest -prerelease -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationVersion`) do set VS_MAJOR=%%i
+)
+
+if not "%VS_MAJOR%"=="" (
+    echo Detected latest installed Visual Studio: major version %VS_MAJOR%
+    goto :map_generator
+)
+
+@REM Fallback: detect the version via msbuild already on PATH (e.g. when run
+@REM from a Developer Command Prompt and vswhere isn't found).
+echo vswhere unavailable or found no instance with the C++ workload; falling back to msbuild on PATH...
 for /f "tokens=*" %%i in ('msbuild -version 2^>^&1 ^| findstr /r "^[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*"') do (
     for /f "tokens=1 delims=." %%a in ("%%i") do set VS_MAJOR=%%a
     set MSBUILD_OUTPUT=%%i
@@ -66,15 +99,16 @@ if "%VS_MAJOR%"=="" (
 )
 
 :version_found
-echo MSBuild version detected: %MSBUILD_OUTPUT%
-echo Major version: %VS_MAJOR%
+if defined MSBUILD_OUTPUT echo MSBuild version detected: %MSBUILD_OUTPUT%
 
 if "%VS_MAJOR%"=="" (
-    echo Error: Could not determine Visual Studio version from msbuild
-    echo Please ensure Visual Studio and MSBuild are properly installed
+    echo Error: Could not determine an installed Visual Studio version.
+    echo Install VS2019/2022/2026 with the "Desktop development with C++" workload,
+    echo or pass vs2019/vs2022/vs2026 as an argument to force a specific toolchain.
     exit /b 1
 )
 
+:map_generator
 if "%VS_MAJOR%"=="16" (
     set VS_VERSION=2019
     set CMAKE_GENERATOR="Visual Studio 16 2019"
