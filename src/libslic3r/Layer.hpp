@@ -204,6 +204,12 @@ public:
     // wall_sublayer_height is set for one of the regions, and always empty on the first layer.
     std::vector<WallSubSlice> wall_sub_slices;
 
+    // Orca: the material a sub-layered wall pass is printed onto - the pass below it, or the topmost
+    // sub-layer of the layer below. Both the wall generator and the G-code overhang estimator have to
+    // classify a pass against this rather than against the whole layer below, or a pass that is fully
+    // supported by the one beneath it reads as an overhang.
+    const ExPolygons*       wall_sublayer_support(size_t pass) const;
+
     size_t                  region_count() const { return m_regions.size(); }
     const LayerRegion*      get_region(int idx) const { return m_regions[idx]; }
     LayerRegion*            get_region(int idx) { return m_regions[idx]; }

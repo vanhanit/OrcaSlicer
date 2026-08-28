@@ -151,6 +151,16 @@ int wall_sublayer_count(const PrintRegionConfig &config, coordf_t layer_height)
     return n;
 }
 
+const ExPolygons* Layer::wall_sublayer_support(size_t pass) const
+{
+    if (pass > 0)
+        return pass <= this->wall_sub_slices.size() ? &this->wall_sub_slices[pass - 1].merged : nullptr;
+    if (this->lower_layer == nullptr)
+        return nullptr;
+    return this->lower_layer->wall_sub_slices.empty() ? &this->lower_layer->lslices
+                                                      : &this->lower_layer->wall_sub_slices.back().merged;
+}
+
 bool Layer::is_perimeter_compatible(const Print& print, const PrintRegion& a, const PrintRegion& b)
 {
     const PrintRegionConfig& config       = a.config();

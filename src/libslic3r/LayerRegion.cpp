@@ -184,10 +184,7 @@ void LayerRegion::make_perimeters(const SurfaceCollection &slices, const LayerRe
             &region_config, &object_config, &print_config, spiral_mode, model_rotation_rad,
             &this->sublayer_perimeters[k], &band_gap_fill, &band_fill_surfaces, &band_fill_no_overlap);
 
-        bg.lower_slices = k > 0                                          ? &layer->wall_sub_slices[k - 1].merged
-            : layer->lower_layer == nullptr                              ? nullptr
-            : layer->lower_layer->wall_sub_slices.empty()                ? &layer->lower_layer->lslices
-                                                                         : &layer->lower_layer->wall_sub_slices.back().merged;
+        bg.lower_slices = layer->wall_sublayer_support(k);
         if (layer->upper_layer != nullptr) {
             bg.upper_slices             = &layer->upper_layer->lslices;
             bg.upper_slices_same_region = &layer->upper_layer->get_region(region_id)->slices;
