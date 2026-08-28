@@ -7626,6 +7626,9 @@ std::string GCode::extrude_sublayer_walls(const Print &print, const std::vector<
     bool any_pass_printed = false;
     for (size_t pass = 0; pass < num_passes; ++ pass) {
         bool this_pass_printed = false;
+        // The material under a pass is a property of the object layer, so it is built once per
+        // object rather than once per instance of it.
+        std::set<const PrintObject*> supports_set_this_pass;
         for (const InstanceVisit &visit : instance_visits) {
             const InstanceToPrint &instance_to_print = instances_to_print[visit.instance_idx];
             const Layer           *layer             = layers[instance_to_print.layer_id].object_layer;
@@ -7661,6 +7664,12 @@ std::string GCode::extrude_sublayer_walls(const Print &print, const std::vector<
             // Keys the overhang estimator's per-object layer boundaries; without it these walls would
             // be measured against whichever object was emitted last.
             m_extrusion_quality_estimator.set_current_object(&instance_to_print.print_object);
+            // These walls sit on the pass below them, not on the layer below, so that is what the
+            // overhang estimator has to measure them against - otherwise a wall a full-height pass
+            // would print at full speed is slowed down and gets the part cooling fan.
+            if (supports_set_this_pass.insert(&instance_to_print.print_object).second)
+                if (const ExPolygons *support = layer->wall_sublayer_support(pass); support != nullptr)
+                    m_extrusion_quality_estimator.override_prev_layer_boundary(&instance_to_print.print_object, *support);
 
             // The pass ends at its own height, which the writer reaches lazily on the next travel.
             m_nominal_z = layer->wall_sub_slices[pass].print_z + m_config.z_offset.value;
@@ -7724,6 +7733,8 @@ std::string GCode::extrude_sublayer_walls(const Print &print, const std::vector<
         any_pass_printed = any_pass_printed || this_pass_printed;
     }
     m_in_sublayer_wall_pass = false;
+    // The rest of the layer prints at print_z over the whole layer below again.
+    m_extrusion_quality_estimator.restore_prev_layer_boundaries();
 
     // Flush a pending object end label before the layer's normal phase reopens an object.
     m_writer.add_object_end_labels(gcode);

@@ -403,6 +403,9 @@ class ExtrusionQualityEstimator
     std::unordered_map<const PrintObject*, AABBTreeLines::LinesDistancer<Linef3>>      next_layer_boundaries;
     std::unordered_map<const PrintObject *, AABBTreeLines::LinesDistancer<CurledLine>> prev_curled_extrusions;
     std::unordered_map<const PrintObject *, AABBTreeLines::LinesDistancer<CurledLine>> next_curled_extrusions;
+    // Orca: sub-layered walls. What prev_layer_boundaries held before it was pointed at the material
+    // under one wall pass, so it can be put back for the rest of the layer.
+    std::unordered_map<const PrintObject*, AABBTreeLines::LinesDistancer<Linef3>>      saved_layer_boundaries;
     const PrintObject                                                            *current_object;
 
 public:
@@ -416,6 +419,27 @@ public:
         next_layer_boundaries[object]  = AABBTreeLines::LinesDistancer<Linef3>{to_unscaled_linesf3(layer->lslices)};
         prev_curled_extrusions[object] = next_curled_extrusions[object];
         next_curled_extrusions[object] = AABBTreeLines::LinesDistancer<CurledLine>{layer->curled_lines};
+    }
+
+    // Orca: sub-layered walls. A wall pass is printed onto the pass below it, not onto the layer
+    // below, so measuring it against the layer below reports an overhang where a full-height wall
+    // would have none - and with it a needless slowdown and part cooling fan. Point the boundary at
+    // what is really underneath the pass for as long as it is being emitted.
+    // The curled extrusions are deliberately left alone: they protrude upwards from the layer below
+    // and can be in the way of any pass.
+    void override_prev_layer_boundary(const PrintObject *object, const ExPolygons &support)
+    {
+        auto saved = saved_layer_boundaries.find(object);
+        if (saved == saved_layer_boundaries.end())
+            saved_layer_boundaries.emplace(object, prev_layer_boundaries[object]);
+        prev_layer_boundaries[object] = AABBTreeLines::LinesDistancer<Linef3>{to_unscaled_linesf3(support)};
+    }
+
+    void restore_prev_layer_boundaries()
+    {
+        for (auto &saved : saved_layer_boundaries)
+            prev_layer_boundaries[saved.first] = std::move(saved.second);
+        saved_layer_boundaries.clear();
     }
 
     std::vector<ProcessedPoint> estimate_extrusion_quality(const ExtrusionPath                &path,
