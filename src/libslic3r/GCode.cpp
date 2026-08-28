@@ -7621,7 +7621,11 @@ std::string GCode::extrude_sublayer_walls(const Print &print, const std::vector<
 
     std::string gcode;
     m_in_sublayer_wall_pass = true;
+    // Each pass is a layer of its own in the preview, so it is marked as one - but only once it is
+    // known to print something, otherwise the preview would be left with an empty layer.
+    bool any_pass_printed = false;
     for (size_t pass = 0; pass < num_passes; ++ pass) {
+        bool this_pass_printed = false;
         for (const InstanceVisit &visit : instance_visits) {
             const InstanceToPrint &instance_to_print = instances_to_print[visit.instance_idx];
             const Layer           *layer             = layers[instance_to_print.layer_id].object_layer;
@@ -7636,6 +7640,14 @@ std::string GCode::extrude_sublayer_walls(const Print &print, const std::vector<
                     regions.emplace_back(layerm);
             if (regions.empty())
                 continue;
+
+            if (! this_pass_printed) {
+                // The last pass ends at the layer's own print_z, so it shares its preview layer with
+                // everything else printed there - only the passes below it open one.
+                if (any_pass_printed)
+                    gcode += ";" + GCodeProcessor::Sub_Layer_Tag + "\n";
+                this_pass_printed = true;
+            }
 
             const auto &inst = instance_to_print.print_object.instances()[instance_to_print.instance_id];
             m_config.apply(print.default_region_config());
@@ -7709,6 +7721,7 @@ std::string GCode::extrude_sublayer_walls(const Print &print, const std::vector<
                 }
             }
         }
+        any_pass_printed = any_pass_printed || this_pass_printed;
     }
     m_in_sublayer_wall_pass = false;
 

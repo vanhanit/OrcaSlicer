@@ -4,10 +4,13 @@
 #include "libslic3r/GCodeReader.hpp"
 #include "libslic3r/Layer.hpp"
 #include "libslic3r/Print.hpp"
+#include "libslic3r/GCode/GCodeProcessor.hpp"
 
 #include "test_helpers.hpp"
 
 #include <algorithm>
+#include <cmath>
+#include <map>
 #include <set>
 #include <string>
 #include <vector>
@@ -409,4 +412,52 @@ TEST_CASE("Sub-layered walls carry features that have nothing else to print", "[
     for (const auto &layer : extruding_zs_per_layer(every_loop))
         for (size_t k = 1; k < layer.size(); ++ k)
             REQUIRE(layer[k] >= layer[k - 1] - EPSILON);
+}
+
+TEST_CASE("Sub-layered wall passes are preview layers of their own", "[WallSublayers]")
+{
+    // Every pass prints at its own Z, so the preview lists it as its own layer instead of burying it
+    // in the middle of the layer's moves. The passes below print_z each open one; the last pass ends
+    // at print_z and shares that layer with the walls and infill printed there.
+    const std::string gcode = slice({cube(20)}, base_config("0.1", "arachne"));
+    REQUIRE(! gcode.empty());
+
+    // One marker per pass below print_z, and never one on the un-subdivided first layer.
+    std::vector<int> markers_per_layer;
+    GCodeReader      reader;
+    reader.parse_buffer(gcode, [&markers_per_layer](GCodeReader &, const GCodeReader::GCodeLine &line) {
+        const std::string_view comment = line.comment();
+        if (comment.find("LAYER_CHANGE") != std::string_view::npos)
+            markers_per_layer.emplace_back(0);
+        else if (! markers_per_layer.empty() && comment == GCodeProcessor::Sub_Layer_Tag)
+            ++ markers_per_layer.back();
+    });
+    REQUIRE(markers_per_layer.size() > 2);
+    CHECK(markers_per_layer.front() == 0);
+    CHECK(markers_per_layer[1] == 1);
+
+    // The preview builds one layer per marker, so every marker has to be followed by something to
+    // print - an empty preview layer would leave a gap the viewer cannot represent - and each of
+    // those layers is printed at a single, rising Z.
+    std::vector<std::vector<double>> preview_layers;
+    GCodeReader                      preview_reader;
+    preview_reader.parse_buffer(gcode, [&preview_layers](GCodeReader &self, const GCodeReader::GCodeLine &line) {
+        const std::string_view comment = line.comment();
+        if (comment.find("LAYER_CHANGE") != std::string_view::npos || comment == GCodeProcessor::Sub_Layer_Tag)
+            preview_layers.emplace_back();
+        else if (! preview_layers.empty() && line.extruding(self) && line.dist_XY(self) > 0)
+            preview_layers.back().emplace_back(self.z());
+    });
+
+    // Twice as many preview layers as the printer prints, bar the first layer which is not split.
+    CHECK(preview_layers.size() == 2 * markers_per_layer.size() - 1);
+    double previous_z = 0.;
+    for (size_t i = 0; i < preview_layers.size(); ++ i) {
+        INFO("preview layer " << i);
+        REQUIRE(! preview_layers[i].empty());
+        const std::vector<double> zs = distinct_sorted(preview_layers[i]);
+        CHECK(zs.size() == 1);
+        CHECK(zs.front() > previous_z);
+        previous_z = zs.front();
+    }
 }
