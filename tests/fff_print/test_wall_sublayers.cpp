@@ -1,6 +1,7 @@
 #include <catch2/catch_all.hpp>
 
 #include "libslic3r/libslic3r.h"
+#include "libslic3r/BoundingBox.hpp"
 #include "libslic3r/GCodeReader.hpp"
 #include "libslic3r/Layer.hpp"
 #include "libslic3r/Print.hpp"
@@ -110,6 +111,37 @@ std::vector<std::map<double, double>> slowest_feedrate_of_type_per_layer_z(const
             it->second = std::min(it->second, double(self.f()));
     });
     return layers;
+}
+
+// The XY bounding box of everything extruded under the given ;TYPE: tag, per Z.
+std::map<double, BoundingBoxf> bbox_of_type_by_z(const std::string &gcode, const std::string &type)
+{
+    std::map<double, BoundingBoxf> boxes;
+    std::string                    current;
+    GCodeReader                    reader;
+    reader.parse_buffer(gcode, [&](GCodeReader &self, const GCodeReader::GCodeLine &line) {
+        const std::string_view comment = line.comment();
+        const size_t           tag = comment.find("TYPE:");
+        if (tag != std::string_view::npos) {
+            current = std::string(comment.substr(tag + 5));
+            return;
+        }
+        if (current != type || ! line.extruding(self) || line.dist_XY(self) <= 0)
+            return;
+        boxes[self.z()].merge(Vec2d(self.x(), self.y()));
+    });
+    return boxes;
+}
+
+// The same cone stood on its head, so the model gains area as Z rises instead of losing it. Each
+// pass's wall then lands outside everything below it, with nothing at all underneath - a hole's
+// lower lip, where a contour appears part way up the layer.
+TriangleMesh inverted_shallow_cone()
+{
+    TriangleMesh m = make_cone(20.0, 2.0);
+    m.mirror_z();
+    m.translate(0., 0., 2.0);
+    return m;
 }
 
 // A cone 2mm tall over a 40mm base: its surface rises 1mm for every 10mm it moves inward, so within
@@ -614,4 +646,60 @@ TEST_CASE("Sub-layered walls are not slowed down as overhangs", "[WallSublayers]
     // their own account. Measured against the layer below instead, a third of them do.
     INFO(consistent << " of " << total << " layers print all their passes at one speed");
     CHECK(consistent > total * 9 / 10);
+}
+
+
+TEST_CASE("Sub-layered walls support a wall line that stands over nothing", "[WallSublayers]")
+{
+    // Where a contour appears part way up a layer - the lower lip of a hole - the next pass's wall
+    // lands outside everything below it rather than inside the void of the pass beneath, so there is
+    // nothing for the pass below to fill *within* its own contour. It has to reach past that contour
+    // and lay the material down anyway, or the wall is printed in mid air.
+    const auto wall_generator = GENERATE("arachne", "classic");
+    INFO("wall_generator=" << wall_generator);
+
+    const std::string gcode = slice({inverted_shallow_cone()}, base_config("0.05", wall_generator));
+    REQUIRE(! gcode.empty());
+
+    const auto layers = extruding_zs_per_layer(gcode);
+    REQUIRE(layers.size() > 4);
+
+    std::set<double> layer_print_zs;
+    for (const auto &layer : layers)
+        if (! layer.empty())
+            layer_print_zs.insert(distinct_sorted(layer).back());
+
+    int fill_at_sublayer_z = 0;
+    for (const double z : zs_of_type(gcode, "Internal solid infill"))
+        if (layer_print_zs.find(z) == layer_print_zs.end())
+            ++ fill_at_sublayer_z;
+    CHECK(fill_at_sublayer_z > 0);
+}
+
+TEST_CASE("Sub-layered walls keep the layer's own walls inside the topmost pass", "[WallSublayers]")
+{
+    // The core run and the topmost pass both print at print_z, so the contour the layer presents
+    // there is the topmost pass's. Built from the layer's mid-height slice instead, the walls the
+    // core run is left with sit outside that contour on any slope shallower than about 13 degrees,
+    // hanging off the edge of the model.
+    const std::string gcode = slice({shallow_cone()}, base_config("0.05", "arachne"));
+    REQUIRE(! gcode.empty());
+
+    const auto outer = bbox_of_type_by_z(gcode, "Outer wall");
+    const auto inner = bbox_of_type_by_z(gcode, "Inner wall");
+    REQUIRE(! outer.empty());
+
+    int compared = 0;
+    for (const auto &[z, inner_box] : inner) {
+        const auto outer_box = outer.find(z);
+        if (outer_box == outer.end())
+            continue;
+        INFO("at z " << z << " inner walls span " << inner_box.min.x() << ".." << inner_box.max.x()
+             << " and the outer wall " << outer_box->second.min.x() << ".." << outer_box->second.max.x());
+        // An inner wall reaching further out than the outer wall is outside the printed surface.
+        CHECK(inner_box.max.x() <= outer_box->second.max.x() + EPSILON);
+        CHECK(inner_box.min.x() >= outer_box->second.min.x() - EPSILON);
+        ++ compared;
+    }
+    CHECK(compared > 4);
 }
