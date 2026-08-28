@@ -9,6 +9,7 @@
 #include "BoundingBox.hpp"
 #include "SVG.hpp"
 #include "Algorithm/RegionExpansion.hpp"
+#include "Fill/FillBase.hpp"
 
 #include <string>
 #include <map>
@@ -77,6 +78,44 @@ void LayerRegion::slices_to_fill_surfaces_clipped()
         if (! this_surfaces.empty())
             this->fill_surfaces.append(intersection_ex(this_surfaces, this->fill_expolygons), SurfaceType(surface_type));
     }
+}
+
+// Orca: sub-layered walls. Solid fill printed inside a wall pass, on the strip the pass above it
+// would otherwise land on with nothing underneath. Flow and height are the sub-layer's, not a
+// bridging flow: a bridge thread is as thick as the nozzle and would stand proud of the pass.
+static void append_sublayer_support_fill(ExtrusionEntityCollection &out,
+                                         const ExPolygons          &areas,
+                                         const Flow                &flow,
+                                         float                      angle,
+                                         const Layer               &layer,
+                                         const PrintRegionConfig   &region_config)
+{
+    std::unique_ptr<Fill> filler(Fill::new_from_type(ipRectilinear));
+    filler->set_bounding_box(layer.object()->bounding_box());
+    filler->layer_id            = layer.id();
+    filler->z                   = layer.print_z;
+    filler->angle               = angle;
+    filler->spacing             = flow.spacing();
+    filler->link_max_length     = (coord_t) scale_(3. * filler->spacing);
+    filler->print_config        = &layer.object()->print()->config();
+    filler->print_object_config = &layer.object()->config();
+
+    FillParams params;
+    params.density        = 1.f;
+    params.dont_adjust    = true;
+    params.flow           = flow;
+    params.extrusion_role = erSolidInfill;
+    params.config         = &region_config;
+
+    ExtrusionEntitiesPtr entities;
+    Surface              surface(stInternalSolid, ExPolygon());
+    for (const ExPolygon &expoly : areas) {
+        surface.expolygon = expoly;
+        // Spacing is modified in place by the filler to report its adjustment.
+        filler->spacing = flow.spacing();
+        filler->fill_surface_extrusion(&surface, params, entities);
+    }
+    out.append(std::move(entities));
 }
 
 void LayerRegion::make_perimeters(const SurfaceCollection &slices, const LayerRegionPtrs &compatible_regions, SurfaceCollection* fill_surfaces, ExPolygons* fill_no_overlap)
@@ -157,8 +196,13 @@ void LayerRegion::make_perimeters(const SurfaceCollection &slices, const LayerRe
     // Overhangs and bridges are classified against the sub-layer below, so a wall that is supported
     // by the pass beneath it is no longer treated as an overhang of the whole layer.
     const Layer *layer = this->layer();
-    this->sublayer_perimeters.resize(layer->wall_sub_slices.size());
-    for (size_t k = 0; k < layer->wall_sub_slices.size(); ++ k) {
+    const size_t num_passes = layer->wall_sub_slices.size();
+    this->sublayer_perimeters.resize(num_passes);
+    // The footprint of each pass's wall band and the area left inside it. The band of pass k+1 is
+    // laid on top of what pass k printed, so these drive both the support fill below and the
+    // exclusion of the layer's own fill from the columns the passes occupy.
+    std::vector<ExPolygons> pass_band(num_passes), pass_interior(num_passes);
+    for (size_t k = 0; k < num_passes; ++ k) {
         const WallSubSlice &sub = layer->wall_sub_slices[k];
 
         ExPolygons band_expolygons;
@@ -169,12 +213,14 @@ void LayerRegion::make_perimeters(const SurfaceCollection &slices, const LayerRe
         }
         if (band_expolygons.empty())
             continue;
+        const ExPolygons pass_slices = union_ex(band_expolygons);
 
         SurfaceCollection band_slices;
-        band_slices.append(offset_ex(union_ex(band_expolygons), ClipperSafetyOffset), stInternal);
+        band_slices.append(offset_ex(pass_slices, ClipperSafetyOffset), stInternal);
 
-        // Discarded: the fill areas and the extra perimeters belong to the core run, which sees the
-        // whole layer. Only the gap fill is kept, appended after the walls of this same sub-layer.
+        // The fill surfaces and the extra perimeters belong to the core run, which sees the whole
+        // layer. The gap fill is kept, appended after the walls of this same sub-layer, and the
+        // no-overlap fill area is kept because it is the area left inside this pass's wall band.
         ExtrusionEntityCollection band_gap_fill;
         SurfaceCollection         band_fill_surfaces;
         ExPolygons                band_fill_no_overlap;
@@ -202,6 +248,27 @@ void LayerRegion::make_perimeters(const SurfaceCollection &slices, const LayerRe
             bg.process_classic();
 
         this->sublayer_perimeters[k].append(std::move(band_gap_fill.entities));
+
+        pass_interior[k] = union_ex(band_fill_no_overlap);
+        pass_band[k]     = diff_ex(pass_slices, pass_interior[k]);
+    }
+
+    // The wall band of pass k+1 lands on whatever pass k printed. Where the contour steps inward
+    // faster than the band is wide - a hole closing over within the layer, a near-horizontal
+    // ceiling - part of that band hangs over the void inside pass k, so pass k fills it first.
+    const Flow  support_flow  = this->flow(frSolidInfill, layer->wall_sub_slices.front().height);
+    const float support_angle = float(Geometry::deg2rad(region_config.solid_infill_direction.value) + model_rotation_rad);
+    // Anything narrower than one extrusion cannot be filled, and an overhang of well under a line
+    // width is what an ordinary layer already prints over. Both make this a no-op on plain geometry.
+    const float support_min_width = float(support_flow.scaled_width());
+    for (size_t k = 0; k + 1 < num_passes; ++ k) {
+        if (pass_interior[k].empty() || pass_band[k + 1].empty())
+            continue;
+        ExPolygons unsupported = opening_ex(intersection_ex(pass_band[k + 1], pass_interior[k]), support_min_width / 2.f);
+        if (unsupported.empty())
+            continue;
+        append_sublayer_support_fill(this->sublayer_perimeters[k], unsupported, support_flow,
+                                     support_angle + float((k % 2) * M_PI / 2.), *layer, region_config);
     }
 }
 
