@@ -139,6 +139,29 @@ void LayerRegion::make_perimeters(const SurfaceCollection &slices, const LayerRe
         model_rotation_rad = std::atan2((double)m(1, 0), (double)m(0, 0));
     }
 
+    const Layer *layer      = this->layer();
+    const size_t num_passes = layer->wall_sub_slices.size();
+    const int    region_id  = this->region().print_object_region_id();
+
+    // Orca: sub-layered walls. The band passes below print the outermost loops at the sub-layer
+    // heights, so the core run must not emit them as well.
+    const int band_walls = num_passes == 0 || spiral_mode
+        ? 0
+        : std::clamp(region_config.wall_sublayer_loops.value, 0, region_config.wall_loops.value);
+
+    // The area each pass is generated from: this layer re-sliced at that sub-layer's height, over
+    // all the regions sharing this perimeter run.
+    std::vector<ExPolygons> pass_slices(band_walls == 0 ? 0 : num_passes);
+    for (size_t k = 0; k < pass_slices.size(); ++ k) {
+        ExPolygons expolygons;
+        for (const LayerRegion *layerm : compatible_regions) {
+            const int band_region_id = layerm->region().print_object_region_id();
+            if (band_region_id >= 0 && size_t(band_region_id) < layer->wall_sub_slices[k].region_slices.size())
+                append(expolygons, layer->wall_sub_slices[k].region_slices[band_region_id]);
+        }
+        pass_slices[k] = union_ex(expolygons);
+    }
+
     PerimeterGenerator g(
         // input:
         &slices,
@@ -166,7 +189,6 @@ void LayerRegion::make_perimeters(const SurfaceCollection &slices, const LayerRe
     if (this->layer()->upper_layer != NULL)
         g.upper_slices = &this->layer()->upper_layer->lslices;
 
-    int region_id = this->region().print_object_region_id();
     if (this->layer()->upper_layer != NULL)
         g.upper_slices_same_region = &this->layer()->upper_layer->get_region(region_id)->slices;
 
@@ -177,11 +199,6 @@ void LayerRegion::make_perimeters(const SurfaceCollection &slices, const LayerRe
 
     const bool arachne = this->layer()->object()->config().wall_generator.value == PerimeterGeneratorType::Arachne && !spiral_mode;
 
-    // Orca: sub-layered walls. The band passes below print the outermost loops at the sub-layer
-    // heights, so the core run must not emit them as well.
-    const int band_walls = this->layer()->wall_sub_slices.empty() || spiral_mode
-        ? 0
-        : std::clamp(region_config.wall_sublayer_loops.value, 0, region_config.wall_loops.value);
     g.sublayer_drop_walls = band_walls;
 
     if (arachne)
@@ -195,8 +212,6 @@ void LayerRegion::make_perimeters(const SurfaceCollection &slices, const LayerRe
     // One wall generator run per sub-layer, each fed the mesh re-sliced at that sub-layer's height.
     // Overhangs and bridges are classified against the sub-layer below, so a wall that is supported
     // by the pass beneath it is no longer treated as an overhang of the whole layer.
-    const Layer *layer = this->layer();
-    const size_t num_passes = layer->wall_sub_slices.size();
     this->sublayer_perimeters.resize(num_passes);
     // The footprint of each pass's wall band and the area left inside it. The band of pass k+1 is
     // laid on top of what pass k printed, so these drive both the support fill below and the
@@ -204,19 +219,11 @@ void LayerRegion::make_perimeters(const SurfaceCollection &slices, const LayerRe
     std::vector<ExPolygons> pass_band(num_passes), pass_interior(num_passes);
     for (size_t k = 0; k < num_passes; ++ k) {
         const WallSubSlice &sub = layer->wall_sub_slices[k];
-
-        ExPolygons band_expolygons;
-        for (const LayerRegion *layerm : compatible_regions) {
-            const int band_region_id = layerm->region().print_object_region_id();
-            if (band_region_id >= 0 && size_t(band_region_id) < sub.region_slices.size())
-                append(band_expolygons, sub.region_slices[band_region_id]);
-        }
-        if (band_expolygons.empty())
+        if (pass_slices[k].empty())
             continue;
-        const ExPolygons pass_slices = union_ex(band_expolygons);
 
         SurfaceCollection band_slices;
-        band_slices.append(offset_ex(pass_slices, ClipperSafetyOffset), stInternal);
+        band_slices.append(offset_ex(pass_slices[k], ClipperSafetyOffset), stInternal);
 
         // The fill surfaces and the extra perimeters belong to the core run, which sees the whole
         // layer. The gap fill is kept, appended after the walls of this same sub-layer, and the
@@ -250,21 +257,34 @@ void LayerRegion::make_perimeters(const SurfaceCollection &slices, const LayerRe
         this->sublayer_perimeters[k].append(std::move(band_gap_fill.entities));
 
         pass_interior[k] = union_ex(band_fill_no_overlap);
-        pass_band[k]     = diff_ex(pass_slices, pass_interior[k]);
+        pass_band[k]     = diff_ex(pass_slices[k], pass_interior[k]);
     }
 
-    // The wall band of pass k+1 lands on whatever pass k printed. Where the contour steps inward
-    // faster than the band is wide - a hole closing over within the layer, a near-horizontal
-    // ceiling - part of that band hangs over the void inside pass k, so pass k fills it first.
+    // The wall band of pass k+1 lands on whatever pass k printed, so wherever this pass's own walls
+    // do not already cover it, pass k lays the material down first. Two ways that happens: the
+    // contour steps inward faster than the band is wide, leaving the next band over the void inside
+    // this pass; or a contour appears that this pass does not have at all - the lip of a hole, where
+    // the next band stands over nothing whatsoever.
     const Flow  support_flow  = this->flow(frSolidInfill, layer->wall_sub_slices.front().height);
     const float support_angle = float(Geometry::deg2rad(region_config.solid_infill_direction.value) + model_rotation_rad);
     // Anything narrower than one extrusion cannot be filled, and an overhang of well under a line
     // width is what an ordinary layer already prints over. Both make this a no-op on plain geometry.
     const float support_min_width = float(support_flow.scaled_width());
     for (size_t k = 0; k + 1 < num_passes; ++ k) {
-        if (pass_interior[k].empty() || pass_band[k + 1].empty())
+        if (pass_band[k + 1].empty())
             continue;
-        ExPolygons unsupported = opening_ex(intersection_ex(pass_band[k + 1], pass_interior[k]), support_min_width / 2.f);
+        const ExPolygons needed = diff_ex(pass_band[k + 1], pass_band[k]);
+        if (needed.empty())
+            continue;
+        // Inside this pass, where its own walls leave the area open.
+        ExPolygons unsupported = intersection_ex(needed, pass_interior[k]);
+        // And past this pass's contour, where the model has nothing at this height for the wall
+        // above to stand on. Filling there puts material outside the model's own surface, but only
+        // for the height of one sub-layer and only as wide as the wall it holds up - the price of
+        // printing the wall at all rather than leaving it hanging.
+        if (const ExPolygons *below = layer->wall_sublayer_support(k); below != nullptr)
+            append(unsupported, diff_ex(diff_ex(needed, pass_slices[k]), *below));
+        unsupported = opening_ex(union_ex(unsupported), support_min_width / 2.f);
         if (unsupported.empty())
             continue;
         append_sublayer_support_fill(this->sublayer_perimeters[k], unsupported, support_flow,
