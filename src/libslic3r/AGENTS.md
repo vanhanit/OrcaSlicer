@@ -76,6 +76,13 @@ the scarf height resolution in `GCode::extrude_loop`.
 by instance, then by island and region, and `extrude_perimeters` / `extrude_infill` decide the order
 from the per-region `is_infill_first`. Ironing is always emitted last.
 
+Three separate emptiness checks read `LayerRegion::perimeters` and `fills` to decide whether anything
+exists to print: `LayerRegion::has_extrusions()` (skips the layer), `ToolOrdering::collect_extruders`
+(claims the filament) and the island collection in `process_layer` (creates the instance). Extrusions
+held anywhere else are invisible to all three, and a feature that is *only* walls — a thin plate, a
+Benchy's smoke stack — has nothing in either collection to fall back on, so it is dropped silently
+rather than misprinted. Anything storing extrusions outside those two has to be added to all three.
+
 ### Z within a layer
 
 Three features already print part of a layer at a Z other than `print_z`; all of them work the same
@@ -102,6 +109,12 @@ Rules that hold for anything printing at several Z levels in one layer:
 - Emit exactly **one** layer-change tag per real layer. `GCodeProcessor` counts layers from that tag,
   so extra Z moves do not create phantom preview layers. The `;HEIGHT:` tag is per path and is the
   right place to report a sub-height.
+- `m_layer_id` is the number of layers the *printer* prints: it is written into the G-code header as
+  the total layer count and buckets the time estimate. To give the preview a layer of its own without
+  disturbing either, count separately and add that to `MoveVertex::layer_id`, which nothing outside
+  `GCodeViewer` reads (`m_sub_layer_count` and `GCodeProcessor::Sub_Layer_Tag` are the example). The
+  viewer requires those ids to arrive in order and without gaps, so mark a sub-layer only once it is
+  known to print something.
 - Set a hidden derived bool (`has_scarf_joint_seam`, `has_sublayered_walls`) in `PrintApply.cpp` and
   OR it into `GCodeProcessor::m_detect_layer_based_on_tag`, otherwise the seam detector mis-reads the
   in-layer Z changes.

@@ -134,10 +134,30 @@ While `m_in_sublayer_wall_pass` is set, two features are suppressed:
 - **wipe-before-external-loop**, which aims for a neighbouring inner wall that does not exist at that
   height yet.
 
+A region whose every loop is sub-layered keeps nothing in `LayerRegion::perimeters`, and a feature
+that is only walls — a thin plate, a Benchy's smoke stack — has no fills either. Three emptiness
+checks decide whether such a feature is printed at all, and each reads only those two collections:
+`LayerRegion::has_extrusions()`, `ToolOrdering::collect_extruders` and the island collection in
+`process_layer`. All three consult `has_sublayer_walls()` as well; missing any one of them drops the
+feature from the G-code without a warning.
+
+### Preview
+
 `GCodeProcessor` counts layers from the layer-change tag, which is still emitted once per layer, so
-the extra Z moves create no phantom preview layers. `has_sublayered_walls` is OR-ed into
+the printer's layer count and the time estimate are unchanged. `has_sublayered_walls` is OR-ed into
 `m_detect_layer_based_on_tag` so the seam detector tolerates in-layer Z changes, mirroring
 `has_scarf_joint_seam`.
+
+The preview does need a layer per pass, or the passes are only reachable by dragging the horizontal
+slider through the middle of a layer. `GCodeProcessor::Sub_Layer_Tag` marks each pass below `print_z`
+and is counted into `m_sub_layer_count`, which is added to `MoveVertex::layer_id` — a field nothing
+outside `GCodeViewer` reads. The last pass ends at `print_z` and so shares its preview layer with the
+walls and infill printed there, which keeps one Z per preview layer. The marker is written only once
+a pass is known to print something, because the viewer cannot represent an empty layer.
+
+Sub-layered walls keep the ordinary `erExternalPerimeter` / `erPerimeter` roles, so `;TYPE:` tags,
+speeds and cooling are what they would be for a full-height wall, and the preview's feature-type list
+counts them under Outer wall and Inner wall rather than on a row of their own.
 
 ## Conflicts
 
