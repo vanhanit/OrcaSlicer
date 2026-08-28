@@ -85,6 +85,39 @@ std::set<double> zs_of_type(const std::string &gcode, const std::string &type)
     return zs;
 }
 
+// The slowest feedrate used for the given ;TYPE: tag at each Z of a layer, one entry per layer.
+// Layers printing nothing of that type are left out.
+std::vector<std::map<double, double>> slowest_feedrate_of_type_per_layer_z(const std::string &gcode, const std::string &type)
+{
+    std::vector<std::map<double, double>> layers;
+    std::string                           current;
+    GCodeReader                           reader;
+    reader.parse_buffer(gcode, [&](GCodeReader &self, const GCodeReader::GCodeLine &line) {
+        const std::string_view comment = line.comment();
+        if (comment.find("LAYER_CHANGE") != std::string_view::npos) {
+            layers.emplace_back();
+            return;
+        }
+        const size_t tag = comment.find("TYPE:");
+        if (tag != std::string_view::npos) {
+            current = std::string(comment.substr(tag + 5));
+            return;
+        }
+        if (layers.empty() || current != type || ! line.extruding(self) || line.dist_XY(self) <= 0)
+            return;
+        auto [it, inserted] = layers.back().emplace(self.z(), self.f());
+        if (! inserted)
+            it->second = std::min(it->second, double(self.f()));
+    });
+    return layers;
+}
+
+// A cone 2mm tall over a 40mm base: its surface rises 1mm for every 10mm it moves inward, so within
+// one 0.2mm layer the contour sweeps 2mm sideways - far more than a wall is wide. Every sub-layer
+// wall pass therefore lands well inside the pass below it, which is the shape of the problem a
+// Benchy's hull makes around the hawseholes.
+TriangleMesh shallow_cone() { return make_cone(20.0, 2.0); }
+
 // 0.2mm layers with z_hop off, so a recorded Z is always a printing Z.
 DynamicPrintConfig base_config(const char *sublayer_height, const char *wall_generator)
 {
@@ -460,4 +493,125 @@ TEST_CASE("Sub-layered wall passes are preview layers of their own", "[WallSubla
         CHECK(zs.front() > previous_z);
         previous_z = zs.front();
     }
+}
+
+TEST_CASE("Sub-layered walls are supported by the pass beneath them", "[WallSublayers]")
+{
+    // On a surface shallow enough that the contour sweeps further than a wall is wide between two
+    // passes, the wall of a pass lands inside the void of the pass below it. The pass below has to
+    // fill the strip it will land on first, or the wall is extruded into thin air.
+    const auto wall_generator = GENERATE("arachne", "classic");
+    INFO("wall_generator=" << wall_generator);
+
+    const std::string gcode = slice({shallow_cone()}, base_config("0.05", wall_generator));
+    REQUIRE(! gcode.empty());
+
+    const auto layers = extruding_zs_per_layer(gcode);
+    REQUIRE(layers.size() > 4);
+
+    // Solid fill printed at a Z that is not a layer's own print_z can only come from a wall pass.
+    std::set<double> layer_print_zs;
+    for (const auto &layer : layers)
+        if (! layer.empty())
+            layer_print_zs.insert(distinct_sorted(layer).back());
+
+    int fill_at_sublayer_z = 0;
+    for (const double z : zs_of_type(gcode, "Internal solid infill"))
+        if (layer_print_zs.find(z) == layer_print_zs.end())
+            ++ fill_at_sublayer_z;
+    CHECK(fill_at_sublayer_z > 0);
+}
+
+TEST_CASE("Sub-layered walls add no support fill where the walls stack up", "[WallSublayers]")
+{
+    // The no-op guarantee for the support fill: a vertical wall repeats the same contour at every
+    // pass, so no pass ever lands on the void inside the one below it and nothing is filled early.
+    const std::string gcode = slice({cube(20)}, base_config("0.05", "arachne"));
+    REQUIRE(! gcode.empty());
+
+    const auto layers = extruding_zs_per_layer(gcode);
+    REQUIRE(layers.size() > 2);
+
+    std::set<double> layer_print_zs;
+    for (const auto &layer : layers)
+        if (! layer.empty())
+            layer_print_zs.insert(distinct_sorted(layer).back());
+
+    for (const double z : zs_of_type(gcode, "Internal solid infill")) {
+        INFO("solid infill at z " << z);
+        CHECK(layer_print_zs.find(z) != layer_print_zs.end());
+    }
+}
+
+TEST_CASE("Sub-layered walls keep the layer's own infill out of their columns", "[WallSublayers]")
+{
+    // A pass's wall band occupies its column for the whole height of the layer, so the layer's own
+    // infill - printed afterwards at print_z, at the full layer height - must not be laid over it.
+    auto fill_area = [](const char *sublayer_height) {
+        Print print;
+        Model model;
+        DynamicPrintConfig config = base_config(sublayer_height, "arachne");
+        // A single wall, so the fill area reaches out far enough for the passes to sweep across it.
+        // With three walls the 2mm the contour travels within a layer is swallowed by the wall stack.
+        config.set_deserialize_strict({{"wall_loops", "1"}});
+        init_print({shallow_cone()}, print, model, config);
+        print.process();
+
+        const auto &layers = print.objects().front()->layers();
+        double      area   = 0.;
+        for (size_t i = 1; i < layers.size(); ++ i)
+            for (const LayerRegion *layerm : layers[i]->regions())
+                for (const ExPolygon &expoly : layerm->fill_expolygons)
+                    area += expoly.area();
+        return area;
+    };
+
+    const double plain      = fill_area("0");
+    const double sublayered = fill_area("0.05");
+    REQUIRE(plain > 0.);
+    // The columns the passes occupy are given up by the layer's fill, so there is strictly less of it.
+    CHECK(sublayered < plain);
+}
+
+TEST_CASE("Sub-layered walls are not slowed down as overhangs", "[WallSublayers]")
+{
+    // Every pass of a layer is printed onto the pass right below it, the same sub-layer height down,
+    // so the material under each of them is alike and they all deserve the same speed. Measured
+    // instead against the layer below - which is what the estimator does for an ordinary wall - the
+    // passes are between one and two layer heights above their reference, so the higher ones read as
+    // hanging over further than they do and pick up an overhang slowdown, with the part cooling fan
+    // behind it, that a full-height wall over the same geometry never triggers.
+    DynamicPrintConfig config = base_config("0.05", "arachne");
+    config.set_deserialize_strict({{"enable_overhang_speed", "1"},
+                                   {"slowdown_for_curled_perimeters", "0"},
+                                   {"enable_auto_cooling", "0"},
+                                   // Distinct speeds per overhang band, so any misjudged pass shows
+                                   // up as a feedrate that differs from the passes around it.
+                                   {"overhang_1_4_speed", "50"},
+                                   {"overhang_2_4_speed", "40"},
+                                   {"overhang_3_4_speed", "30"},
+                                   {"overhang_4_4_speed", "20"},
+                                   {"outer_wall_speed", "60"}});
+
+    // A sphere presents every wall angle there is, so it exercises both the overhanging lower half
+    // and the receding upper half.
+    const std::string gcode = slice({mesh(TestMesh::sphere_50mm)}, config);
+    REQUIRE(! gcode.empty());
+
+    int consistent = 0;
+    int total      = 0;
+    for (const auto &layer : slowest_feedrate_of_type_per_layer_z(gcode, "Outer wall")) {
+        if (layer.size() < 2)
+            continue;
+        ++ total;
+        const double first = layer.begin()->second;
+        if (std::all_of(layer.begin(), layer.end(), [first](const auto &z_f) { return std::abs(z_f.second - first) < 1.; }))
+            ++ consistent;
+    }
+    REQUIRE(total > 100);
+
+    // The sphere's poles genuinely change shape from one pass to the next, so a few layers differ on
+    // their own account. Measured against the layer below instead, a third of them do.
+    INFO(consistent << " of " << total << " layers print all their passes at one speed");
+    CHECK(consistent > total * 9 / 10);
 }
