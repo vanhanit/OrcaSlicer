@@ -8,6 +8,7 @@
 #include "test_helpers.hpp"
 
 #include <algorithm>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -61,6 +62,24 @@ std::map<double, double> min_x_by_z(const std::string &gcode)
             it->second = std::min(it->second, double(self.x()));
     });
     return min_x;
+}
+
+
+// Distinct Z heights at which something is extruded under the given ;TYPE: tag.
+std::set<double> zs_of_type(const std::string &gcode, const std::string &type)
+{
+    std::set<double> zs;
+    std::string      current;
+    GCodeReader      reader;
+    reader.parse_buffer(gcode, [&](GCodeReader &self, const GCodeReader::GCodeLine &line) {
+        const std::string_view comment = line.comment();
+        const size_t           tag = comment.find("TYPE:");
+        if (tag != std::string_view::npos)
+            current = std::string(comment.substr(tag + 5));
+        else if (current == type && line.extruding(self) && line.dist_XY(self) > 0)
+            zs.insert(self.z());
+    });
+    return zs;
 }
 
 // 0.2mm layers with z_hop off, so a recorded Z is always a printing Z.
@@ -352,4 +371,42 @@ TEST_CASE("Sub-layered walls hold up under every wall ordering", "[WallSublayers
         for (size_t k = 1; k < layers[i].size(); ++ k)
             REQUIRE(layers[i][k] >= layers[i][k - 1] - EPSILON);
     CHECK(gcode.find(";TYPE:Inner wall") != std::string::npos);
+}
+
+TEST_CASE("Sub-layered walls carry features that have nothing else to print", "[WallSublayers]")
+{
+    // A 1 mm plate is walls all the way through: no sparse infill, no solid fill, and only enough
+    // room for the outermost loop. Once every loop it has is sub-layered, the region's own
+    // perimeters are empty and its whole content lives in the sub-layer passes - which the layer,
+    // the tool ordering and the instance collection all have to notice. This is the shape of a 3D
+    // Benchy's cabin wall and smoke stack.
+    const auto wall_generator = GENERATE("arachne", "classic");
+    auto plate_gcode = [wall_generator](const char *sublayer_loops) {
+        return slice({make_cube(1.0, 20.0, 5.0)}, {{"layer_height", "0.2"},
+                                                   {"initial_layer_print_height", "0.2"},
+                                                   {"wall_loops", "2"},
+                                                   {"z_hop", "0"},
+                                                   {"skirt_loops", "0"},
+                                                   {"wall_generator", wall_generator},
+                                                   {"wall_sublayer_height", "0.1"},
+                                                   {"wall_sublayer_loops", sublayer_loops}});
+    };
+
+    INFO("wall_generator=" << wall_generator);
+    // Asking for more sub-layered loops than the feature has room for prints the ones it does have,
+    // so the two cases differ in nothing that reaches the plate.
+    const std::string fewer_loops = plate_gcode("1");
+    const std::string every_loop  = plate_gcode("2");
+    REQUIRE(! every_loop.empty());
+
+    // 5 mm of 0.2 mm layers, all but the first subdivided into two passes.
+    const auto zs = zs_of_type(every_loop, "Outer wall");
+    CHECK(zs.size() >= 48);
+    CHECK(zs_of_type(fewer_loops, "Outer wall").size() == zs.size());
+    CHECK_THAT(max_z(every_loop), Catch::Matchers::WithinAbs(5.0, 1e-6));
+
+    // And the passes still only ever move up within a layer.
+    for (const auto &layer : extruding_zs_per_layer(every_loop))
+        for (size_t k = 1; k < layer.size(); ++ k)
+            REQUIRE(layer[k] >= layer[k - 1] - EPSILON);
 }

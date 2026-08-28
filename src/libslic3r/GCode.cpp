@@ -6085,6 +6085,14 @@ LayerResult GCode::process_layer(
                         }
                     }
                 }
+
+                // Orca: sub-layered walls are emitted per instance rather than per island, but the
+                // instance only exists if something claimed it here. A thin wall-only feature whose
+                // every loop is sub-layered contributes no perimeters and no fills, so claim it
+                // explicitly - otherwise the feature is silently dropped from the layer.
+                if (layerm->has_sublayer_walls())
+                    object_islands_by_extruder(by_extruder, layer_tools.wall_extruder_id(region),
+                                               &layer_to_print - layers.data(), layers.size(), n_slices + 1);
             } // for regions
         }
     } // for objects

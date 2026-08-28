@@ -104,8 +104,16 @@ public:
     void    export_region_slices_to_svg_debug(const char *name) const;
     void    export_region_fill_surfaces_to_svg_debug(const char *name) const;
 
+    // Orca: sub-layered walls. A region whose walls are all sub-layered has no perimeters of its own,
+    // and a thin wall-only feature has no fills either, so its whole content lives here.
+    bool    has_sublayer_walls() const {
+        for (const ExtrusionEntityCollection &pass : this->sublayer_perimeters)
+            if (! pass.entities.empty())
+                return true;
+        return false;
+    }
     // Is there any valid extrusion assigned to this LayerRegion?
-    bool    has_extrusions() const { return ! this->perimeters.entities.empty() || ! this->fills.entities.empty(); }
+    bool    has_extrusions() const { return ! this->perimeters.entities.empty() || ! this->fills.entities.empty() || this->has_sublayer_walls(); }
     //BBS
     void    simplify_infill_extrusion_entity() { simplify_entity_collection(&fills); }
     void    simplify_wall_extrusion_entity() { simplify_entity_collection(&perimeters); }

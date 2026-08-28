@@ -805,7 +805,10 @@ void ToolOrdering::collect_extruders(const PrintObject &object, const std::vecto
         for (const LayerRegion *layerm : layer->regions()) {
             const PrintRegion &region = layerm->region();
 
-            if (! layerm->perimeters.entities.empty()) {
+            // Orca: sub-layered walls are the region's only walls once every loop is sub-layered, so
+            // the wall filament has to be claimed for them too or the layer is left without one.
+            const bool has_sublayer_walls = layerm->has_sublayer_walls();
+            if (! layerm->perimeters.entities.empty() || has_sublayer_walls) {
                 bool something_nonoverriddable = true;
 
                 if (m_print_config_ptr) { // in this case print->config().print_sequence != PrintSequence::ByObject (see ToolOrdering constructors)
@@ -813,6 +816,9 @@ void ToolOrdering::collect_extruders(const PrintObject &object, const std::vecto
                     for (const auto& eec : layerm->perimeters.entities) // let's check if there are nonoverriddable entities
                         if (!layer_tools.wiping_extrusions().is_overriddable_and_mark(dynamic_cast<const ExtrusionEntityCollection&>(*eec), *m_print_config_ptr, object, region))
                             something_nonoverriddable = true;
+                    // Sub-layered walls print before the rest of the layer and are never wipe-overridden.
+                    if (has_sublayer_walls)
+                        something_nonoverriddable = true;
                 }
 
                 if (something_nonoverriddable){
