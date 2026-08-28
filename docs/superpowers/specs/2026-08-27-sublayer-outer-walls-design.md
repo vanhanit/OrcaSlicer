@@ -87,6 +87,19 @@ generator run per sub-slice produces that pass's outermost loops into
 (`LayerRegion::flow(role, height)`), with the bridge flow left alone because it is a thread diameter
 rather than a layer height.
 
+Each pass keeps two things beyond its walls. Its **gap fill**, appended after the walls. And the
+**support fill** for the pass above it: the band of pass `k+1`'s walls lands on whatever pass `k`
+printed, so where the contour steps inward faster than the band is wide — a hole closing over within
+the layer, a near-horizontal ceiling — part of that band would hang over the void inside pass `k`.
+Pass `k` therefore fills `band(k+1) ∩ interior(k)` first, as `erSolidInfill` at the sub-layer height.
+The flow is deliberately *not* a bridging flow: a bridge thread is as thick as the nozzle and would
+stand proud of a pass a fraction of that height. An opening by one extrusion width discards strips
+narrower than a single line, which is what keeps the whole mechanism inert on ordinary geometry —
+a vertical wall repeats one contour and never triggers it.
+
+`interior(k)` is the pass generator's `fill_no_overlap` output and `band(k)` is the rest of the
+sub-slice, so the two are complementary by construction and no pass can fill outside its own walls.
+
 **Why "generate normally, then drop" rather than shrinking the core region:**
 
 - It is the only formulation that works for Arachne, whose walls have variable width, so a constant
@@ -110,6 +123,15 @@ own sub-slice, so it is filled at the sub-layer height.
 `apply_extra_perimeters()` are all core-only: they change the wall count or the infill area of the
 layer as a whole, which the band passes must not touch.
 
+Finally, the passes own their columns for the whole height of the layer, so the wall bands are
+subtracted from the layer's `fill_surfaces` and `fill_no_overlap` before `make_perimeters` returns.
+Without it the layer's own infill — printed afterwards at `print_z`, at the full layer height —
+extrudes into walls that are already there. The bands are shrunk by the same infill/wall overlap the
+generator grows the fill area by, so the infill still bonds to the topmost pass exactly as it would
+to a full-height wall. The subtraction survives `posPrepareInfill`: `Layer::make_perimeters` copies
+the result into `fill_expolygons`, and `slices_to_fill_surfaces_clipped()` rebuilds `fill_surfaces`
+as `slices ∩ fill_expolygons`.
+
 ### 3. Emission — `GCode::extrude_sublayer_walls()` (`GCode.cpp`)
 
 Runs inside the per-extruder section of `process_layer`, right after the tool change and **before**
@@ -128,6 +150,16 @@ already travels at the current height and applies the destination Z only at the 
 `m_sub_layer_flow_ratio` is deliberately **not** used: unlike the mixed-color feature, these paths
 were generated at the sub-layer height, so their width, height and `mm3_per_mm` are already correct
 and the `;HEIGHT:` tag reports the sub-height on its own.
+
+A pass is printed onto the pass right below it, not onto the layer below, so
+`ExtrusionQualityEstimator::override_prev_layer_boundary()` points the overhang estimator at
+`Layer::wall_sublayer_support(k)` — the same material the wall generator classified that pass
+against — for as long as the pass is being emitted, and `restore_prev_layer_boundaries()` puts the
+layer below back before the rest of the layer. Measured against the layer below, a pass sits between
+one and two layer heights above its reference instead of one, so the higher passes read as hanging
+over further than they do and pick up an overhang slowdown and the part cooling fan that a
+full-height wall over the same geometry never triggers. The curled extrusions are deliberately left
+alone: they protrude upwards from the layer below and are in the way of any pass.
 
 While `m_in_sublayer_wall_pass` is set, two features are suppressed:
 - **Scarf seams**, whose Z ramp spans a full layer height and would cut into the pass below.
@@ -178,6 +210,11 @@ counts them under Outer wall and Inner wall rather than on a row of their own.
 
 - On a slope, the interface between the passes and the inner walls can be off by up to `(H/2)·tanθ`,
   since the inner walls still derive from the layer's mid-height slice.
+- The support fill a pass prints for the pass above it goes down with the **wall** filament, the one
+  that pass is printed with, not with `sparse_infill_filament`.
+- A pass whose wall band falls *outside* the material below it — the ceiling of a hole, where the
+  model gains area as Z rises — is still printed over the void. Nothing inside the layer can support
+  it: the fill that would anchor it is the layer's own bridge at `print_z`, above the pass.
 - With several filaments, a later extruder's passes can start below content an earlier extruder
   printed at `print_z` (wipe tower, supports on another filament). The lift-travel mitigates it, and
   `validate()` warns. This is the same exposure the existing mixed-color sub-layer feature accepts.
@@ -190,3 +227,16 @@ counts them under Outer wall and Inner wall rather than on a row of their own.
 "never moves the nozzle back down within a layer" (the safety contract, checked with supports on) and
 "follow the model between sub-layers on a slope" (proves real re-slicing rather than a repeated
 contour, by measuring that each pass on a pyramid starts further inward than the one below).
+
+Three more cover the interaction between the passes and the fill, each on a shape chosen so the
+contour sweeps further within one layer than a wall is wide — a cone 2mm tall over a 40mm base, or a
+sphere:
+
+- "supported by the pass beneath them" and its no-op twin "add no support fill where the walls stack
+  up": solid fill appears at sub-layer Z on the cone and nowhere on a cube.
+- "keep the layer's own infill out of their columns": the layer's fill area is strictly smaller with
+  the feature on.
+- "are not slowed down as overhangs": on a sphere, over 90% of layers print every one of their passes
+  at one feedrate. Measured against the layer below instead, only about two thirds do. Asserting the
+  passes of a layer agree with *each other* is what makes this independent of how the estimator
+  scores any particular slope.
