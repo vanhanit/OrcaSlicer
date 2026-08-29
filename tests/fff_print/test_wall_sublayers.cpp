@@ -2,7 +2,9 @@
 
 #include "libslic3r/libslic3r.h"
 #include "libslic3r/BoundingBox.hpp"
+#include "libslic3r/ClipperUtils.hpp"
 #include "libslic3r/GCodeReader.hpp"
+#include "libslic3r/MeshBoolean.hpp"
 #include "libslic3r/Layer.hpp"
 #include "libslic3r/Print.hpp"
 #include "libslic3r/GCode/GCodeProcessor.hpp"
@@ -702,4 +704,70 @@ TEST_CASE("Sub-layered walls keep the layer's own walls inside the topmost pass"
         ++ compared;
     }
     CHECK(compared > 4);
+}
+
+// A block bored through by a round horizontal hole - the shape of a Benchy's hawsehole. Where the
+// bore closes over, the contour sweeps far enough between sub-layers to expose what the passes and
+// the layer's own full-height phase disagree about. A wall inset of three loops at 0.2mm hides it,
+// so this is deliberately sliced thick and thin-walled.
+TriangleMesh bored_block()
+{
+    TriangleMesh block = make_cube(30., 24., 20.);
+    TriangleMesh bore  = make_cylinder(5., 40., 2. * PI / 60.);
+    bore.rotate_x(float(-PI / 2.));   // axis along Y, through the middle of the block
+    bore.translate(15., -8., 10.);
+    MeshBoolean::cgal::minus(block, bore);
+    return block;
+}
+
+TEST_CASE("The layer's full-height phase stays out of what the passes own", "[WallSublayers]")
+{
+    // Everything the core run emits is printed at print_z over the whole layer height, so it may
+    // only occupy ground that is solid for that entire height and that no pass has printed on.
+    // Measured against the layer's mid-height slice instead, it comes down on a column a pass has
+    // already laid a wall on, and reaches into ground that is a hole at some sub-layer.
+    Print print;
+    Model model;
+    init_print({bored_block()}, print, model, {{"layer_height", "0.3"},
+        {"initial_layer_print_height", "0.2"}, {"wall_loops", "2"}, {"skirt_loops", "0"},
+        {"wall_generator", "arachne"}, {"wall_sublayer_height", "0.05"}});
+    print.process();
+
+    double worst_on_band = 0., worst_outside = 0., worst_z = 0.;
+    for (const Layer *layer : print.objects().front()->layers()) {
+        if (layer->wall_sub_slices.size() < 2)
+            continue;
+        // The union of the passes' wall bands, and the ground solid for the whole layer height.
+        ExPolygons bands, common = layer->wall_sub_slices.front().merged;
+        for (const WallSubSlice &sub : layer->wall_sub_slices) {
+            append(bands, diff_ex(sub.merged, offset_ex(sub.merged, - scale_(0.42))));
+            common = intersection_ex(common, sub.merged);
+        }
+        // Shrunk, so merely touching a band's edge is not counted as standing on it.
+        const Polygons bands_p = to_polygons(offset_ex(union_ex(bands), - scale_(0.15)));
+
+        for (const LayerRegion *layerm : layer->regions()) {
+            Polylines walls;
+            for (const ExtrusionEntity *island : layerm->perimeters.entities)
+                for (const ExtrusionEntity *loop : static_cast<const ExtrusionEntityCollection*>(island)->entities)
+                    walls.push_back(loop->as_polyline());
+            double on_band = 0.;
+            for (const Polyline &p : intersection_pl(walls, bands_p))
+                on_band += unscale<double>(p.length());
+
+            double outside = 0.;
+            for (const ExPolygon &e : diff_ex(layerm->fill_expolygons, common))
+                outside += unscale<double>(unscale<double>(e.area()));
+
+            if (on_band > worst_on_band || outside > worst_outside)
+                worst_z = layer->print_z;
+            worst_on_band = std::max(worst_on_band, on_band);
+            worst_outside = std::max(worst_outside, outside);
+        }
+    }
+    INFO("worst layer at z " << worst_z);
+    // Before the core run was confined, the layer where the bore closes over showed 1.86mm of wall
+    // standing on a pass's band and 24mm2 of infill over ground that is a hole at some sub-layer.
+    CHECK(worst_on_band < 0.01);
+    CHECK(worst_outside < 0.01);
 }
