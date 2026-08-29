@@ -162,19 +162,31 @@ void LayerRegion::make_perimeters(const SurfaceCollection &slices, const LayerRe
         pass_slices[k] = union_ex(expolygons);
     }
 
-    // The core run prints at print_z, and so does the topmost pass, whose contour is therefore the
-    // one the layer really presents there. Clipping to it keeps the walls the core run is left with
-    // nested inside the pass rather than positioned against the mid-height contour, which on a slope
-    // shallower than about 13 degrees puts them outside the surface altogether. Inert where the
-    // contour grows with Z, the topmost sub-slice then containing the layer's own slice.
+    // Everything the core run emits - its walls and its infill alike - is printed at print_z over
+    // the full layer height, so it occupies its whole column from bottom_z upwards. It is only valid
+    // where the model is solid for that entire height, which is the intersection of the sub-slices,
+    // and the passes own everything outside it: their wall bands, and the treads between them.
+    // Against the layer's own mid-height slice instead, the core reaches into ground that is a hole
+    // at some sub-layer, and its innermost kept wall comes down on a column a pass already printed.
+    // A pass with nothing in it does not constrain the core, or a feature ending part way up a layer
+    // would take the whole layer's content with it.
+    ExPolygons core_region;
+    bool       core_region_set = false;
+    for (const ExPolygons &pass : pass_slices) {
+        if (pass.empty())
+            continue;
+        core_region     = core_region_set ? intersection_ex(core_region, pass) : pass;
+        core_region_set = true;
+    }
+
     SurfaceCollection core_slices;
-    if (band_walls > 0 && ! pass_slices.back().empty())
+    if (core_region_set)
         for (const Surface &surface : slices.surfaces)
-            core_slices.append(intersection_ex(surface.expolygon, pass_slices.back()), surface);
+            core_slices.append(intersection_ex(surface.expolygon, core_region), surface);
 
     PerimeterGenerator g(
         // input:
-        band_walls > 0 && ! pass_slices.back().empty() ? &core_slices : &slices,
+        core_region_set ? &core_slices : &slices,
         &compatible_regions,
         this->layer()->height,
         this->layer()->slice_z,
@@ -270,30 +282,29 @@ void LayerRegion::make_perimeters(const SurfaceCollection &slices, const LayerRe
         pass_band[k]     = diff_ex(pass_slices[k], pass_interior[k]);
     }
 
-    // The wall band of pass k+1 lands on whatever pass k printed, so wherever this pass's own walls
-    // do not already cover it, pass k lays the material down first. Two ways that happens: the
-    // contour steps inward faster than the band is wide, leaving the next band over the void inside
-    // this pass; or a contour appears that this pass does not have at all - the lip of a hole, where
-    // the next band stands over nothing whatsoever.
+    // Everything the passes own but their walls do not cover has to be filled by the pass itself:
+    // the core run is confined to the columns that are solid for the whole layer, so nothing else
+    // reaches this ground, and it is what the wall band of every pass above comes down on.
     const Flow  support_flow  = this->flow(frSolidInfill, layer->wall_sub_slices.front().height);
     const float support_angle = float(Geometry::deg2rad(region_config.solid_infill_direction.value) + model_rotation_rad);
     // Anything narrower than one extrusion cannot be filled, and an overhang of well under a line
     // width is what an ordinary layer already prints over. Both make this a no-op on plain geometry.
     const float support_min_width = float(support_flow.scaled_width());
-    for (size_t k = 0; k + 1 < num_passes; ++ k) {
-        if (pass_band[k + 1].empty())
+    for (size_t k = 0; k < num_passes; ++ k) {
+        if (pass_slices[k].empty())
             continue;
-        const ExPolygons needed = diff_ex(pass_band[k + 1], pass_band[k]);
-        if (needed.empty())
-            continue;
-        // Inside this pass, where its own walls leave the area open.
-        ExPolygons unsupported = intersection_ex(needed, pass_interior[k]);
+        // The tread: solid at this pass but outside the column the core run may occupy, and not
+        // already covered by this pass's own walls. Nothing else in the layer will ever cover it,
+        // and it is what the band of every pass above lands on. Repeating it pass after pass is how
+        // the staircase a sloped surface makes is filled all the way up to print_z.
+        ExPolygons unsupported = diff_ex(diff_ex(pass_slices[k], core_region), pass_band[k]);
         // And past this pass's contour, where the model has nothing at this height for the wall
         // above to stand on. Filling there puts material outside the model's own surface, but only
         // for the height of one sub-layer and only as wide as the wall it holds up - the price of
         // printing the wall at all rather than leaving it hanging.
-        if (const ExPolygons *below = layer->wall_sublayer_support(k); below != nullptr)
-            append(unsupported, diff_ex(diff_ex(needed, pass_slices[k]), *below));
+        if (k + 1 < num_passes && ! pass_band[k + 1].empty())
+            if (const ExPolygons *below = layer->wall_sublayer_support(k); below != nullptr)
+                append(unsupported, diff_ex(diff_ex(diff_ex(pass_band[k + 1], pass_band[k]), pass_slices[k]), *below));
         unsupported = opening_ex(union_ex(unsupported), support_min_width / 2.f);
         if (unsupported.empty())
             continue;
