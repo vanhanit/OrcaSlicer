@@ -771,3 +771,56 @@ TEST_CASE("The layer's full-height phase stays out of what the passes own", "[Wa
     CHECK(worst_on_band < 0.01);
     CHECK(worst_outside < 0.01);
 }
+
+// Every solid-infill path a pass laid down, however deeply the fillers nested it.
+static void collect_pass_fill(const ExtrusionEntity *ee, Polylines &out)
+{
+    if (const auto *coll = dynamic_cast<const ExtrusionEntityCollection*>(ee)) {
+        for (const ExtrusionEntity *child : coll->entities)
+            collect_pass_fill(child, out);
+    } else if (ee->role() == erSolidInfill) {
+        out.push_back(ee->as_polyline());
+    }
+}
+
+TEST_CASE("Sub-layered wall support fill is not sprayed over overhangs", "[WallSublayers]")
+{
+    // A cone stood on its head rolls outward with Z exactly as a Benchy's gunwale does, so every
+    // pass lands a little further out than the one below. A wall that still comes down on most of
+    // the wall beneath it is an ordinary overhang and needs nothing: propping each one up buried
+    // the print in tiny fill fragments that held up nothing.
+    TriangleMesh cone = make_cone(20.0, 2.0);
+    cone.mirror_z();
+    cone.translate(0., 0., 2.0);
+
+    Print print;
+    Model model;
+    init_print({cone}, print, model, {{"layer_height", "0.3"},
+        {"initial_layer_print_height", "0.2"}, {"wall_loops", "2"}, {"skirt_loops", "0"},
+        {"wall_generator", "arachne"}, {"wall_sublayer_height", "0.05"}});
+    print.process();
+
+    double length = 0.;
+    int    paths = 0, fragments = 0;
+    for (const Layer *layer : print.objects().front()->layers())
+        for (size_t k = 0; k < layer->wall_sub_slices.size(); ++ k) {
+            Polylines fill;
+            for (const LayerRegion *layerm : layer->regions())
+                if (k < layerm->sublayer_perimeters.size())
+                    for (const ExtrusionEntity *ee : layerm->sublayer_perimeters[k].entities)
+                        collect_pass_fill(ee, fill);
+            paths += (int) fill.size();
+            for (const Polyline &p : fill) {
+                const double l = unscale<double>(p.length());
+                length += l;
+                if (l < 6.)
+                    ++ fragments;
+            }
+        }
+
+    INFO("support fill " << length << "mm over " << paths << " paths, " << fragments << " under 6mm");
+    // Before the overhang rule, this cone drew 643 paths of which 547 were these stubs; now 107/28.
+    CHECK(fragments < 100);
+    // And the staircase it does have to build is still built - the fix must not simply emit nothing.
+    CHECK(length > 1000.);
+}
