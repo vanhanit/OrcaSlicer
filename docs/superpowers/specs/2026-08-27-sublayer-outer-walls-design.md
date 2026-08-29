@@ -100,21 +100,31 @@ top sub-slice then contains the layer's own slice and the clip does nothing.
 
 Then one extra generator run per sub-slice produces that pass's outermost loops into
 `LayerRegion::sublayer_perimeters[k]`, using flows built at the sub-layer height
-(`LayerRegion::flow(role, height)`), with the bridge flow left alone because it is a thread diameter
-rather than a layer height.
+(`LayerRegion::flow(role, height)`) — the overhang flow included. A bridge flow is a thread as thick
+as the nozzle, which is right for a wall spanning a whole layer and roughly five times too much
+material inside a pass a fraction of that height: it stands proud of the pass and the one above
+ploughs through it. The overhang *role* is kept, so those walls still print at the bridge speed with
+the part cooling fan on.
 
 Each pass keeps two things beyond its walls. Its **gap fill**, appended after the walls. And the
 **support fill**, which is everything the passes own that their walls do not cover. Two parts:
 
-- `(slice(k) ∖ core) ∖ band(k)` — the **tread**: solid at this pass but outside the column the core
-  run may occupy. The core is confined to the intersection of the sub-slices, so nothing else in the
+- `((slice(k) ∖ core) ∖ band(k)) ∩ below(k)` — the **tread**: solid at this pass, outside the column
+  the core run may occupy, and over material that actually exists beneath the pass. The core is confined to the intersection of the sub-slices, so nothing else in the
   layer ever reaches this ground, and it is what the wall band of every pass above comes down on.
   Repeating it pass after pass is how the staircase a sloped surface makes is filled up to `print_z`;
   a region that becomes solid at pass `k` is refilled by every pass above it without any explicit
   carrying.
-- `(band(k+1) ∖ band(k)) ∖ slice(k)`, less the material below the pass — a contour appears that pass
-  `k` does not have at all, so the next band stands over nothing whatsoever. The lip of a hole, where
-  the profile only starts being printed part way up the layer.
+- `band(k+1) ∖ grow(support(k), w/2) ∖ core`, where `support(k)` is this pass's band, its tread and
+  the material below it, and `w` is the band's external perimeter width — the **lip**: the wall above
+  comes down on so little that it would be printed into mid air. The lip of a hole, where the profile
+  only starts being printed part way up the layer.
+
+  The `w/2` is the rule that keeps this from firing on every overhang: a wall still resting on at
+  least about half its width is an ordinary overhang and is left alone, exactly as it would be
+  without sub-layers. Without it, a surface rolling outward — a Benchy's gunwale — had every pass
+  propped up by a fresh sliver that held up nothing; on a cone stood on its head that was 547 stub
+  paths out of 643, against 28 out of 107 with the rule in place.
 
 The second case puts material **outside the model's own surface** at that height. That is deliberate:
 it is bounded by one sub-layer height and the width of the wall it holds up, and the alternative is
@@ -275,6 +285,8 @@ sphere:
   wall lands outside everything below it. Nothing is filled without the second case above.
 - "keep the layer's own walls inside the topmost pass": no `Inner wall` move at a given Z may reach
   further out than the `Outer wall` at that same Z.
+- "support fill is not sprayed over overhangs": the same cone stood on its head, the one shape where
+  every pass lands outside the one below it.
 - "the layer's full-height phase stays out of what the passes own": a block bored through by a round
   horizontal hole, sliced at 0.3mm with two walls so the wall inset cannot hide the error. At the
   layer where the bore closes over, the unconfined core run put 1.86mm of wall on a pass's band and
