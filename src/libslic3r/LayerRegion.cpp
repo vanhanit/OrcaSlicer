@@ -267,8 +267,11 @@ void LayerRegion::make_perimeters(const SurfaceCollection &slices, const LayerRe
         bg.layer_id              = (int) layer->id();
         bg.sublayer_band_walls   = band_walls;
         bg.ext_perimeter_flow    = this->flow(frExternalPerimeter, sub.height);
-        // Bridge flow is a thread diameter rather than a layer height, so it is not scaled down.
-        bg.overhang_flow         = this->bridging_flow(frPerimeter, object_config.thick_bridges);
+        // A bridge flow is a thread as thick as the nozzle, which is right for a wall spanning a
+        // whole layer and five times too much material inside a pass a fraction of that height - it
+        // would stand proud of the pass and the one above would plough through it. The overhang role
+        // is kept, so these still print at the bridge speed with the part cooling fan on.
+        bg.overhang_flow         = this->flow(frPerimeter, sub.height);
         bg.solid_infill_flow     = this->flow(frSolidInfill, sub.height);
 
         if (arachne)
@@ -293,18 +296,27 @@ void LayerRegion::make_perimeters(const SurfaceCollection &slices, const LayerRe
     for (size_t k = 0; k < num_passes; ++ k) {
         if (pass_slices[k].empty())
             continue;
+        const ExPolygons *below = layer->wall_sublayer_support(k);
+        if (below == nullptr)
+            continue;
         // The tread: solid at this pass but outside the column the core run may occupy, and not
         // already covered by this pass's own walls. Nothing else in the layer will ever cover it,
         // and it is what the band of every pass above lands on. Repeating it pass after pass is how
-        // the staircase a sloped surface makes is filled all the way up to print_z.
-        ExPolygons unsupported = diff_ex(diff_ex(pass_slices[k], core_region), pass_band[k]);
-        // And past this pass's contour, where the model has nothing at this height for the wall
-        // above to stand on. Filling there puts material outside the model's own surface, but only
-        // for the height of one sub-layer and only as wide as the wall it holds up - the price of
-        // printing the wall at all rather than leaving it hanging.
-        if (k + 1 < num_passes && ! pass_band[k + 1].empty())
-            if (const ExPolygons *below = layer->wall_sublayer_support(k); below != nullptr)
-                append(unsupported, diff_ex(diff_ex(diff_ex(pass_band[k + 1], pass_band[k]), pass_slices[k]), *below));
+        // the staircase a sloped surface makes is filled all the way up to print_z. Clipped to the
+        // material below the pass: past that it would float in the air and hold up nothing, which
+        // on the overhanging side of a wall showered the print in fill fragments.
+        ExPolygons tread = intersection_ex(diff_ex(diff_ex(pass_slices[k], core_region), pass_band[k]), *below);
+        ExPolygons unsupported = tread;
+        // And under the wall of the pass above wherever less than about half its width comes down
+        // on material - a wall resting on most of the wall below it is an ordinary overhang and
+        // needs nothing, but past that it is printed into mid air. Filling there puts material
+        // outside the model's own surface, for the height of one sub-layer and only as wide as the
+        // wall it holds up - the price of printing the wall at all rather than leaving it hanging.
+        if (k + 1 < num_passes && ! pass_band[k + 1].empty()) {
+            ExPolygons support = union_ex(tread, union_ex(pass_band[k], *below));
+            const auto tol = float(this->flow(frExternalPerimeter, layer->wall_sub_slices[k].height).scaled_width() / 2);
+            append(unsupported, diff_ex(diff_ex(pass_band[k + 1], offset_ex(support, tol)), core_region));
+        }
         unsupported = opening_ex(union_ex(unsupported), support_min_width / 2.f);
         if (unsupported.empty())
             continue;
