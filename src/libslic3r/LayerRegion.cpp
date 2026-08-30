@@ -118,6 +118,40 @@ static void append_sublayer_support_fill(ExtrusionEntityCollection &out,
     out.append(std::move(entities));
 }
 
+// Orca: sub-layered walls. A wall a pass prints over the void is a bridge, and a bridge has to be
+// straight: every place a curved one changes direction is a point with nothing underneath to anchor
+// it, so it can only droop. The wall generator has already split each loop into supported paths and
+// overhang paths, classified against the material below this pass, so an overhang run that is
+// anchored at both ends becomes the chord between those anchors. A run long enough to be the shape
+// of the model rather than a gap in it - the whole side of an overhanging hull - is left alone.
+static void straighten_pass_bridges(ExtrusionEntityCollection &entities, double max_chord)
+{
+    for (ExtrusionEntity *entity : entities.entities) {
+        if (auto *nested = dynamic_cast<ExtrusionEntityCollection*>(entity)) {
+            straighten_pass_bridges(*nested, max_chord);
+            continue;
+        }
+        auto *loop = dynamic_cast<ExtrusionLoop*>(entity);
+        if (loop == nullptr || loop->paths.size() < 3)
+            continue;
+        for (size_t i = 0; i < loop->paths.size(); ++ i) {
+            ExtrusionPath &path = loop->paths[i];
+            if (path.role() != erOverhangPerimeter || path.polyline.size() < 3)
+                continue;
+            // Anchored only if the wall on either side of it is standing on something.
+            const ExtrusionPath &before = loop->paths[(i + loop->paths.size() - 1) % loop->paths.size()];
+            const ExtrusionPath &after  = loop->paths[(i + 1) % loop->paths.size()];
+            if (before.role() == erOverhangPerimeter || after.role() == erOverhangPerimeter)
+                continue;
+            // Keep the end points as they are - they carry the Z the path was generated with.
+            const Point3 &a = path.polyline.points.front(), &b = path.polyline.points.back();
+            if (Vec2d(double(b.x() - a.x()), double(b.y() - a.y())).norm() > max_chord)
+                continue;
+            path.polyline.points = { a, b };
+        }
+    }
+}
+
 void LayerRegion::make_perimeters(const SurfaceCollection &slices, const LayerRegionPtrs &compatible_regions, SurfaceCollection* fill_surfaces, ExPolygons* fill_no_overlap)
 {
     this->perimeters.clear();
@@ -278,6 +312,10 @@ void LayerRegion::make_perimeters(const SurfaceCollection &slices, const LayerRe
             bg.process_arachne();
         else
             bg.process_classic();
+
+        // A gap in the wall that the pass has to fly over is bridged straight, between the anchors
+        // the generator left on either side of it.
+        straighten_pass_bridges(this->sublayer_perimeters[k], 8. * double(bg.ext_perimeter_flow.scaled_width()));
 
         this->sublayer_perimeters[k].append(std::move(band_gap_fill.entities));
 
