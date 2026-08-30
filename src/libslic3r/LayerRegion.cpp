@@ -309,15 +309,16 @@ void LayerRegion::make_perimeters(const SurfaceCollection &slices, const LayerRe
         // up as blobs on the outside of the print. Such a wall prints as the overhang or bridge the
         // wall generator already classified it as.
         ExPolygons unsupported = intersection_ex(diff_ex(diff_ex(pass_slices[k], core_region), pass_band[k]), *below);
-        // A strip that cannot hold a single extrusion along its whole length is not worth printing:
-        // it comes out as a stub of a millimetre or two that supports nothing and shows up on the
-        // surface. Where a wall moves by only a fraction of its width between passes, everything the
-        // tread finds is of that kind, which is what keeps this quiet on a gently rolling surface.
+        // A patch smaller than a few extrusion lines across is not worth printing: it comes out as a
+        // dab of a millimetre or two that supports nothing and shows on the surface. Where a wall
+        // moves by only a fraction of its width between passes, everything the tread finds is of
+        // that kind, which is what keeps this quiet on a gently rolling surface. The test is area,
+        // not width: the thin ring a gently sloped surface needs is narrow but long, and an opening
+        // wide enough to clear the dabs takes the ring with it.
         unsupported = opening_ex(union_ex(unsupported), support_min_width / 2.f);
+        const double min_support_area = 12. * double(support_min_width) * double(support_min_width);
         unsupported.erase(std::remove_if(unsupported.begin(), unsupported.end(),
-                                         [support_min_width](const ExPolygon &e) {
-                                             return e.area() < 4. * double(support_min_width) * double(support_min_width);
-                                         }),
+                                         [min_support_area](const ExPolygon &e) { return e.area() < min_support_area; }),
                           unsupported.end());
         if (unsupported.empty())
             continue;
