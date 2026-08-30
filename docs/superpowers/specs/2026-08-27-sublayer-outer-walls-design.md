@@ -115,28 +115,15 @@ Each pass keeps two things beyond its walls. Its **gap fill**, appended after th
   Repeating it pass after pass is how the staircase a sloped surface makes is filled up to `print_z`;
   a region that becomes solid at pass `k` is refilled by every pass above it without any explicit
   carrying.
-- `band(k+1) ∖ grow(support(k), w/2) ∖ core`, where `support(k)` is this pass's band, its tread and
-  the material below it, and `w` is the band's external perimeter width — the **lip**: the wall above
-  comes down on so little that it would be printed into mid air. The lip of a hole, where the profile
-  only starts being printed part way up the layer.
+That is the whole of it. A wall band that lands past its support is **not** propped up: fill placed
+under it at the pass below would be sitting on air itself, and on an outward-rolling surface — a
+Benchy's gunwale — it came out as material on the outside of the hull. Such a wall prints as the
+overhang or bridge the wall generator has already classified it as, exactly as it would without
+sub-layers.
 
-  The `w/2` is the rule that keeps this from firing on every overhang: a wall still resting on at
-  least about half its width is an ordinary overhang and is left alone, exactly as it would be
-  without sub-layers. Without it, a surface rolling outward — a Benchy's gunwale — had every pass
-  propped up by a fresh sliver that held up nothing; on a cone stood on its head that was 547 stub
-  paths out of 643, against 28 out of 107 with the rule in place.
-
-The second case puts material **outside the model's own surface** at that height. That is deliberate:
-it is bounded by one sub-layer height and the width of the wall it holds up, and the alternative is
-extruding that wall into mid air. The opening by one extrusion width below is what confines it to
-geometry where a whole wall line would otherwise be unsupported.
-
-The fill goes down as `erSolidInfill` at the sub-layer height. The flow is deliberately *not* a
-bridging flow even for the second case: a bridge thread is as thick as the nozzle and would stand
-proud of a pass a fraction of that height. An opening by one extrusion width discards strips
-narrower than a single line, which is what keeps the whole mechanism inert on ordinary geometry — a
-vertical wall repeats one contour and never triggers it, and on a 45° slope the step per pass is a
-tenth of a line width.
+The support fill therefore has a contract worth stating plainly: **it never leaves the model and it
+never floats.** Both halves come from the clip to `below(k)`, since that is model geometry beneath
+the pass.
 
 `interior(k)` is the pass generator's `fill_no_overlap` output and `band(k)` is the rest of the
 sub-slice, so the two are complementary by construction.
@@ -252,9 +239,8 @@ counts them under Outer wall and Inner wall rather than on a row of their own.
 
 - The support fill a pass prints for the pass above it goes down with the **wall** filament, the one
   that pass is printed with, not with `sparse_infill_filament`.
-- On a shallow slope the support fill leaves the model's surface by up to one wall width, for the
-  height of one sub-layer, wherever that is what it takes to get material under the wall line above.
-  A hole gains a slight ledge at each lip rather than an unsupported wall.
+- A wall band past the material below it is left as an overhang: the passes never print outside the
+  model to catch one. On a hole's ceiling that means the topmost passes bridge, as the layer would.
 - Confining the core run to the intersection of the sub-slices means the layer's own infill stops at
   the narrowest cross-section the layer has, rather than at its mid-height one. Everything outside it
   is carried by the passes' wall bands and their tread fill, so the material is still there — but on
