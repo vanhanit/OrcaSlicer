@@ -364,28 +364,6 @@ void LayerRegion::make_perimeters(const SurfaceCollection &slices, const LayerRe
                                      support_angle + float((k % 2) * M_PI / 2.), *layer, region_config);
     }
 
-    // The passes occupy their wall bands over the whole height of the layer, so the layer's own
-    // infill - printed afterwards at print_z, at the full layer height - must not extrude into
-    // them. The bands are shrunk by the infill/wall overlap first, so the infill still bonds to the
-    // topmost pass exactly as it would to a full-height wall.
-    ExPolygons occupied;
-    for (const ExPolygons &band : pass_band)
-        append(occupied, band);
-    if (occupied.empty())
-        return;
-    occupied = union_ex(occupied);
-    // Mirrors the overlap the perimeter generator grows the fill area by, see infill_peri_overlap.
-    const coord_t inset = (region_config.wall_loops.value <= 1 ? this->flow(frExternalPerimeter) : this->flow(frPerimeter)).scaled_spacing() / 2;
-    const auto    overlap = float(scale_(region_config.infill_wall_overlap.get_abs_value(
-        unscale<double>(inset + this->flow(frSolidInfill).scaled_spacing() / 2))));
-    const ExPolygons occupied_shrunk = overlap > 0 ? offset_ex(occupied, - overlap) : occupied;
-    if (! occupied_shrunk.empty()) {
-        SurfaceCollection kept;
-        for (const Surface &surface : fill_surfaces->surfaces)
-            kept.append(diff_ex(surface.expolygon, occupied_shrunk), surface);
-        fill_surfaces->set(std::move(kept));
-    }
-    *fill_no_overlap = diff_ex(*fill_no_overlap, occupied);
 }
 
 #if 1
