@@ -118,22 +118,30 @@ static void append_sublayer_support_fill(ExtrusionEntityCollection &out,
     out.append(std::move(entities));
 }
 
-// Orca: sub-layered walls. A wall a pass prints over the void is a bridge, and a bridge has to be
-// straight: every place a curved one changes direction is a point with nothing underneath to anchor
-// it, so it can only droop. The wall generator has already split each loop into supported paths and
-// overhang paths, classified against the material below this pass, so an overhang run that is
-// anchored at both ends becomes the chord between those anchors. A run long enough to be the shape
-// of the model rather than a gap in it - the whole side of an overhanging hull - is left alone.
-static void straighten_pass_bridges(ExtrusionEntityCollection &entities, double max_chord)
+// Orca: sub-layered walls. Two things the wall generator leaves for a pass to tidy up, both about
+// the overhang paths it split each loop into against the material below the pass.
+//
+// A stretch shorter than one extrusion is not an overhang at all - the wall on either side of it
+// carries it - and printing it as one costs an acceleration change, a fan blast and a drop to
+// bridging speed for a third of a nozzle's width of material. Those become ordinary wall.
+//
+// What remains is a real bridge, and a bridge has to be straight: every place a curved one changes
+// direction is a point with nothing underneath to anchor it, so it can only droop. An overhang run
+// anchored by wall at both ends becomes the chord between those anchors. A run long enough to be
+// the shape of the model rather than a gap in it - the side of an overhanging hull - is left alone.
+static void tidy_pass_overhangs(ExtrusionEntityCollection &entities, double min_overhang, double max_chord)
 {
     for (ExtrusionEntity *entity : entities.entities) {
         if (auto *nested = dynamic_cast<ExtrusionEntityCollection*>(entity)) {
-            straighten_pass_bridges(*nested, max_chord);
+            tidy_pass_overhangs(*nested, min_overhang, max_chord);
             continue;
         }
         auto *loop = dynamic_cast<ExtrusionLoop*>(entity);
         if (loop == nullptr || loop->paths.size() < 3)
             continue;
+        for (ExtrusionPath &path : loop->paths)
+            if (path.role() == erOverhangPerimeter && path.polyline.length() < min_overhang)
+                path.set_extrusion_role(erExternalPerimeter);
         for (size_t i = 0; i < loop->paths.size(); ++ i) {
             ExtrusionPath &path = loop->paths[i];
             if (path.role() != erOverhangPerimeter || path.polyline.size() < 3)
@@ -313,9 +321,10 @@ void LayerRegion::make_perimeters(const SurfaceCollection &slices, const LayerRe
         else
             bg.process_classic();
 
-        // A gap in the wall that the pass has to fly over is bridged straight, between the anchors
-        // the generator left on either side of it.
-        straighten_pass_bridges(this->sublayer_perimeters[k], 8. * double(bg.ext_perimeter_flow.scaled_width()));
+        // Overhangs too short to be real become ordinary wall, and a gap the pass really does have
+        // to fly over is bridged straight between the anchors on either side of it.
+        tidy_pass_overhangs(this->sublayer_perimeters[k], double(bg.ext_perimeter_flow.scaled_width()),
+                            8. * double(bg.ext_perimeter_flow.scaled_width()));
 
         this->sublayer_perimeters[k].append(std::move(band_gap_fill.entities));
 
