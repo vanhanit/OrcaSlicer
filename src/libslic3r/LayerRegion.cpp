@@ -303,20 +303,12 @@ void LayerRegion::make_perimeters(const SurfaceCollection &slices, const LayerRe
         // already covered by this pass's own walls. Nothing else in the layer will ever cover it,
         // and it is what the band of every pass above lands on. Repeating it pass after pass is how
         // the staircase a sloped surface makes is filled all the way up to print_z. Clipped to the
-        // material below the pass: past that it would float in the air and hold up nothing, which
-        // on the overhanging side of a wall showered the print in fill fragments.
-        ExPolygons tread = intersection_ex(diff_ex(diff_ex(pass_slices[k], core_region), pass_band[k]), *below);
-        ExPolygons unsupported = tread;
-        // And under the wall of the pass above wherever less than about half its width comes down
-        // on material - a wall resting on most of the wall below it is an ordinary overhang and
-        // needs nothing, but past that it is printed into mid air. Filling there puts material
-        // outside the model's own surface, for the height of one sub-layer and only as wide as the
-        // wall it holds up - the price of printing the wall at all rather than leaving it hanging.
-        if (k + 1 < num_passes && ! pass_band[k + 1].empty()) {
-            ExPolygons support = union_ex(tread, union_ex(pass_band[k], *below));
-            const auto tol = float(this->flow(frExternalPerimeter, layer->wall_sub_slices[k].height).scaled_width() / 2);
-            append(unsupported, diff_ex(diff_ex(pass_band[k + 1], offset_ex(support, tol)), core_region));
-        }
+        // material below the pass, which gives the fill its whole contract: it never leaves the
+        // model and it never floats. A wall band past its support is not propped up from here -
+        // fill placed under it would sit on air itself, and on an outward-rolling surface it ended
+        // up as blobs on the outside of the print. Such a wall prints as the overhang or bridge the
+        // wall generator already classified it as.
+        ExPolygons unsupported = intersection_ex(diff_ex(diff_ex(pass_slices[k], core_region), pass_band[k]), *below);
         unsupported = opening_ex(union_ex(unsupported), support_min_width / 2.f);
         if (unsupported.empty())
             continue;
