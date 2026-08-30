@@ -309,7 +309,16 @@ void LayerRegion::make_perimeters(const SurfaceCollection &slices, const LayerRe
         // up as blobs on the outside of the print. Such a wall prints as the overhang or bridge the
         // wall generator already classified it as.
         ExPolygons unsupported = intersection_ex(diff_ex(diff_ex(pass_slices[k], core_region), pass_band[k]), *below);
+        // A strip that cannot hold a single extrusion along its whole length is not worth printing:
+        // it comes out as a stub of a millimetre or two that supports nothing and shows up on the
+        // surface. Where a wall moves by only a fraction of its width between passes, everything the
+        // tread finds is of that kind, which is what keeps this quiet on a gently rolling surface.
         unsupported = opening_ex(union_ex(unsupported), support_min_width / 2.f);
+        unsupported.erase(std::remove_if(unsupported.begin(), unsupported.end(),
+                                         [support_min_width](const ExPolygon &e) {
+                                             return e.area() < 4. * double(support_min_width) * double(support_min_width);
+                                         }),
+                          unsupported.end());
         if (unsupported.empty())
             continue;
         append_sublayer_support_fill(this->sublayer_perimeters[k], unsupported, support_flow,
