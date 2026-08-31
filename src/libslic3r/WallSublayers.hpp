@@ -31,9 +31,12 @@ struct WallSublayerContext
     // Per pass, lowest first: this layer re-sliced at that sub-layer's height, over all the regions
     // sharing this perimeter run.
     std::vector<ExPolygons> pass_slices;
-    // Where the model is solid for the whole layer height, which is the only ground the layer's own
-    // full-height pass may occupy. Unset when no pass has any area.
+    // Where the model is solid for the whole layer height, plus anything no pass can build on, which
+    // the layer's own full-height pass bridges at print_z. Unset when no pass has any area.
     ExPolygons              core_region;
+    // Only the solid-for-the-whole-height part. That column carries a pass standing on it; the rest
+    // of core_region is printed at print_z, above the passes, so it is air while they run.
+    ExPolygons              core_base;
     bool                    core_region_set = false;
 };
 
