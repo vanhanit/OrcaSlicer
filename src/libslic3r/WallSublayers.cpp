@@ -19,10 +19,11 @@
 
 namespace Slic3r {
 
-// An overhang path shorter than one extrusion is carried by the wall on either side of it; printing
-// it as an overhang costs an acceleration change, a fan blast and a drop to bridging speed for a
-// fraction of a nozzle's width of material.
-static constexpr double SUBLAYER_MIN_OVERHANG = 1.;  // x external wall width
+// An overhang path this short is carried by the wall on either side of it - it is a bridge whose
+// anchors are closer together than the thread is thick. Printing it as an overhang costs a
+// deceleration, a drop to bridging speed and a fan blast for a fraction of a millimetre of material,
+// which is a visible hitch in the wall and buys nothing.
+static constexpr double SUBLAYER_MIN_OVERHANG = 3.;  // x external wall width
 // A bridge has to be straight, so an overhang run anchored by wall at both ends becomes the chord
 // between those anchors. Past this it is the shape of the model, not a gap in it, and is left alone.
 static constexpr double SUBLAYER_MAX_BRIDGE_CHORD = 8.;  // x external wall width
