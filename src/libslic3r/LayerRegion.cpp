@@ -20,6 +20,7 @@
 #include "Algorithm/RegionExpansion.hpp"
 #include "libslic3r.h"
 #include "Utils.hpp"
+#include "WallSublayers.hpp"
 
 #include <cmath>
 #include <array>
@@ -109,6 +110,7 @@ void LayerRegion::slices_to_fill_surfaces_clipped()
 void LayerRegion::make_perimeters(const SurfaceCollection &slices, const LayerRegionPtrs &compatible_regions, SurfaceCollection* fill_surfaces, ExPolygons* fill_no_overlap)
 {
     this->perimeters.clear();
+    this->sublayer_perimeters.clear();
     this->thin_fills.clear();
 
     const PrintConfig       &print_config  = this->layer()->object()->print()->config();
@@ -126,9 +128,18 @@ void LayerRegion::make_perimeters(const SurfaceCollection &slices, const LayerRe
         model_rotation_rad = std::atan2((double)m(1, 0), (double)m(0, 0));
     }
 
+    // Orca: sub-layered walls take over the outermost loops, so the layer's own run must neither
+    // emit them nor reach outside the column that is solid for the whole layer height.
+    const WallSublayerContext sublayers = wall_sublayer_prepare(*this, compatible_regions, spiral_mode);
+
+    SurfaceCollection core_slices;
+    if (sublayers.core_region_set)
+        for (const Surface &surface : slices.surfaces)
+            core_slices.append(intersection_ex(surface.expolygon, sublayers.core_region), surface);
+
     PerimeterGenerator g(
         // input:
-        &slices,
+        sublayers.core_region_set ? &core_slices : &slices,
         &compatible_regions,
         this->layer()->height,
         this->layer()->slice_z,
@@ -166,10 +177,17 @@ void LayerRegion::make_perimeters(const SurfaceCollection &slices, const LayerRe
         g.lower_slices = &lower_slices;
     }
 
-    if (this->layer()->object()->config().wall_generator.value == PerimeterGeneratorType::Arachne && !spiral_mode)
+    const bool arachne = this->layer()->object()->config().wall_generator.value == PerimeterGeneratorType::Arachne && !spiral_mode;
+
+    g.sublayer_drop_walls = sublayers.band_walls;
+
+    if (arachne)
         g.process_arachne();
     else
         g.process_classic();
+
+    if (sublayers.band_walls > 0)
+        wall_sublayer_generate(*this, compatible_regions, sublayers, arachne, spiral_mode, model_rotation_rad);
 }
 
 #if 1
