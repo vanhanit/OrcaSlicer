@@ -10,6 +10,7 @@
 #include "MsgDialog.hpp"
 #include "libslic3r/PrintConfig.hpp"
 #include "libslic3r/GCode/AdaptivePAProcessor.hpp"
+#include "libslic3r/WallSublayers.hpp"
 #include "Plater.hpp"
 
 #include <algorithm>
@@ -451,6 +452,26 @@ void ConfigManipulation::update_print_fff_config(DynamicPrintConfig* config, con
         is_msg_dlg_already_exist = false;
     }
 
+    // Orca: sub-layered walls print the outermost walls several times per layer at ascending Z, which
+    // spiral vase cannot express - it rewrites the layer around a single continuous Z ramp.
+    if (config->opt_bool("spiral_mode") && config->get_abs_value("wall_sublayer_height") > 0) {
+        wxString msg_text = _(L("Sub-layered outer walls are not compatible with spiral vase mode."));
+
+        if (is_global_config)
+            msg_text += "\n\n" + _(L("Change these settings automatically?\n"
+                                     "Yes - Disable sub-layered outer walls\n"
+                                     "No  - Don't use spiral vase mode"));
+
+        MessageDialog dialog(m_msg_dlg_parent, msg_text, "", wxICON_WARNING | (is_global_config ? wxYES | wxNO : wxOK));
+        DynamicPrintConfig new_conf = *config;
+        auto answer = dialog.ShowModal();
+        if (!is_global_config || answer == wxID_YES)
+            new_conf.set_key_value("wall_sublayer_height", new ConfigOptionFloatOrPercent(0, false));
+        else
+            new_conf.set_key_value("spiral_mode", new ConfigOptionBool(false));
+        apply(config, &new_conf);
+    }
+
     if (config->opt_bool("alternate_extra_wall") &&
         (config->opt_enum<EnsureVerticalShellThickness>("ensure_vertical_shell_thickness") == evstAll)) {
         wxString msg_text = _(L("Alternate extra wall does't work well when ensure vertical shell thickness is set to All."));
@@ -648,6 +669,27 @@ void ConfigManipulation::update_print_fff_config(DynamicPrintConfig* config, con
         is_msg_dlg_already_exist    = true;
         dialog.ShowModal();
         new_conf.set_key_value("seam_slope_start_height", new ConfigOptionFloatOrPercent(0, false));
+        apply(config, &new_conf);
+        is_msg_dlg_already_exist = false;
+    }
+
+    // Orca: a sub-layer height that cannot divide the layer into at least two printable passes leaves
+    // the walls at the full layer height, which is not what the setting says it does.
+    // layer_height is the value read at the top of this function; a zero there has already been
+    // reported and reset, so skip rather than raise a second dialog about a stale value.
+    const double wall_sublayer_height = config->get_abs_value("wall_sublayer_height");
+    if (wall_sublayer_height > 0 && layer_height > EPSILON &&
+        (wall_sublayer_height > layer_height / 2 || layer_height / wall_sublayer_height > MAX_WALL_SUBLAYERS ||
+         wall_sublayer_height < MIN_WALL_SUBLAYER_HEIGHT)) {
+        const wxString msg_text = wxString::Format(
+            _(L("The outer wall sub-layer height must be at least %.2f mm, at most half the layer height, "
+                "and split a layer into no more than %d sub-layers.\nReset to 0.")),
+            MIN_WALL_SUBLAYER_HEIGHT, MAX_WALL_SUBLAYERS);
+        MessageDialog      dialog(m_msg_dlg_parent, msg_text, "", wxICON_WARNING | wxOK);
+        DynamicPrintConfig new_conf = *config;
+        is_msg_dlg_already_exist    = true;
+        dialog.ShowModal();
+        new_conf.set_key_value("wall_sublayer_height", new ConfigOptionFloatOrPercent(0, false));
         apply(config, &new_conf);
         is_msg_dlg_already_exist = false;
     }
@@ -1146,6 +1188,10 @@ void ConfigManipulation::toggle_print_fff_options(DynamicPrintConfig *config, in
     toggle_field("seam_slope_min_length", !config->opt_bool("seam_slope_entire_loop"));
     toggle_line("scarf_angle_threshold", has_seam_slope && config->opt_bool("seam_slope_conditional"));
     toggle_line("scarf_overhang_threshold", has_seam_slope && config->opt_bool("seam_slope_conditional"));
+
+    // Orca: sub-layered walls.
+    toggle_field("wall_sublayer_height", !has_spiral_vase);
+    toggle_line("wall_sublayer_loops", !has_spiral_vase && config->get_abs_value("wall_sublayer_height") > 0);
 
     bool use_beam_interlocking = config->opt_bool("interlocking_beam");
     toggle_line("mmu_segmented_region_interlocking_depth", !use_beam_interlocking);
