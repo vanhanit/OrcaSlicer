@@ -635,6 +635,8 @@ private:
     // regenerate per-layer content over m_layers only, so a stale stash would
     // otherwise be restored on top of fresh content); the plan calls it too.
     void   belt_undo_purge_plan() { belt_restore_dropped_fills(); belt_restore_truncated_layers(); }
+    // Orca: re-slice the layers at the sub-layer heights their outermost walls are printed at.
+    void slice_wall_sublayers();
     //BBS
     ExPolygons _shrink_contour_holes(double contour_delta, double hole_delta, const ExPolygons& polys) const;
     // BBS

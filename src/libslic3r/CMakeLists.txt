@@ -557,6 +557,8 @@ set(lisbslic3r_sources
     Utils.hpp
     VariableWidth.cpp
     VariableWidth.hpp
+    WallSublayers.cpp
+    WallSublayers.hpp
     Zipper.cpp
     Zipper.hpp
     FilamentGroup.hpp
