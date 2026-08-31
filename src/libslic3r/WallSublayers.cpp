@@ -27,10 +27,6 @@ static constexpr double SUBLAYER_MIN_OVERHANG = 3.;  // x external wall width
 // A bridge has to be straight, so an overhang run anchored by wall at both ends becomes the chord
 // between those anchors. Past this it is the shape of the model, not a gap in it, and is left alone.
 static constexpr double SUBLAYER_MAX_BRIDGE_CHORD = 8.;  // x external wall width
-// How far to either side a wall may look for material and still count as carried. A pass of an
-// outward-rolling surface lands a fraction of a wall width outside the one below and is held by it;
-// a lintel spanning a window has nothing within reach for most of its length.
-static constexpr double SUBLAYER_WALL_REACH = 2.;  // x external wall width
 // Print quality, not correctness: everything a pass fills stands on material by construction, but a
 // patch smaller than a few extrusion lines still comes out as a dab of a millimetre or two that
 // shows on the surface and costs a travel. Area rather than width, because the ring a gently sloped
@@ -125,26 +121,50 @@ static void tidy_pass_overhangs(ExtrusionEntityCollection &entities, double min_
     }
 }
 
-// A pass may print a wall that overhangs, but not one that bridges. A run with nothing within reach
-// of it for longer than a bridge can be straightened between its anchors is a bridge, and a bridge is
-// a thread as thick as the nozzle: inside a pass a fraction of that height it droops or is dragged
-// around. The lintel over a window is the case - it appears part way up a layer, anchored on the
-// jambs and spanning air between them. Such an island is left to the layer's own pass, which bridges
-// it at print_z the way an ordinary layer does.
-static void drop_bridging_islands(ExtrusionEntityCollection &entities, const ExPolygons &supported, double max_span)
+// A pass may print a wall that overhangs - an outward-rolling surface lands every pass outside the
+// one below and is built exactly that way - but not one with nothing under it at all. Where material
+// appears part way up a layer over open space, such as the lintel above a window, the pass would jump
+// to it, lay it in mid air and jump away. It is left to the layer's own pass, which prints it at
+// print_z over the whole layer height, with the bridge handling that needs.
+//
+// An overhanging perimeter still encloses the material it is growing out from, so a closed loop is
+// judged by whether the model below fills what it bounds, and an open path - a thin wall, a single
+// line with nothing either side of it - by whether the model below lies under the line itself.
+static bool stranded_over_air(const Polyline &q, const ExPolygons &below)
 {
+    if (q.points.size() > 2 && q.points.front() == q.points.back()) {
+        Polygon pg(q.points);
+        pg.points.pop_back();
+        const double enclosed = std::abs(pg.area());
+        if (enclosed <= 0.)
+            return false;
+        double covered = 0.;
+        for (const ExPolygon &e : intersection_ex(ExPolygons{ExPolygon(pg)}, below))
+            covered += e.area();
+        return covered < 0.1 * enclosed;
+    }
+    double air = 0.;
+    for (const Polyline &r : diff_pl(Polylines{q}, below))
+        air += r.length();
+    return air > 0.9 * q.length();
+}
+
+static void drop_airborne_islands(ExtrusionEntityCollection &entities, const ExPolygons &below)
+{
+    if (below.empty())
+        return;
     ExtrusionEntitiesPtr kept;
     kept.reserve(entities.entities.size());
     for (ExtrusionEntity *entity : entities.entities) {
         Polylines pl;
         entity->collect_polylines(pl);
-        bool bridges = false;
-        for (const Polyline &run : diff_pl(pl, supported))
-            if (run.length() > max_span) {
-                bridges = true;
+        bool stranded = ! pl.empty();
+        for (const Polyline &q : pl)
+            if (! stranded_over_air(q, below)) {
+                stranded = false;
                 break;
             }
-        if (bridges)
+        if (stranded)
             delete entity;
         else
             kept.emplace_back(entity);
@@ -311,13 +331,10 @@ void wall_sublayer_generate(LayerRegion               &layerm,
             ground.clear();
             continue;
         }
-        // What this pass has to work with: what the pass below put down, plus the column the layer's
-        // own pass fills at print_z over the whole layer height, plus the reach a wall is carried
-        // over by the material beside it.
-        ExPolygons beneath = ground;
-        append(beneath, ctx.core_base);
-        const ExPolygons supported = offset_ex(union_ex(beneath), SUBLAYER_WALL_REACH * support_width);
-        drop_bridging_islands(layerm.sublayer_perimeters[k], supported, SUBLAYER_MAX_BRIDGE_CHORD * double(support_width));
+        // Measured against the model at the sub-layer below, not against what was printed there: a
+        // thin wall needs something under it, and material merely beside it does not hold it up.
+        const ExPolygons *below = layer->wall_sublayer_support(k);
+        drop_airborne_islands(layerm.sublayer_perimeters[k], below == nullptr ? ExPolygons() : *below);
 
         // The tread: solid at this pass, outside the column the layer's own pass may occupy, not
         // already covered by this pass's walls, and standing on what the pass below put down.
@@ -328,7 +345,7 @@ void wall_sublayer_generate(LayerRegion               &layerm,
         // Ground for the pass above is the whole tread, before the quality filter below drops the
         // dabs, so that dropping one does not punch a hole and fragment every pass above it, and only
         // the band that is actually carried - the span of a lintel dropped above holds nothing up.
-        ExPolygons printed = intersection_ex(pass_band[k], supported);
+        ExPolygons printed = pass_band[k];
         append(printed, tread);
         ground = union_ex(printed);
 

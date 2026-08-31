@@ -893,19 +893,23 @@ TEST_CASE("Sub-layered wall support fill never stands on a void", "[WallSublayer
 }
 
 // A thin plate with a window cut through it, the window's top edge landing part way through a layer.
-// The lintel above it is one extrusion wide, so it reappears over the opening as a single line
-// anchored on the jambs and spanning air between them - the shape of a 3DBenchy's cabin front.
+// Above the opening the plate's wall crosses it, anchored on the jambs at either end.
 TriangleMesh windowed_plate()
 {
     TriangleMesh plate  = make_cube(20., 1., 12.);
     TriangleMesh window = make_cube(10., 3., 4.15);
-    window.translate(5., -1., 4.);   // opening X 5..15, right through the 1mm thickness, top at 8.15
+    window.translate(5., -1., 4.);   // opening X 5..15, right through the thickness, top at 8.15
     MeshBoolean::cgal::minus(plate, window);
     return plate;
 }
 
-TEST_CASE("A sub-layered pass does not bridge a window lintel", "[WallSublayers]")
+TEST_CASE("A sub-layered pass keeps a wall that crosses an opening", "[WallSublayers]")
 {
+    // The wall above a window is part of the plate's own perimeter, anchored at both ends, and has to
+    // be printed - the overhang handling is what carries it. Dropping stranded material must never
+    // take a whole perimeter with it: an earlier rule judged this island by the longest unsupported
+    // run anywhere in it and deleted the plate's entire outline, which the tests of the day did not
+    // notice because they only asked whether anything was left over the opening.
     const std::string gcode = slice({windowed_plate()}, {{"layer_height", "0.3"},
         {"initial_layer_print_height", "0.2"}, {"wall_loops", "2"}, {"skirt_loops", "0"},
         {"z_hop", "0"}, {"wall_generator", "arachne"}, {"wall_sublayer_height", "0.05"}});
@@ -927,11 +931,11 @@ TEST_CASE("A sub-layered pass does not bridge a window lintel", "[WallSublayers]
             return;
         const double above_first = self.z() - first_layer;
         if (std::abs(above_first / layer_height - std::round(above_first / layer_height)) < 1e-4)
-            return;   // the layer's own print_z, where the lintel is bridged normally
+            return;
         if (self.z() > 8.15 && self.z() < 8.3 && std::abs(self.x() - mid_x) < 3.)
             over_opening += line.dist_XY(self);
     });
 
-    INFO("extrusion spanning the opening at a sub-layer height: " << over_opening << "mm");
-    CHECK(over_opening < 1.);
+    INFO("wall crossing the opening at a sub-layer height: " << over_opening << "mm");
+    CHECK(over_opening > 3.);
 }
