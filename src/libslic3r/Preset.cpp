@@ -1048,6 +1048,8 @@ static std::vector<std::string> s_Preset_print_options{
     "staggered_inner_seams",
     "wall_sequence",
     "is_infill_first",
+    "wall_sublayer_height",
+    "wall_sublayer_loops",
     "sparse_infill_density",
     "fill_multiline",
     "gyroid_optimized",
