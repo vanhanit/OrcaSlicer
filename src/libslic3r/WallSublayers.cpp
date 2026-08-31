@@ -239,6 +239,15 @@ WallSublayerContext wall_sublayer_prepare(const LayerRegion &layerm, const Layer
         ground = union_ex(printed);
     }
     if (! stranded.empty()) {
+        stranded = union_ex(stranded);
+        // The passes must not detail a void the layer closes over and fills: the bottom text of a
+        // 3DBenchy is a recess a fraction of a layer deep, and the passes below it were drawing the
+        // outline of every character, to be buried by the bridge that goes over the whole recess a
+        // moment later. Closing the hole in the sub-slices leaves the outer contour untouched and
+        // takes those loops with it.
+        for (ExPolygons &pass : ctx.pass_slices)
+            if (! pass.empty())
+                pass = union_ex(pass, stranded);
         append(stranded, ctx.core_region);
         ctx.core_region = union_ex(stranded);
     }
