@@ -30,6 +30,7 @@ add_executable(${_TEST_NAME}_tests
 	test_texture_displacement.cpp
 	test_tree_support.cpp
 	test_trianglemesh.cpp
+	test_wall_sublayers.cpp
 	test_wipe.cpp
 	test_wipe_tower.cpp
 	)
