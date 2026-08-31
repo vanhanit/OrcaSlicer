@@ -136,6 +136,16 @@ ExPolygons Layer::merged(float offset_scaled) const
     return out;
 }
 
+const ExPolygons* Layer::wall_sublayer_support(size_t pass) const
+{
+    if (pass > 0)
+        return pass <= this->wall_sub_slices.size() ? &this->wall_sub_slices[pass - 1].merged : nullptr;
+    if (this->lower_layer == nullptr)
+        return nullptr;
+    return this->lower_layer->wall_sub_slices.empty() ? &this->lower_layer->lslices
+                                                      : &this->lower_layer->wall_sub_slices.back().merged;
+}
+
 bool Layer::is_perimeter_compatible(const Print& print, const PrintRegion& a, const PrintRegion& b)
 {
     const PrintRegionConfig& config       = a.config();
@@ -177,7 +187,11 @@ bool Layer::is_perimeter_compatible(const Print& print, const PrintRegion& a, co
         && config.seam_slope_entire_loop  == other_config.seam_slope_entire_loop
         && config.seam_slope_min_length   == other_config.seam_slope_min_length
         && config.seam_slope_steps        == other_config.seam_slope_steps
-        && config.seam_slope_inner_walls  == other_config.seam_slope_inner_walls;
+        && config.seam_slope_inner_walls  == other_config.seam_slope_inner_walls
+        // Orca: sub-layered walls replace the outermost loops of the shared perimeter run, so two
+        // regions must agree on them before their slices can be merged.
+        && config.opt_serialize("wall_sublayer_height") == other_config.opt_serialize("wall_sublayer_height")
+        && config.wall_sublayer_loops     == other_config.wall_sublayer_loops;
 }
 
 // Here the perimeters are created cummulatively for all layer regions sharing the same parameters influencing the perimeters.
@@ -193,6 +207,7 @@ void Layer::make_perimeters()
     for (LayerRegionPtrs::iterator layerm = m_regions.begin(); layerm != m_regions.end(); ++ layerm)
     	if ((*layerm)->slices.empty()) {
  			(*layerm)->perimeters.clear();
+ 			(*layerm)->sublayer_perimeters.clear();
  			(*layerm)->fills.clear();
  			(*layerm)->thin_fills.clear();
     	} else {
@@ -219,6 +234,7 @@ void Layer::make_perimeters()
                     if (is_perimeter_compatible(*m_object->print(), this_region, other_region))
 		            {
 			 			other_layerm->perimeters.clear();
+			 			other_layerm->sublayer_perimeters.clear();
 			 			other_layerm->fills.clear();
 			 			other_layerm->thin_fills.clear();
 		                layerms.push_back(other_layerm);

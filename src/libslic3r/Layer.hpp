@@ -72,6 +72,11 @@ public:
     // (this collection contains only ExtrusionEntityCollection objects)
     ExtrusionEntityCollection   perimeters;
 
+    // Orca: sub-layered outer walls. One entry per sub-layer of Layer::wall_sub_slices, lowest
+    // first, holding the outermost walls generated from that sub-slice. Empty unless
+    // wall_sublayer_height is set. The loops these replace are absent from `perimeters`.
+    std::vector<ExtrusionEntityCollection> sublayer_perimeters;
+
     // ordered collection of extrusion paths to fill surfaces
     // (this collection contains only ExtrusionEntityCollection objects)
     ExtrusionEntityCollection   fills;
@@ -98,8 +103,16 @@ public:
     void    export_region_slices_to_svg_debug(const char *name) const;
     void    export_region_fill_surfaces_to_svg_debug(const char *name) const;
 
+    // Orca: sub-layered walls. A region whose walls are all sub-layered has no perimeters of its own,
+    // and a thin wall-only feature has no fills either, so its whole content lives here.
+    bool    has_sublayer_walls() const {
+        for (const ExtrusionEntityCollection &pass : this->sublayer_perimeters)
+            if (! pass.entities.empty())
+                return true;
+        return false;
+    }
     // Is there any valid extrusion assigned to this LayerRegion?
-    bool    has_extrusions() const { return ! this->perimeters.entities.empty() || ! this->fills.entities.empty(); }
+    bool    has_extrusions() const { return ! this->perimeters.entities.empty() || ! this->fills.entities.empty() || this->has_sublayer_walls(); }
     //BBS
     void    simplify_infill_extrusion_entity() { simplify_entity_collection(&fills); }
     void    simplify_wall_extrusion_entity() { simplify_entity_collection(&perimeters); }
@@ -119,6 +132,21 @@ protected:
 private:
     Layer             *m_layer;
     const PrintRegion *m_region;
+};
+
+// Orca: one sub-layer of a layer whose outermost walls are printed as a stack of thinner passes.
+// The mesh is re-sliced at slice_z, so a sloped surface gains real vertical resolution rather than
+// repeating the layer's contour. The last sub-layer of a layer ends exactly at the layer's print_z.
+struct WallSubSlice
+{
+    coordf_t                print_z;
+    coordf_t                slice_z;
+    coordf_t                height;
+    // Indexed by PrintRegion::print_object_region_id(), like Layer::m_regions.
+    std::vector<ExPolygons> region_slices;
+    // Union over the regions. Serves as the lower slices for the sub-layer above it, so overhangs
+    // and bridges are classified against what this sub-layer actually printed.
+    ExPolygons              merged;
 };
 
 class Layer
@@ -165,6 +193,17 @@ public:
     // BBS
     ExPolygons              loverhangs;
     BoundingBox             loverhangs_bbox;
+
+    // Orca: sub-layers this layer's outermost walls are split into, lowest first. Empty unless
+    // wall_sublayer_height is set for one of the regions, and always empty on the first layer.
+    std::vector<WallSubSlice> wall_sub_slices;
+
+    // Orca: the material a sub-layered wall pass is printed onto - the pass below it, or the topmost
+    // sub-layer of the layer below. Both the wall generator and the G-code overhang estimator have to
+    // classify a pass against this rather than against the whole layer below, or a pass that is fully
+    // supported by the one beneath it reads as an overhang.
+    const ExPolygons*       wall_sublayer_support(size_t pass) const;
+
     size_t                  region_count() const { return m_regions.size(); }
     const LayerRegion*      get_region(int idx) const { return m_regions[idx]; }
     LayerRegion*            get_region(int idx) { return m_regions[idx]; }

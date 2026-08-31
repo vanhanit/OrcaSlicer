@@ -543,6 +543,10 @@ void PrintObject::make_perimeters()
         BOOST_LOG_TRIVIAL(debug) << "Generating extra perimeters for region " << region_id << " in parallel - end";
     }
 
+    // Orca: re-slice the layers whose outermost walls are printed as sub-layer stacks. Has to run
+    // before make_perimeters(), which generates the walls of each sub-slice.
+    this->slice_wall_sublayers();
+
     BOOST_LOG_TRIVIAL(debug) << "Generating perimeters in parallel - start";
     tbb::parallel_for(
         tbb::blocked_range<size_t>(0, m_layers.size()),

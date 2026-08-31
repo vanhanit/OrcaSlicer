@@ -101,6 +101,14 @@ public:
     std::vector<Polygons>       m_external_lower_polygons_series;
     std::vector<Polygons>       m_smaller_external_lower_polygons_series;
 
+    // Orca: sub-layered walls. Exactly one of these is set when the feature is in use; both left at
+    // 0 reproduces the unmodified generator.
+    // Band mode: generate only this many outermost loops, from a sub-slice of the layer.
+    int                                             sublayer_band_walls = 0;
+    // Core mode: the outermost loops up to this inset index are printed by the band passes, so drop
+    // them from the output once the wall ordering has been applied.
+    int                                             sublayer_drop_walls = 0;
+
     bool                                            has_fuzzy_skin = false;
     bool                                            has_fuzzy_hole = false;
     // Preserve construction order so overlap precedence remains deterministic.
