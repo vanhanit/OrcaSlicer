@@ -1594,6 +1594,8 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionBool,                is_infill_first))
     ((ConfigOptionBool,                small_area_infill_flow_compensation))
     ((ConfigOptionEnum<WallDirection>,  wall_direction))
+    ((ConfigOptionFloatOrPercent,      wall_sublayer_height))
+    ((ConfigOptionInt,                 wall_sublayer_loops))
 
     // Orca: other flow ratios (available for overriding, if set_other_flow_ratios is enabled)
     ((ConfigOptionFloat,                first_layer_flow_ratio))
@@ -1895,6 +1897,7 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionStrings,              small_area_infill_flow_compensation_model))
 
     ((ConfigOptionBool,                has_scarf_joint_seam))
+    ((ConfigOptionBool,                has_sublayered_walls))
 
     // Multi-nozzle + pre-heating + nozzle-change (nc) keys. Defaults are no-ops for existing
     // single-nozzle printers; new slicing paths gate on extruder_max_nozzle_count > 1.
