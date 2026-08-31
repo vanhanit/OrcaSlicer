@@ -26,13 +26,12 @@ static constexpr double SUBLAYER_MIN_OVERHANG = 1.;  // x external wall width
 // A bridge has to be straight, so an overhang run anchored by wall at both ends becomes the chord
 // between those anchors. Past this it is the shape of the model, not a gap in it, and is left alone.
 static constexpr double SUBLAYER_MAX_BRIDGE_CHORD = 8.;  // x external wall width
-// Below this a support patch is a dab of a millimetre or two that props nothing up and shows on the
-// surface. Area rather than width, because the ring a gently sloped surface needs is narrow but long.
+// Print quality, not correctness: everything a pass fills stands on material by construction, but a
+// patch smaller than a few extrusion lines still comes out as a dab of a millimetre or two that
+// shows on the surface and costs a travel. Area rather than width, because the ring a gently sloped
+// surface needs is narrow but long.
 static constexpr double SUBLAYER_MIN_SUPPORT_AREA = 12.;  // x solid infill width^2
-// How far a pass's fill may reach past the material under it. A rim a line or two wide is carried by
-// the wall band beside it and has to be laid down, or the wall above stands in mid air. Anything
-// further out is a void the passes cannot span, and filling it lays solid infill over open air.
-static constexpr double SUBLAYER_MAX_TREAD_REACH = 2.;  // x solid infill width
+
 
 int wall_sublayer_count(const PrintRegionConfig &config, coordf_t layer_height)
 {
@@ -157,6 +156,39 @@ WallSublayerContext wall_sublayer_prepare(const LayerRegion &layerm, const Layer
         ctx.core_region     = ctx.core_region_set ? intersection_ex(ctx.core_region, pass) : pass;
         ctx.core_region_set = true;
     }
+    if (! ctx.core_region_set)
+        return ctx;
+
+    // A pass extrudes over air only as wall - a wall may overhang, and the generator classifies it as
+    // one. Anything else it would have to fill over air is handed back to the layer's own pass, which
+    // prints at print_z over the whole layer height and so bridges it the way an ordinary layer does:
+    // with a bridge flow, bridge speed and the fan on. A pass cannot do that itself, because a bridge
+    // is a thread as thick as the nozzle and would stand proud of a pass a fraction of that height.
+    //
+    // The wall band is printed everywhere the pass has material, so it is ground for the pass above
+    // whether or not it overhangs. Approximated here from the sub-slice, because the real band is not
+    // known until the generator has run and the core has to be settled before that.
+    const coord_t band_width = coord_t(ctx.band_walls * layerm.flow(frExternalPerimeter, layer->height).scaled_width());
+    const ExPolygons *below  = layer->wall_sublayer_support(0);
+    ExPolygons        ground = below == nullptr ? ExPolygons() : *below;
+    ExPolygons        stranded;
+    for (size_t k = 0; k < num_passes; ++ k) {
+        if (ctx.pass_slices[k].empty()) {
+            ground.clear();
+            continue;
+        }
+        const ExPolygons band     = diff_ex(ctx.pass_slices[k], offset_ex(ctx.pass_slices[k], - float(band_width)));
+        const ExPolygons fillable = diff_ex(diff_ex(ctx.pass_slices[k], ctx.core_region), band);
+        append(stranded, diff_ex(fillable, ground));
+
+        ExPolygons printed = band;
+        append(printed, intersection_ex(fillable, ground));
+        ground = union_ex(printed);
+    }
+    if (! stranded.empty()) {
+        append(stranded, ctx.core_region);
+        ctx.core_region = union_ex(stranded);
+    }
     return ctx;
 }
 
@@ -229,50 +261,42 @@ void wall_sublayer_generate(LayerRegion               &layerm,
         pass_band[k] = diff_ex(ctx.pass_slices[k], union_ex(band_fill_no_overlap));
     }
 
-    // Everything the passes own but their walls do not cover has to be filled by the pass itself: the
-    // layer's own pass is confined to the columns solid for the whole layer, so nothing else reaches
-    // this ground, and it is what the wall band of every pass above comes down on.
+    // Everything the passes own but their walls do not cover, the pass fills itself: the layer's own
+    // pass is confined to the columns solid for the whole layer, so nothing else reaches this ground,
+    // and it is what the wall band of every pass above comes down on. wall_sublayer_prepare() has
+    // already handed anything a pass would have to fill over air back to the layer's own pass, so
+    // what is left here stands on material by construction.
     const Flow  support_flow  = layerm.flow(frSolidInfill, layer->wall_sub_slices.front().height);
     const float support_angle = float(Geometry::deg2rad(region_config.solid_infill_direction.value) + model_rotation_rad);
     const float support_width = float(support_flow.scaled_width());
     const double min_area     = SUBLAYER_MIN_SUPPORT_AREA * double(support_width) * double(support_width);
 
-    // What a pass may stand on: what the pass below put down - its wall band, its tread, and the
-    // column the layer fills at print_z - and not that sub-layer's slice. The slice says only where
-    // the model is solid, so a ceiling closing over part way up a layer claims ground the pass below
-    // left as air, and the fill went down over the void at solid infill speed. What no pass can
-    // reach is left to the next layer, which covers it at print_z as the bridge it is.
-    ExPolygons ground = layer->wall_sublayer_support(0) == nullptr ? ExPolygons() : *layer->wall_sublayer_support(0);
+    const ExPolygons *below  = layer->wall_sublayer_support(0);
+    ExPolygons        ground = below == nullptr ? ExPolygons() : *below;
     for (size_t k = 0; k < num_passes; ++ k) {
-        if (ctx.pass_slices[k].empty() || ground.empty()) {
+        if (ctx.pass_slices[k].empty()) {
             ground.clear();
             continue;
         }
         // The tread: solid at this pass, outside the column the layer's own pass may occupy, not
-        // already covered by this pass's walls, and standing on something. Repeating it pass after
-        // pass is how the staircase a sloped surface makes is filled up to print_z.
-        const ExPolygons reach = offset_ex(ground, float(SUBLAYER_MAX_TREAD_REACH * support_width));
-        const ExPolygons tread = intersection_ex(diff_ex(diff_ex(ctx.pass_slices[k], ctx.core_region), pass_band[k]), reach);
+        // already covered by this pass's walls, and standing on what the pass below put down.
+        // Repeating it pass after pass is how the staircase a sloped surface makes is filled up to
+        // print_z.
+        const ExPolygons tread = intersection_ex(diff_ex(diff_ex(ctx.pass_slices[k], ctx.core_region), pass_band[k]), ground);
 
-        // Ground for the pass above. Built from the tread before the print-quality filtering below,
-        // so that dropping a dab too small to be worth printing does not punch a hole in the ground
-        // and fragment every pass above it.
+        // Ground for the pass above is the whole tread, before the quality filter below drops the
+        // dabs, so that dropping one does not punch a hole and fragment every pass above it.
         ExPolygons printed = pass_band[k];
         append(printed, tread);
-        append(printed, intersection_ex(ctx.core_region, ctx.pass_slices[k]));
         ground = union_ex(printed);
 
-        // A patch smaller than a few extrusion lines across is not worth printing: it comes out as a
-        // dab of a millimetre or two that supports nothing and shows on the surface. The test is
-        // area, not width - the ring a gently sloped surface needs is narrow but long.
         ExPolygons fill = opening_ex(union_ex(tread), support_width / 2.f);
         fill.erase(std::remove_if(fill.begin(), fill.end(),
                                   [min_area](const ExPolygon &e) { return e.area() < min_area; }),
                    fill.end());
-        if (fill.empty())
-            continue;
-        append_sublayer_support_fill(layerm.sublayer_perimeters[k], fill, support_flow,
-                                     support_angle + float((k % 2) * M_PI / 2.), *layer, region_config);
+        if (! fill.empty())
+            append_sublayer_support_fill(layerm.sublayer_perimeters[k], fill, support_flow,
+                                         support_angle + float((k % 2) * M_PI / 2.), *layer, region_config);
     }
 }
 
