@@ -651,12 +651,12 @@ TEST_CASE("Sub-layered walls are not slowed down as overhangs", "[WallSublayers]
 }
 
 
-TEST_CASE("Sub-layered walls support a wall line that stands over nothing", "[WallSublayers]")
+TEST_CASE("A sub-layered wall over nothing is an overhang, not something to fill under", "[WallSublayers]")
 {
-    // Where a contour appears part way up a layer - the lower lip of a hole - the next pass's wall
-    // lands outside everything below it rather than inside the void of the pass beneath, so there is
-    // nothing for the pass below to fill *within* its own contour. It has to reach past that contour
-    // and lay the material down anyway, or the wall is printed in mid air.
+    // Where the contour rolls outward - the lower lip of a hole, a Benchy's gunwale - each pass's
+    // wall lands outside everything below it. A wall may do that: the generator classifies it as an
+    // overhang and prints it as one, which is what an ordinary layer does too. What a pass must not
+    // do is fill under it, because that fill would stand on air itself.
     const auto wall_generator = GENERATE("arachne", "classic");
     INFO("wall_generator=" << wall_generator);
 
@@ -671,11 +671,20 @@ TEST_CASE("Sub-layered walls support a wall line that stands over nothing", "[Wa
         if (! layer.empty())
             layer_print_zs.insert(distinct_sorted(layer).back());
 
-    int fill_at_sublayer_z = 0;
-    for (const double z : zs_of_type(gcode, "Internal solid infill"))
+    // The wall is still printed at the sub-layer heights - the surface is not left with a hole. Every
+    // pass here lands outside the one below, so the wall carries the overhang role for most of its
+    // length and both tags have to be counted.
+    std::set<double> wall_zs = zs_of_type(gcode, "Outer wall");
+    for (const double z : zs_of_type(gcode, "Overhang wall"))
+        wall_zs.insert(z);
+    int wall_at_sublayer_z = 0;
+    for (const double z : wall_zs)
         if (layer_print_zs.find(z) == layer_print_zs.end())
-            ++ fill_at_sublayer_z;
-    CHECK(fill_at_sublayer_z > 0);
+            ++ wall_at_sublayer_z;
+    CHECK(wall_at_sublayer_z > 0);
+
+    // And the overhang is carried by the overhang role rather than by fill beneath it.
+    CHECK(gcode.find(";TYPE:Overhang wall") != std::string::npos);
 }
 
 TEST_CASE("Sub-layered walls keep the layer's own walls inside the topmost pass", "[WallSublayers]")
@@ -819,10 +828,12 @@ TEST_CASE("Sub-layered wall support fill is not sprayed over overhangs", "[WallS
         }
 
     INFO("support fill " << length << "mm over " << paths << " paths, " << fragments << " under 6mm");
-    // Before the overhang rule, this cone drew 643 paths of which 547 were these stubs; now 107/28.
-    CHECK(fragments < 100);
-    // And the staircase it does have to build is still built - the fix must not simply emit nothing.
-    CHECK(length > 1000.);
+    // Nothing at all: every pass here lands outside the one below, so there is no ground to fill on.
+    // The wall prints as the overhang it is, and whatever needs filling belongs to the layer's own
+    // pass at print_z. Earlier designs chased these overhangs and drew 643 paths, 547 of them stubs
+    // of under 6mm, which showed on the print as blobs on an outward-rolling surface.
+    CHECK(length < 10.);
+    CHECK(fragments == 0);
 }
 
 // A box hollowed from the bed up to a ceiling that lands part way through a layer rather than on one
