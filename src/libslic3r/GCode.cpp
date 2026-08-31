@@ -6085,6 +6085,14 @@ LayerResult GCode::process_layer(
                         }
                     }
                 }
+
+                // Orca: sub-layered walls are emitted per instance rather than per island, but the
+                // instance only exists if something claimed it here. A thin wall-only feature whose
+                // every loop is sub-layered contributes no perimeters and no fills, so claim it
+                // explicitly - otherwise the feature is silently dropped from the layer.
+                if (layerm->has_sublayer_walls())
+                    object_islands_by_extruder(by_extruder, layer_tools.wall_extruder_id(region),
+                                               &layer_to_print - layers.data(), layers.size(), n_slices + 1);
             } // for regions
         }
     } // for objects
@@ -6393,6 +6401,10 @@ LayerResult GCode::process_layer(
         std::vector<InstanceToPrint>     &instances_to_print = filament_plan.first;
         const std::vector<InstanceVisit> &instance_visits    = filament_plan.second;
 
+        // Orca: sub-layered walls go down first, so the rest of the layer - including the skirt, the
+        // brim and the supports below - is printed at or above the height they finish at.
+        gcode += this->extrude_sublayer_walls(print, layers, instances_to_print, instance_visits, layer_tools, extruder_id, print_z);
+
         // We are almost ready to print. However, we must go through all the objects twice to print the overridden extrusions first (infill/perimeter wiping feature):
         std::vector<ObjectByExtruder::Island::Region> by_region_per_copy_cache;
         for (int print_wipe_extrusions = is_anything_overridden; print_wipe_extrusions>=0; --print_wipe_extrusions) {
@@ -6418,30 +6430,7 @@ LayerResult GCode::process_layer(
                 if (m_config.reduce_crossing_wall)
                     m_avoid_crossing_perimeters.init_layer(*m_layer);
 
-                if (this->config().gcode_label_objects) {
-                    gcode += std::string("; printing object ") + instance_to_print.print_object.model_object()->name +
-                             " id:" + std::to_string(instance_to_print.print_object.get_id()) + " copy " +
-                             std::to_string(inst.id) + "\n";
-                }
-                // exclude objects
-                if (m_enable_exclude_object) {
-                    if (is_BBL_Printer()) {
-                        m_writer.set_object_start_str(
-                            std::string("; start printing object, unique label id: ") +
-                            std::to_string(instance_to_print.label_object_id) + "\n" + "M624 " +
-                            _encode_label_ids_to_base64({instance_to_print.label_object_id}) + "\n");
-                    } else {
-                        const auto gflavor = print.config().gcode_flavor.value;
-                        if (gflavor == gcfKlipper) {
-                            m_writer.set_object_start_str(std::string("EXCLUDE_OBJECT_START NAME=") +
-                                                          get_instance_name(&instance_to_print.print_object, inst.id) + "\n");
-                        }
-                        else if (gflavor == gcfMarlinLegacy || gflavor == gcfMarlinFirmware || gflavor == gcfRepRapFirmware) {
-                            std::string str = std::string("M486 S") + std::to_string(inst.unique_id) + "\n";
-                            m_writer.set_object_start_str(str);
-                        }
-                    }
-                }
+                gcode += this->object_start_labels(print, instance_to_print, inst);
 
                 // Orca(#7946): set current obj regardless of the `enable_overhang_speed` value, because
                 // `enable_overhang_speed` is a PrintRegionConfig and here we don't have a region yet.
@@ -6568,25 +6557,7 @@ LayerResult GCode::process_layer(
                              " id:" + std::to_string(instance_to_print.print_object.get_id()) + " copy " +
                              std::to_string(inst.id) + "\n";
                 }
-                // exclude objects
-                // Don't set m_gcode_label_objects_end if you don't had to write the m_gcode_label_objects_start.
-                if (!m_writer.is_object_start_str_empty()) {
-                    m_writer.set_object_start_str("");
-                } else if (m_enable_exclude_object) {
-                    if (is_BBL_Printer()) {
-                        m_writer.set_object_end_str(std::string("; stop printing object, unique label id: ") +
-                                                    std::to_string(instance_to_print.label_object_id) + "\n" +
-                                                    "M625\n");
-                    } else {
-                        const auto gflavor = print.config().gcode_flavor.value;
-                        if (gflavor == gcfKlipper) {
-                            m_writer.set_object_end_str(std::string("EXCLUDE_OBJECT_END NAME=") +
-                                                        get_instance_name(&instance_to_print.print_object, inst.id) + "\n");
-                        } else if (gflavor == gcfMarlinLegacy || gflavor == gcfMarlinFirmware || gflavor == gcfRepRapFirmware) {
-                            m_writer.set_object_end_str(std::string("M486 S-1\n"));
-                        }
-                    }
-                }
+                this->object_end_labels(print, instance_to_print, inst);
             }
         }
 
@@ -6641,27 +6612,7 @@ LayerResult GCode::process_layer(
                 if (m_config.reduce_crossing_wall)
                     m_avoid_crossing_perimeters.init_layer(*m_layer);
 
-                if (this->config().gcode_label_objects) {
-                    gcode += std::string("; printing object ") + instance_to_print.print_object.model_object()->name +
-                             " id:" + std::to_string(instance_to_print.print_object.get_id()) + " copy " +
-                             std::to_string(inst.id) + "\n";
-                }
-                if (m_enable_exclude_object) {
-                    if (is_BBL_Printer()) {
-                        m_writer.set_object_start_str(
-                            std::string("; start printing object, unique label id: ") +
-                            std::to_string(instance_to_print.label_object_id) + "\n" + "M624 " +
-                            _encode_label_ids_to_base64({instance_to_print.label_object_id}) + "\n");
-                    } else {
-                        const auto gflavor = print.config().gcode_flavor.value;
-                        if (gflavor == gcfKlipper) {
-                            m_writer.set_object_start_str(std::string("EXCLUDE_OBJECT_START NAME=") +
-                                                          get_instance_name(&instance_to_print.print_object, inst.id) + "\n");
-                        } else if (gflavor == gcfMarlinLegacy || gflavor == gcfMarlinFirmware || gflavor == gcfRepRapFirmware) {
-                            m_writer.set_object_start_str(std::string("M486 S") + std::to_string(inst.unique_id) + "\n");
-                        }
-                    }
-                }
+                gcode += this->object_start_labels(print, instance_to_print, inst);
 
                 m_extrusion_quality_estimator.set_current_object(&instance_to_print.print_object);
 
@@ -6869,24 +6820,7 @@ LayerResult GCode::process_layer(
                         gcode += this->extrude_support(*instance_to_print.object_by_extruder.support, erIroning);
                 }
 
-                // --- Shared instance footer (mirrors Orca's main instance loop) ---
-                if (!m_writer.is_object_start_str_empty()) {
-                    m_writer.set_object_start_str("");
-                } else if (m_enable_exclude_object) {
-                    if (is_BBL_Printer()) {
-                        m_writer.set_object_end_str(std::string("; stop printing object, unique label id: ") +
-                                                    std::to_string(instance_to_print.label_object_id) + "\n" +
-                                                    "M625\n");
-                    } else {
-                        const auto gflavor = print.config().gcode_flavor.value;
-                        if (gflavor == gcfKlipper) {
-                            m_writer.set_object_end_str(std::string("EXCLUDE_OBJECT_END NAME=") +
-                                                        get_instance_name(&instance_to_print.print_object, inst.id) + "\n");
-                        } else if (gflavor == gcfMarlinLegacy || gflavor == gcfMarlinFirmware || gflavor == gcfRepRapFirmware) {
-                            m_writer.set_object_end_str(std::string("M486 S-1\n"));
-                        }
-                    }
-                }
+                this->object_end_labels(print, instance_to_print, inst);
             }
 
             m_sub_layer_flow_ratio = 0.0;
@@ -7232,7 +7166,10 @@ std::string GCode::extrude_loop(const ExtrusionLoop&        loop_ref,
     bool enable_seam_slope = ((seam_scarf_type == SeamScarfType::External && !is_hole) || seam_scarf_type == SeamScarfType::All) &&
         !m_config.spiral_mode &&
         (loop.role() == erExternalPerimeter || (loop.role() == erPerimeter && m_config.seam_slope_inner_walls)) &&
-        layer_id() > 0;
+        layer_id() > 0 &&
+        // Orca: a scarf ramps down over a full layer height, which would dip below the sub-layer
+        // wall pass underneath this one.
+        !m_in_sublayer_wall_pass;
     const auto nozzle_diameter = EXTRUDER_CONFIG(nozzle_diameter);
     if (enable_seam_slope && m_config.seam_slope_conditional.value) {
         enable_seam_slope = loop.is_smooth(m_config.scarf_angle_threshold.value * M_PI / 180., nozzle_diameter);
@@ -7275,7 +7212,9 @@ std::string GCode::extrude_loop(const ExtrusionLoop&        loop_ref,
     // If region perimeters size not greater than or equal to 2, then skip the wipe inside move as we will extrude in mid air
     // as no neighbouring perimeter exists. If an internal perimeter exists, we should find 2 perimeters touching the de-retraction point
     // 1 - the currently printed external perimeter and 2 - the neighbouring internal perimeter.
-    if (m_config.wipe_before_external_loop.value && !paths.empty() && paths.front().size() > 1 && paths.back().size() > 1 && paths.front().role() == erExternalPerimeter && region_perimeters.size() > 1) {
+    // Orca: during a sub-layer wall pass the inner walls of the layer have not been printed yet, so
+    // there is nothing at this height to wipe into.
+    if (m_config.wipe_before_external_loop.value && !m_in_sublayer_wall_pass && !paths.empty() && paths.front().size() > 1 && paths.back().size() > 1 && paths.front().role() == erExternalPerimeter && region_perimeters.size() > 1) {
         const bool is_full_loop_ccw = loop.polygon().is_counter_clockwise();
         bool is_hole_loop = (loop.loop_role() & ExtrusionLoopRole::elrHole) != 0;
         const double nozzle_diam = nozzle_diameter;
@@ -7578,6 +7517,169 @@ std::string GCode::extrude_path(const ExtrusionPath& path, const std::string& de
             m_wipe.path.reverse();
     }
 
+    return gcode;
+}
+
+// Orca: the labels that bracket one instance's extrusions - the gcode_label_objects comment and the
+// firmware-specific exclude-object markers. Shared by every place that starts printing an instance
+// within a layer, so an instance is labelled the same way wherever its extrusions come from.
+std::string GCode::object_start_labels(const Print &print, const InstanceToPrint &instance_to_print, const PrintInstance &inst)
+{
+    std::string gcode;
+    if (this->config().gcode_label_objects)
+        gcode += std::string("; printing object ") + instance_to_print.print_object.model_object()->name +
+                 " id:" + std::to_string(instance_to_print.print_object.get_id()) + " copy " +
+                 std::to_string(inst.id) + "\n";
+    if (m_enable_exclude_object) {
+        if (is_BBL_Printer()) {
+            m_writer.set_object_start_str(std::string("; start printing object, unique label id: ") +
+                                          std::to_string(instance_to_print.label_object_id) + "\n" + "M624 " +
+                                          _encode_label_ids_to_base64({instance_to_print.label_object_id}) + "\n");
+        } else {
+            const auto gflavor = print.config().gcode_flavor.value;
+            if (gflavor == gcfKlipper) {
+                m_writer.set_object_start_str(std::string("EXCLUDE_OBJECT_START NAME=") +
+                                              get_instance_name(&instance_to_print.print_object, inst.id) + "\n");
+            } else if (gflavor == gcfMarlinLegacy || gflavor == gcfMarlinFirmware || gflavor == gcfRepRapFirmware) {
+                m_writer.set_object_start_str(std::string("M486 S") + std::to_string(inst.unique_id) + "\n");
+            }
+        }
+    }
+    return gcode;
+}
+
+// The closing half of object_start_labels. Don't write an end marker if the start marker was never
+// flushed - nothing was printed for this instance, so just drop it.
+void GCode::object_end_labels(const Print &print, const InstanceToPrint &instance_to_print, const PrintInstance &inst)
+{
+    if (! m_writer.is_object_start_str_empty()) {
+        m_writer.set_object_start_str("");
+    } else if (m_enable_exclude_object) {
+        if (is_BBL_Printer()) {
+            m_writer.set_object_end_str(std::string("; stop printing object, unique label id: ") +
+                                        std::to_string(instance_to_print.label_object_id) + "\n" + "M625\n");
+        } else {
+            const auto gflavor = print.config().gcode_flavor.value;
+            if (gflavor == gcfKlipper) {
+                m_writer.set_object_end_str(std::string("EXCLUDE_OBJECT_END NAME=") +
+                                            get_instance_name(&instance_to_print.print_object, inst.id) + "\n");
+            } else if (gflavor == gcfMarlinLegacy || gflavor == gcfMarlinFirmware || gflavor == gcfRepRapFirmware) {
+                m_writer.set_object_end_str(std::string("M486 S-1\n"));
+            }
+        }
+    }
+}
+
+// Orca: sub-layered walls. Print the outermost walls as a stack of passes at ascending sub-layer
+// heights, the topmost of which ends exactly at the layer's print_z, before anything else of the
+// layer is printed. Every instance is taken through pass k before any instance starts pass k+1, so
+// Z only ever rises within the layer and the nozzle never crosses material printed above it.
+std::string GCode::extrude_sublayer_walls(const Print &print, const std::vector<LayerToPrint> &layers,
+                                          const std::vector<InstanceToPrint> &instances_to_print,
+                                          const std::vector<InstanceVisit> &instance_visits,
+                                          const LayerTools &layer_tools, unsigned int extruder_id, coordf_t print_z)
+{
+    // Sub-layer counts are per object layer, and an object is only subdivided in as many passes as
+    // its own layer height asked for.
+    size_t num_passes = 0;
+    for (const InstanceVisit &visit : instance_visits) {
+        const Layer *layer = layers[instances_to_print[visit.instance_idx].layer_id].object_layer;
+        if (layer != nullptr)
+            for (const LayerRegion *layerm : layer->regions())
+                num_passes = std::max(num_passes, layerm->sublayer_perimeters.size());
+    }
+    if (num_passes == 0)
+        return {};
+
+    std::string gcode;
+    m_in_sublayer_wall_pass = true;
+    // Each pass is a layer of its own in the preview, so it is marked as one - but only once it is
+    // known to print something, otherwise the preview would be left with an empty layer.
+    bool any_pass_printed = false;
+    for (size_t pass = 0; pass < num_passes; ++ pass) {
+        bool this_pass_printed = false;
+        // The material under a pass is a property of the object layer, so it is built once per
+        // object rather than once per instance of it.
+        std::set<const PrintObject*> supports_set_this_pass;
+        for (const InstanceVisit &visit : instance_visits) {
+            const InstanceToPrint &instance_to_print = instances_to_print[visit.instance_idx];
+            const Layer           *layer             = layers[instance_to_print.layer_id].object_layer;
+            if (layer == nullptr || pass >= layer->wall_sub_slices.size())
+                continue;
+
+            // Which regions of this instance have walls to print in this pass with this filament.
+            std::vector<const LayerRegion*> regions;
+            for (const LayerRegion *layerm : layer->regions())
+                if (pass < layerm->sublayer_perimeters.size() && ! layerm->sublayer_perimeters[pass].empty() &&
+                    layer_tools.wall_extruder_id(layerm->region()) == extruder_id)
+                    regions.emplace_back(layerm);
+            if (regions.empty())
+                continue;
+
+            if (! this_pass_printed) {
+                // The last pass ends at the layer's own print_z, so it shares its preview layer with
+                // everything else printed there - only the passes below it open one.
+                if (any_pass_printed)
+                    gcode += ";" + GCodeProcessor::Sub_Layer_Tag + "\n";
+                this_pass_printed = true;
+            }
+
+            const auto &inst = instance_to_print.print_object.instances()[instance_to_print.instance_id];
+            m_config.apply(print.default_region_config());
+            m_config.apply(instance_to_print.print_object.config(), true);
+            m_layer = layer;
+            // The layer printed over a raft interface is the object's first layer, which is never
+            // subdivided.
+            m_object_layer_over_raft = false;
+            if (m_config.reduce_crossing_wall)
+                m_avoid_crossing_perimeters.init_layer(*m_layer);
+            // Keys the overhang estimator's per-object layer boundaries; without it these walls would
+            // be measured against whichever object was emitted last.
+            m_extrusion_quality_estimator.set_current_object(&instance_to_print.print_object);
+            // These walls sit on the pass below them, not on the layer below, so that is what the
+            // overhang estimator has to measure them against - otherwise a wall a full-height pass
+            // would print at full speed is slowed down and gets the part cooling fan.
+            if (supports_set_this_pass.insert(&instance_to_print.print_object).second)
+                if (const ExPolygons *support = layer->wall_sublayer_support(pass); support != nullptr)
+                    m_extrusion_quality_estimator.override_prev_layer_boundary(&instance_to_print.print_object, *support);
+
+            // The pass ends at its own height, which the writer reaches lazily on the next travel.
+            m_nominal_z = layer->wall_sub_slices[pass].print_z + m_config.z_offset.value;
+            m_need_change_layer_lift_z = true;
+
+            gcode += this->object_start_labels(print, instance_to_print, inst);
+            // Starting on another object copy, plan the first travel with the external motion planner.
+            const std::pair<const PrintObject*, Point> this_object_copy(&instance_to_print.print_object, inst.shift);
+            if (m_last_obj_copy != this_object_copy)
+                m_avoid_crossing_perimeters.use_external_mp_once();
+            m_last_obj_copy = this_object_copy;
+            this->set_origin(unscale(inst.shift));
+
+            for (const LayerRegion *layerm : regions) {
+                m_config.apply(layerm->region().config());
+                // The pass holds one collection per island, whose loops are already in the order
+                // wall_sequence asked for, plus this pass's gap fill as bare paths at the end.
+                for (const ExtrusionEntity *entity : layerm->sublayer_perimeters[pass].entities) {
+                    if (const auto *island = dynamic_cast<const ExtrusionEntityCollection*>(entity))
+                        for (const ExtrusionEntity *ee : island->entities)
+                            gcode += this->extrude_entity(*ee, "perimeter", -1., island->entities);
+                    else
+                        gcode += this->extrude_entity(*entity, "perimeter");
+                }
+            }
+
+            this->object_end_labels(print, instance_to_print, inst);
+        }
+        any_pass_printed = any_pass_printed || this_pass_printed;
+    }
+    m_in_sublayer_wall_pass = false;
+    // The rest of the layer prints at print_z over the whole layer below again.
+    m_extrusion_quality_estimator.restore_prev_layer_boundaries();
+
+    // Flush a pending object end label before the layer's normal phase reopens an object.
+    m_writer.add_object_end_labels(gcode);
+    m_nominal_z = print_z + m_config.z_offset.value;
+    m_need_change_layer_lift_z = true;
     return gcode;
 }
 

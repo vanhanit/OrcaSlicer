@@ -111,6 +111,9 @@ const std::string GCodeProcessor::VFlush_End_Tag  = " VFLUSH_END";
 //Orca: External device purge tag
 const std::string GCodeProcessor::External_Purge_Tag = " EXTERNAL_PURGE";
 
+// Sub-layered wall pass marker, see Sub_Layer_Tag in the header.
+const std::string GCodeProcessor::Sub_Layer_Tag = " SUB_LAYER";
+
 // SKIPPABLE region tags. SKIPTYPE carries a trailing "<type>" payload so it is matched with
 // starts_with; START/END are whole-line tags.
 const std::string GCodeProcessor::Skippable_Start_Tag = " SKIPPABLE_START";
@@ -3054,6 +3057,10 @@ void GCodeProcessor::apply_config(const PrintConfig& config)
     if (has_scarf_joint_seam != nullptr)
         m_detect_layer_based_on_tag = m_detect_layer_based_on_tag || has_scarf_joint_seam->value;
 
+    const ConfigOptionBool* has_sublayered_walls = config.option<ConfigOptionBool>("has_sublayered_walls");
+    if (has_sublayered_walls != nullptr)
+        m_detect_layer_based_on_tag = m_detect_layer_based_on_tag || has_sublayered_walls->value;
+
     const ConfigOptionBool* manual_filament_change = config.option<ConfigOptionBool>("manual_filament_change");
     if (manual_filament_change != nullptr)
         m_manual_filament_change = manual_filament_change->value;
@@ -3448,6 +3455,10 @@ void GCodeProcessor::apply_config(const DynamicPrintConfig& config)
     if (has_scarf_joint_seam != nullptr)
         m_detect_layer_based_on_tag = m_detect_layer_based_on_tag || has_scarf_joint_seam->value;
 
+    const ConfigOptionBool* has_sublayered_walls = config.option<ConfigOptionBool>("has_sublayered_walls");
+    if (has_sublayered_walls != nullptr)
+        m_detect_layer_based_on_tag = m_detect_layer_based_on_tag || has_sublayered_walls->value;
+
     const ConfigOptionEnumGeneric *bed_type = config.option<ConfigOptionEnumGeneric>("curr_bed_type");
     if (bed_type != nullptr)
         m_result.bed_type = (BedType)bed_type->value;
@@ -3553,6 +3564,7 @@ void GCodeProcessor::reset()
     m_processing_start_custom_gcode = false;
     m_g1_line_id = 0;
     m_layer_id = 0;
+    m_sub_layer_count = 0;
     m_cp_color.reset();
 
     m_producer = EProducer::Unknown;
@@ -4366,6 +4378,12 @@ void GCodeProcessor::process_tags(const std::string_view comment, bool producers
     // layer change tag
     if (comment == reserved_tag(ETags::Layer_Change)) {
         ++m_layer_id;
+        return;
+    }
+
+    // Orca: a sub-layered wall pass starts a new preview layer without being one to the printer.
+    if (comment == Sub_Layer_Tag) {
+        ++m_sub_layer_count;
         return;
     }
 }
@@ -7055,7 +7073,9 @@ void GCodeProcessor::store_move_vertex(EMoveType type, EMovePathType path_type, 
         move_jerk,
         { 0.0f, 0.0f }, // time
         static_cast<float>(m_layer_id), //layer_duration: set later
-        std::max<unsigned int>(1, m_layer_id) - 1,
+        // Orca: the preview layer, which sub-layered wall passes add to without the printer or the
+        // time estimate seeing extra layers.
+        std::max<unsigned int>(1, m_layer_id) - 1 + m_sub_layer_count,
         internal_only,
         m_object_label_id,
         m_print_z

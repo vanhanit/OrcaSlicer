@@ -486,6 +486,9 @@ class Print;
         // multi-nozzle markers only ever emitted by BBL-printer paths. Public so the emission sites can
         // reference them single-sourced. The MACHINE_*_GCODE_* emission (GCode.cpp, gated
         // enable_pre_heating) activates the usage-block builder.
+        // Orca: marks the start of a sub-layered wall pass above the previous one. Preview-only, so
+        // it is a static string rather than a Reserved_Tags entry (the FLUSH/SKIPPABLE idiom above).
+        static const std::string Sub_Layer_Tag;
         static const std::string Machine_Start_GCode_End_Tag;
         static const std::string Machine_End_GCode_Start_Tag;
         static const std::string Nozzle_Change_Start_Tag;
@@ -1167,6 +1170,10 @@ class Print;
         bool m_processing_start_custom_gcode;
         unsigned int m_g1_line_id;
         unsigned int m_layer_id;
+        // Orca: sub-layered walls print a layer at several Z heights. Each of those is its own layer
+        // in the preview but not to the printer, so they are counted apart from m_layer_id, which
+        // stays the number of layers the machine prints and drives the time estimate.
+        unsigned int m_sub_layer_count;
         CpColor m_cp_color;
         SeamsDetector m_seams_detector;
         OptionsZCorrector m_options_z_corrector;
