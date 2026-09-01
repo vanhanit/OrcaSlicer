@@ -175,14 +175,25 @@ static void drop_airborne_islands(ExtrusionEntityCollection &entities, const ExP
 // A void the layer's own slice does not have is one that closes part way up the layer. The sub-slices
 // below it see it open, so left alone the passes trace its outline and the core carves it out of the
 // layer. Neither is wanted: the layer prints across it at print_z and bridges it the way an ordinary
-// layer does. Keeps the outer contour, and every void the layer itself has.
-static ExPolygons keep_layer_voids(const ExPolygons &src, const Polygons &layer_voids)
+// layer does. Decided per hole and the kept holes copied across untouched, so that no boundary is
+// reclipped: filling a hole by unioning its own footprint back in leaves hairline crescents along
+// the coincident edges, which the perimeter generator then walls in.
+static ExPolygons keep_layer_voids(const ExPolygons &src, const ExPolygons &layer_voids)
 {
-    Polygons contours;
-    contours.reserve(src.size());
-    for (const ExPolygon &expoly : src)
-        contours.emplace_back(expoly.contour);
-    return layer_voids.empty() ? union_ex(contours) : diff_ex(union_ex(contours), layer_voids);
+    ExPolygons kept;
+    kept.reserve(src.size());
+    for (const ExPolygon &expoly : src) {
+        ExPolygon out(expoly.contour);
+        for (const Polygon &hole : expoly.holes) {
+            double covered = 0.;
+            for (const ExPolygon &shared : intersection_ex(ExPolygons{ExPolygon(hole)}, layer_voids))
+                covered += shared.area();
+            if (covered > 0.05 * std::abs(hole.area()))
+                out.holes.emplace_back(hole);
+        }
+        kept.emplace_back(std::move(out));
+    }
+    return kept;
 }
 
 WallSublayerContext wall_sublayer_prepare(const LayerRegion &layerm, const LayerRegionPtrs &compatible_regions, bool spiral_mode)
@@ -228,12 +239,12 @@ WallSublayerContext wall_sublayer_prepare(const LayerRegion &layerm, const Layer
     // ceiling sees the characters as holes, so the passes were drawing the outline of each one and
     // the core was leaving a matching hole in a layer whose own slice is solid there - the layer
     // bridges the recess, and can only do so if it is given the material to bridge with.
-    Polygons layer_voids;
+    ExPolygons layer_voids;
     for (const LayerRegion *other : compatible_regions)
         for (const Surface &surface : other->slices.surfaces)
             for (const Polygon &hole : surface.expolygon.holes) {
                 layer_voids.emplace_back(hole);
-                layer_voids.back().reverse();
+                layer_voids.back().contour.reverse();
             }
     for (ExPolygons &pass : ctx.pass_slices)
         if (! pass.empty())

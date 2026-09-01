@@ -995,3 +995,57 @@ TEST_CASE("Sub-layers do not trace a recess the layer closes over", "[WallSublay
     INFO("wall drawn around the closed-over recess: " << around_recess << "mm");
     CHECK(around_recess < 1.);
 }
+
+// A hollow box with a pillar standing in the middle of the hollow, so every layer above the floor
+// slices as a ring with an island inside its hole - the topology of the box behind a 3DBenchy's
+// cabin, which stands inside the hull.
+TriangleMesh pillared_box()
+{
+    TriangleMesh box    = make_cube(20., 20., 12.);
+    TriangleMesh cavity = make_cube(14., 14., 12.);
+    cavity.translate(3., 3., 2.);   // hollow from z=2 up, open at the top
+    TriangleMesh pillar = make_cube(4., 4., 12.);
+    pillar.translate(8., 8., 1.);   // rooted in the floor, standing inside the hollow
+    MeshBoolean::cgal::minus(cavity, pillar);
+    MeshBoolean::cgal::minus(box, cavity);
+    return box;
+}
+
+TEST_CASE("A sub-layer pass keeps an island that stands inside a layer's hole", "[WallSublayers]")
+{
+    // Dropping the voids a layer does not have must never take material with it. Deciding it by
+    // subtracting the layer's holes from the sub-slice deleted every island that stands inside one,
+    // because such an island lies wholly within the hole it sits in: on a 3DBenchy the cabin and the
+    // box behind it vanished for two millimetres of Z and the walls above them started in mid air.
+    const double layer_height = 0.3, first_layer = 0.2;
+    const std::string gcode = slice({pillared_box()}, {{"layer_height", "0.3"},
+        {"initial_layer_print_height", "0.2"}, {"wall_loops", "2"}, {"skirt_loops", "0"},
+        {"z_hop", "0"}, {"wall_generator", "arachne"}, {"wall_sublayer_height", "0.05"}});
+    REQUIRE(! gcode.empty());
+
+    BoundingBoxf bbox;
+    GCodeReader  probe;
+    probe.parse_buffer(gcode, [&bbox](GCodeReader &self, const GCodeReader::GCodeLine &line) {
+        if (line.extruding(self) && line.dist_XY(self) > 0)
+            bbox.merge(Vec2d(self.x(), self.y()));
+    });
+    const Vec2d centre = bbox.center();
+
+    // Sub-layer Z values between 6 and 8mm at which the pillar has something printed.
+    std::set<double> pass_zs, pillar_zs;
+    GCodeReader      reader;
+    reader.parse_buffer(gcode, [&](GCodeReader &self, const GCodeReader::GCodeLine &line) {
+        if (! line.extruding(self) || line.dist_XY(self) <= 0 || self.z() < 6. || self.z() > 8.)
+            return;
+        const double above_first = self.z() - first_layer;
+        if (std::abs(above_first / layer_height - std::round(above_first / layer_height)) < 1e-4)
+            return;   // a layer's own print_z
+        pass_zs.insert(self.z());
+        if (std::abs(self.x() - centre.x()) < 2.5 && std::abs(self.y() - centre.y()) < 2.5)
+            pillar_zs.insert(self.z());
+    });
+
+    REQUIRE(! pass_zs.empty());
+    INFO("pillar printed at " << pillar_zs.size() << " of " << pass_zs.size() << " sub-layer heights");
+    CHECK(pillar_zs.size() == pass_zs.size());
+}
