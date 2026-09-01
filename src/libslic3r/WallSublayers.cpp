@@ -172,6 +172,19 @@ static void drop_airborne_islands(ExtrusionEntityCollection &entities, const ExP
     entities.entities = std::move(kept);
 }
 
+// A void the layer's own slice does not have is one that closes part way up the layer. The sub-slices
+// below it see it open, so left alone the passes trace its outline and the core carves it out of the
+// layer. Neither is wanted: the layer prints across it at print_z and bridges it the way an ordinary
+// layer does. Keeps the outer contour, and every void the layer itself has.
+static ExPolygons keep_layer_voids(const ExPolygons &src, const Polygons &layer_voids)
+{
+    Polygons contours;
+    contours.reserve(src.size());
+    for (const ExPolygon &expoly : src)
+        contours.emplace_back(expoly.contour);
+    return layer_voids.empty() ? union_ex(contours) : diff_ex(union_ex(contours), layer_voids);
+}
+
 WallSublayerContext wall_sublayer_prepare(const LayerRegion &layerm, const LayerRegionPtrs &compatible_regions, bool spiral_mode)
 {
     WallSublayerContext      ctx;
@@ -210,7 +223,23 @@ WallSublayerContext wall_sublayer_prepare(const LayerRegion &layerm, const Layer
     }
     if (! ctx.core_region_set)
         return ctx;
-    ctx.core_base = ctx.core_region;
+
+    // The bottom text of a 3DBenchy is a recess a fraction of a layer deep. Every pass below its
+    // ceiling sees the characters as holes, so the passes were drawing the outline of each one and
+    // the core was leaving a matching hole in a layer whose own slice is solid there - the layer
+    // bridges the recess, and can only do so if it is given the material to bridge with.
+    Polygons layer_voids;
+    for (const LayerRegion *other : compatible_regions)
+        for (const Surface &surface : other->slices.surfaces)
+            for (const Polygon &hole : surface.expolygon.holes) {
+                layer_voids.emplace_back(hole);
+                layer_voids.back().reverse();
+            }
+    for (ExPolygons &pass : ctx.pass_slices)
+        if (! pass.empty())
+            pass = keep_layer_voids(pass, layer_voids);
+    ctx.core_region = keep_layer_voids(ctx.core_region, layer_voids);
+    ctx.core_base   = ctx.core_region;
 
     // A pass extrudes over air only as wall - a wall may overhang, and the generator classifies it as
     // one. Anything else it would have to fill over air is handed back to the layer's own pass, which
@@ -239,15 +268,6 @@ WallSublayerContext wall_sublayer_prepare(const LayerRegion &layerm, const Layer
         ground = union_ex(printed);
     }
     if (! stranded.empty()) {
-        stranded = union_ex(stranded);
-        // The passes must not detail a void the layer closes over and fills: the bottom text of a
-        // 3DBenchy is a recess a fraction of a layer deep, and the passes below it were drawing the
-        // outline of every character, to be buried by the bridge that goes over the whole recess a
-        // moment later. Closing the hole in the sub-slices leaves the outer contour untouched and
-        // takes those loops with it.
-        for (ExPolygons &pass : ctx.pass_slices)
-            if (! pass.empty())
-                pass = union_ex(pass, stranded);
         append(stranded, ctx.core_region);
         ctx.core_region = union_ex(stranded);
     }

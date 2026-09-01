@@ -939,3 +939,59 @@ TEST_CASE("A sub-layered pass keeps a wall that crosses an opening", "[WallSubla
     INFO("wall crossing the opening at a sub-layer height: " << over_opening << "mm");
     CHECK(over_opening > 3.);
 }
+
+// A box with a shallow square recess in its underside, shallower than one layer, so it closes over
+// between two sub-layers rather than on a layer boundary - the engraved text on a 3DBenchy's hull.
+TriangleMesh engraved_box()
+{
+    TriangleMesh box = make_cube(20., 20., 6.);
+    for (const Vec3d &at : {Vec3d(7., 7., -0.3), Vec3d(13., 9., -0.35), Vec3d(9., 13., -0.28)}) {
+        TriangleMesh engrave = make_cylinder(1.6, 0.6);
+        engrave.translate(at.x(), at.y(), at.z());   // open to the bed, ceiling just above 0.25
+        MeshBoolean::cgal::minus(box, engrave);
+    }
+    return box;
+}
+
+TEST_CASE("Sub-layers do not trace a recess the layer closes over", "[WallSublayers]")
+{
+    // The layer's own slice is taken at its mid-height, where the recess has already closed, so the
+    // layer covers it in one bridge. The sub-slices below the ceiling still see it open, and taking
+    // the core from their intersection punched the recess back into a layer that has no such hole:
+    // every character of a 3DBenchy's bottom text came out as a wall, drawn in mid-air over the
+    // recess and buried by the bridge a moment later.
+    const double layer_height = 0.3, first_layer = 0.2;
+    const std::string gcode = slice({engraved_box()}, {{"layer_height", "0.3"},
+        {"initial_layer_print_height", "0.2"}, {"wall_loops", "2"}, {"skirt_loops", "0"},
+        {"z_hop", "0"}, {"wall_generator", "arachne"}, {"wall_sublayer_height", "0.05"}});
+    REQUIRE(! gcode.empty());
+
+    BoundingBoxf bbox;
+    GCodeReader  probe;
+    probe.parse_buffer(gcode, [&bbox](GCodeReader &self, const GCodeReader::GCodeLine &line) {
+        if (line.extruding(self) && line.dist_XY(self) > 0)
+            bbox.merge(Vec2d(self.x(), self.y()));
+    });
+    const Vec2d centre = bbox.center();
+
+    // Wall printed around the recess, anywhere between the first layer and the layer that covers it.
+    double      around_recess = 0.;
+    std::string type;
+    GCodeReader reader;
+    reader.parse_buffer(gcode, [&](GCodeReader &self, const GCodeReader::GCodeLine &line) {
+        const std::string_view comment = line.comment();
+        if (const size_t tag = comment.find("TYPE:"); tag != std::string_view::npos) {
+            type = std::string(comment.substr(tag + 5));
+            return;
+        }
+        if (type.find("wall") == std::string::npos || ! line.extruding(self) || line.dist_XY(self) <= 0)
+            return;
+        if (self.z() <= first_layer + EPSILON || self.z() > first_layer + layer_height + EPSILON)
+            return;
+        if (std::abs(self.x() - centre.x()) < 4.5 && std::abs(self.y() - centre.y()) < 4.5)
+            around_recess += line.dist_XY(self);
+    });
+
+    INFO("wall drawn around the closed-over recess: " << around_recess << "mm");
+    CHECK(around_recess < 1.);
+}
