@@ -1346,3 +1346,75 @@ TEST_CASE("A scarf seam inside a pass ramps within that pass", "[WallSublayers]"
         }
     }
 }
+
+TEST_CASE("Sub-layered walls stay joined to the walls the layer keeps", "[WallSublayers]")
+{
+    // The layer's own walls are generated from the column solid for the whole layer height, which on a
+    // wall that flares is the contour at the bottom of the layer. Every pass sits further out than
+    // that by the flare over one sub-layer, so without something in between the outer wall stack
+    // stands free of the rest of the layer, bonded to nothing, and prints as a rough free-standing
+    // ribbon. Measured as the closest approach between the two, which must be within touching
+    // distance of one extrusion for the band to be joined on at all.
+    // A sphere's lower half flares outward with Z exactly as a hull does, so each pass's contour sits
+    // outside the one below it by the flare over one sub-layer.
+    Print print;
+    Model model;
+    init_print({mesh(TestMesh::sphere_50mm)}, print, model, {{"layer_height", "0.2"},
+        {"initial_layer_print_height", "0.2"}, {"wall_loops", "3"}, {"skirt_loops", "0"},
+        {"wall_generator", "arachne"}, {"wall_sublayer_height", "0.05"}});
+    print.process();
+
+    std::function<void(const ExtrusionEntity*, Points&)> pts =
+        [&](const ExtrusionEntity *ee, Points &out) {
+            if (const auto *c = dynamic_cast<const ExtrusionEntityCollection*>(ee)) {
+                for (const ExtrusionEntity *ch : c->entities) pts(ch, out);
+            } else {
+                Polylines pl; ee->collect_polylines(pl);
+                for (const Polyline &p : pl)
+                    for (const Point &q : p.points) out.push_back(q);
+            }
+        };
+
+    const auto &layers = print.objects().front()->layers();
+    std::vector<double> gaps;
+    int no_tread = 0, with_tread = 0;
+    for (size_t li = 10; li < std::min<size_t>(layers.size(), 60); li += 5) {
+        const Layer *layer = layers[li];
+        Points core;
+        for (const LayerRegion *lr : layer->regions())
+            for (const ExtrusionEntity *ee : lr->perimeters.entities) pts(ee, core);
+        if (core.empty()) continue;
+        for (size_t k = 0; k < layer->wall_sub_slices.size(); ++ k) {
+            Points band; bool tread = false;
+            for (const LayerRegion *lr : layer->regions())
+                if (k < lr->sublayer_perimeters.size()) {
+                    for (const ExtrusionEntity *ee : lr->sublayer_perimeters[k].entities) {
+                        pts(ee, band);
+                        std::function<void(const ExtrusionEntity*)> chk = [&](const ExtrusionEntity *e) {
+                            if (const auto *c = dynamic_cast<const ExtrusionEntityCollection*>(e)) {
+                                for (const ExtrusionEntity *ch : c->entities) chk(ch);
+                            } else if (e->role() == erSolidInfill) tread = true;
+                        };
+                        chk(ee);
+                    }
+                }
+            if (band.empty()) continue;
+            (tread ? with_tread : no_tread) ++;
+            double best = std::numeric_limits<double>::max();
+            for (size_t i = 0; i < band.size(); i += 3)
+                for (size_t j = 0; j < core.size(); j += 3)
+                    best = std::min(best, (band[i] - core[j]).cast<double>().norm());
+            gaps.push_back(unscale<double>(best));
+        }
+    }
+    std::sort(gaps.begin(), gaps.end());
+    REQUIRE(! gaps.empty());
+    const double median = gaps[gaps.size() / 2];
+    INFO("passes sampled " << gaps.size() << " (with tread " << with_tread << ", without " << no_tread
+         << ")  closest band-to-core centreline distance: min " << gaps.front()
+         << "mm  median " << median << "mm  max " << gaps.back() << "mm");
+    // Two lines of the default width touch at about 0.42mm between their centres. Before the join was
+    // printed this was 0.58mm - a void right behind the outer wall over most of the surface.
+    CHECK(median < 0.45);
+    CHECK(gaps.front() < 0.42);
+}

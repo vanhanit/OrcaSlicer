@@ -12,6 +12,7 @@
 #include "PerimeterGenerator.hpp"
 #include "Print.hpp"
 #include "Surface.hpp"
+#include "VariableWidth.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -107,6 +108,32 @@ static void append_sublayer_support_fill(ExtrusionEntityCollection &out,
         filler->fill_surface_extrusion(&surface, params, entities);
     }
     out.append(std::move(entities));
+}
+
+// The remainder of a tread, too narrow for a fill line to sit in. A medial axis gives it a centreline
+// and a width that varies along it, so a ring a third of a line wide is printed a third of a line wide
+// instead of being dropped or over-extruded.
+static void append_sublayer_gap_fill(ExtrusionEntityCollection &out,
+                                     const ExPolygons          &areas,
+                                     const Flow                &flow,
+                                     const PrintRegionConfig   &region_config)
+{
+    if (areas.empty())
+        return;
+    const double   min = 0.2 * flow.scaled_width() * (1 - INSET_OVERLAP_TOLERANCE);
+    const double   max = 2. * flow.scaled_spacing();
+    ThickPolylines polylines;
+    for (ExPolygon &ex : diff_ex(opening_ex(areas, float(min / 2.)),
+                                 offset2_ex(areas, - float(max / 2.), float(max / 2. + ClipperSafetyOffset))))
+        ex.medial_axis(min, max, &polylines);
+
+    polylines.erase(std::remove_if(polylines.begin(), polylines.end(),
+                                   [&region_config](const ThickPolyline &p) {
+                                       return p.length() < scale_(region_config.filter_out_gap_fill.value);
+                                   }),
+                    polylines.end());
+    if (! polylines.empty())
+        variable_width(polylines, erGapFill, flow, out.entities);
 }
 
 // Tidy the overhang paths the wall generator split each loop into against the material below the
@@ -387,6 +414,14 @@ void wall_sublayer_generate(LayerRegion               &layerm,
     // and it is what the wall band of every pass above comes down on. wall_sublayer_prepare() has
     // already handed anything a pass would have to fill over air back to the layer's own pass, so
     // what is left here stands on material by construction.
+    // Where the layer's own run starts the first wall it keeps. The passes have to reach it, or the
+    // outer wall stack stands free of the rest of the layer with a void between them: on a wall that
+    // flares, every pass sits further out than the core boundary by the flare over one sub-layer, and
+    // a wall_sublayer_line_width that does not divide the strip evenly leaves a fraction of a line
+    // over on top of that.
+    const coord_t core_strip  = coord_t(ctx.band_walls * layerm.flow(frExternalPerimeter, layer->height).scaled_spacing());
+    const ExPolygons core_inner = offset_ex(ctx.core_region, - float(core_strip));
+
     const Flow   support_flow  = sublayer_flow(layerm, frSolidInfill, layer->wall_sub_slices.front().height);
     const float  support_angle = float(Geometry::deg2rad(region_config.solid_infill_direction.value) + model_rotation_rad);
     const float  support_width = float(support_flow.scaled_width());
@@ -412,11 +447,19 @@ void wall_sublayer_generate(LayerRegion               &layerm,
         // print_z.
         const ExPolygons tread = intersection_ex(diff_ex(diff_ex(ctx.pass_slices[k], ctx.core_region), pass_band[k]), ground);
 
+        // The strip between the band and the first wall the layer keeps for itself. On a wall that
+        // flares, every pass sits further out than the core boundary by the flare over one sub-layer,
+        // and a wall_sublayer_line_width that does not divide the strip evenly leaves a fraction of a
+        // line over on top of that. Unprinted, the outer wall stack stands free of the rest of the
+        // layer. It is only ever a fraction of a line wide, so it is gap fill, never solid fill.
+        const ExPolygons join = intersection_ex(diff_ex(diff_ex(ctx.core_region, core_inner), pass_band[k]), ground);
+
         // Ground for the pass above is the whole tread, before the quality filter below drops the
         // dabs, so that dropping one does not punch a hole and fragment every pass above it, and only
         // the band that is actually carried - the span of a lintel dropped above holds nothing up.
         ExPolygons printed = pass_band[k];
         append(printed, tread);
+        append(printed, join);
         ground = union_ex(printed);
 
         ExPolygons fill = opening_ex(union_ex(tread), support_width / 2.f);
@@ -426,6 +469,13 @@ void wall_sublayer_generate(LayerRegion               &layerm,
         if (! fill.empty())
             append_sublayer_support_fill(layerm.sublayer_perimeters[k], fill, support_flow,
                                          support_angle + float(k % 2) * pass_turn, *layer, region_config);
+
+        // The join, plus whatever of the tread was too narrow for a fill line to sit in. Solid fill
+        // either drops those or lays a full-width bead into them; gap fill gives them a medial axis and
+        // a width that follows the room there actually is.
+        ExPolygons thin = diff_ex(union_ex(tread), fill);
+        append(thin, join);
+        append_sublayer_gap_fill(layerm.sublayer_perimeters[k], union_ex(thin), support_flow, region_config);
     }
 }
 
