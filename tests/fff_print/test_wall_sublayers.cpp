@@ -1049,3 +1049,254 @@ TEST_CASE("A sub-layer pass keeps an island that stands inside a layer's hole", 
     INFO("pillar printed at " << pillar_zs.size() << " of " << pass_zs.size() << " sub-layer heights");
     CHECK(pillar_zs.size() == pass_zs.size());
 }
+
+// All non-zero part cooling fan speeds the G-code sets, as raw S values.
+static std::set<int> fan_speeds(const std::string &gcode)
+{
+    std::set<int> speeds;
+    GCodeReader   reader;
+    reader.parse_buffer(gcode, [&speeds](GCodeReader &, const GCodeReader::GCodeLine &line) {
+        if (line.cmd() != "M106")
+            return;
+        float s = 0.f;
+        if (line.has_value('S', s) && s > 0.f)
+            speeds.insert((int) std::lround(s));
+    });
+    return speeds;
+}
+
+// The extrusion widths reported by ;WIDTH: at each Z, which is how wide the thread laid there is.
+static std::map<double, std::set<double>> widths_by_z(const std::string &gcode)
+{
+    std::map<double, std::set<double>> widths;
+    double                             current = 0.;
+    GCodeReader                        reader;
+    reader.parse_buffer(gcode, [&](GCodeReader &self, const GCodeReader::GCodeLine &line) {
+        const std::string_view comment = line.comment();
+        const size_t           tag     = comment.find("WIDTH:");
+        if (tag != std::string_view::npos) {
+            current = atof(std::string(comment.substr(tag + 6)).c_str());
+            return;
+        }
+        if (current > 0. && line.extruding(self) && line.dist_XY(self) > 0)
+            widths[self.z()].insert(current);
+    });
+    return widths;
+}
+
+TEST_CASE("Sub-layered walls take their own speed", "[WallSublayers]")
+{
+    // A pass lays a fraction of a layer, so slowing one down costs a fraction of what slowing the
+    // outer wall everywhere costs - which is the point of having a speed of its own. With one banded
+    // loop the passes own every "Outer wall" extrusion and the layer's own run owns every "Inner
+    // wall" one, so the two are told apart by their type tag.
+    auto config = [](const char *sublayer_speed) {
+        DynamicPrintConfig c = base_config("0.05", "arachne");
+        c.set_deserialize_strict({{"wall_sublayer_loops", "1"},
+                                  {"slow_down_for_layer_cooling", "0"},
+                                  {"enable_overhang_speed", "0"},
+                                  {"slowdown_for_curled_perimeters", "0"},
+                                  {"outer_wall_speed", "60"},
+                                  {"inner_wall_speed", "60"},
+                                  {"wall_sublayer_speed", sublayer_speed}});
+        return c;
+    };
+
+    // Skipping the first layers, which print at the initial layer speed whatever else is set.
+    auto slowest = [](const std::string &gcode, const char *type) {
+        double     f      = std::numeric_limits<double>::max();
+        const auto layers = slowest_feedrate_of_type_per_layer_z(gcode, type);
+        for (size_t i = 3; i < layers.size(); ++ i)
+            for (const auto &[z, feedrate] : layers[i])
+                f = std::min(f, feedrate);
+        return f;
+    };
+    auto fastest = [](const std::string &gcode, const char *type) {
+        double f = 0.;
+        for (const auto &layer : slowest_feedrate_of_type_per_layer_z(gcode, type))
+            for (const auto &[z, feedrate] : layer)
+                f = std::max(f, feedrate);
+        return f;
+    };
+
+    const std::string full = slice({cube(20)}, config("100%"));
+    const std::string half = slice({cube(20)}, config("50%"));
+    REQUIRE(! full.empty());
+    REQUIRE(! half.empty());
+
+    // 100% is the speed the extrusion type would have used anyway.
+    CHECK_THAT(fastest(full, "Outer wall"), Catch::Matchers::WithinRel(60. * 60., 0.02));
+    // 50% halves the passes.
+    CHECK_THAT(fastest(half, "Outer wall"), Catch::Matchers::WithinRel(30. * 60., 0.02));
+    // and leaves the walls the layer still prints at its own height alone: every inner wall keeps the
+    // feedrate it had, whatever the volumetric limit and the initial layers made of it.
+    const auto full_inner = slowest_feedrate_of_type_per_layer_z(full, "Inner wall");
+    const auto half_inner = slowest_feedrate_of_type_per_layer_z(half, "Inner wall");
+    REQUIRE(full_inner.size() > 10);
+    CHECK(full_inner == half_inner);
+    CHECK(slowest(full, "Inner wall") > 0.);
+}
+
+TEST_CASE("Sub-layered walls are given a minimum layer time per pass", "[WallSublayers]")
+{
+    // The nozzle comes back to the same spot once per pass, so the layer has to last as many minimum
+    // layer times as it has passes for each of those intervals to be one. Splitting a layer into more
+    // passes therefore has to slow it down further, not less - even though more passes also means
+    // more material and so a longer layer to begin with.
+    auto slowest_feedrate = [](const char *sublayer_height) {
+        DynamicPrintConfig config = base_config(sublayer_height, "arachne");
+        config.set_deserialize_strict({{"wall_loops", "2"},
+                                       {"slow_down_for_layer_cooling", "1"},
+                                       {"slow_down_layer_time", "5"},
+                                       {"slow_down_min_speed", "1"},
+                                       {"enable_overhang_speed", "0"}});
+        // Small enough that a layer is well under the minimum layer time and the regulator has to act.
+        const std::string gcode = slice({cube(5)}, config);
+        REQUIRE(! gcode.empty());
+        double f = std::numeric_limits<double>::max();
+        const auto layers = slowest_feedrate_of_type_per_layer_z(gcode, "Outer wall");
+        REQUIRE(layers.size() > 4);
+        // Skip the first layers, whose speeds are dictated by the initial layer settings.
+        for (size_t i = 3; i < layers.size(); ++ i)
+            for (const auto &[z, feedrate] : layers[i])
+                f = std::min(f, feedrate);
+        return f;
+    };
+
+    const double two_passes  = slowest_feedrate("0.1");
+    const double four_passes = slowest_feedrate("0.05");
+    INFO("2 passes slowest " << two_passes << ", 4 passes slowest " << four_passes);
+    CHECK(four_passes < two_passes);
+}
+
+TEST_CASE("Sub-layered walls take their own fan speed", "[WallSublayers]")
+{
+    // With every other fan source pinned to zero, any fan the print turns on is the sub-layer one.
+    auto config = [](const char *sublayer_fan) {
+        DynamicPrintConfig c = base_config("0.05", "arachne");
+        c.set_deserialize_strict({{"slow_down_for_layer_cooling", "0"},
+                                  {"fan_min_speed", "0"},
+                                  {"fan_max_speed", "0"},
+                                  {"reduce_fan_stop_start_freq", "0"},
+                                  {"close_fan_the_first_x_layers", "0"},
+                                  {"enable_overhang_bridge_fan", "0"},
+                                  {"additional_cooling_fan_speed", "0"},
+                                  {"initial_layer_fan_speed", "-1"},
+                                  {"part_cooling_fan_min_pwm", "0"},
+                                  {"wall_sublayer_fan_speed", sublayer_fan}});
+        return c;
+    };
+
+    const std::set<int> off = fan_speeds(slice({cube(20)}, config("-1")));
+    const std::set<int> on  = fan_speeds(slice({cube(20)}, config("40")));
+
+    INFO("off: " << off.size() << " speeds, on: " << on.size() << " speeds");
+    CHECK(off.empty());
+    REQUIRE(on.size() == 1);
+    // 40% of the fan's range.
+    CHECK(*on.begin() == (int) std::lround(40. * 255. / 100.));
+}
+
+TEST_CASE("A narrower sub-layer line still covers the wall it replaces", "[WallSublayers]")
+{
+    // A pass a fraction of a layer tall but a full wall wide is far flatter than it is wide and hard
+    // to lay down evenly. Narrowing it has to leave the wall as thick as it was, so the passes take
+    // proportionally more loops to cover the same strip - otherwise the band and the walls the layer
+    // still prints itself part company and leave a groove.
+    auto config = [](const char *line_width) {
+        DynamicPrintConfig c = base_config("0.05", "arachne");
+        c.set_deserialize_strict({{"wall_loops", "4"},
+                                  {"wall_sublayer_loops", "2"},
+                                  {"outer_wall_line_width", "0.45"},
+                                  {"inner_wall_line_width", "0.45"},
+                                  {"wall_sublayer_line_width", line_width}});
+        return c;
+    };
+
+    const std::string wide   = slice({cube(20)}, config("0"));
+    const std::string narrow = slice({cube(20)}, config("0.3"));
+    REQUIRE(! wide.empty());
+    REQUIRE(! narrow.empty());
+
+    // A pass Z is any Z that is not a layer boundary; on this cube only the band prints there.
+    const auto pass_z = [](double z) { return std::abs(std::fmod(z + 1e-6, 0.2)) > 2e-6; };
+
+    const auto narrow_widths = widths_by_z(narrow);
+    int        pass_zs = 0;
+    for (const auto &[z, widths] : narrow_widths) {
+        if (z < 1. || ! pass_z(z))
+            continue;
+        ++ pass_zs;
+        for (const double w : widths) {
+            INFO("z " << z << " width " << w);
+            REQUIRE_THAT(w, Catch::Matchers::WithinAbs(0.3, 0.05));
+        }
+    }
+    REQUIRE(pass_zs > 10);
+
+    // The layer's own walls are untouched by the setting. They print at the layer's print_z, which the
+    // topmost pass also finishes on, so that Z carries both widths.
+    int boundary_zs = 0;
+    for (const auto &[z, widths] : narrow_widths)
+        if (z > 1. && ! pass_z(z)) {
+            ++ boundary_zs;
+            INFO("z " << z);
+            CHECK(std::any_of(widths.begin(), widths.end(), [](double w) { return w > 0.35; }));
+        }
+    REQUIRE(boundary_zs > 10);
+
+    // And the band still reaches as far in as it did at the full width, so nothing is left bare
+    // between it and the first wall the layer prints itself.
+    const auto wide_x   = min_x_by_z(wide);
+    const auto narrow_x = min_x_by_z(narrow);
+    double     worst    = 0.;
+    for (const auto &[z, x] : wide_x) {
+        if (z < 1. || ! pass_z(z))
+            continue;
+        const auto it = narrow_x.find(z);
+        REQUIRE(it != narrow_x.end());
+        worst = std::max(worst, std::abs(it->second - x));
+    }
+    INFO("innermost band extent moved by at most " << worst << "mm");
+    CHECK(worst < 0.25);
+}
+
+TEST_CASE("A concentric sub-layer fill follows the surface it fills", "[WallSublayers]")
+{
+    // What a pass has to fill is the tread of the staircase a sloped surface makes: a long narrow
+    // ring following the wall. Filled with straight lines it comes out as stubs across the ring;
+    // filled concentrically it is one loop per line. Which suits a given model is the user's call, so
+    // the pattern is an option and rectilinear stays the default.
+    auto closed_fraction = [](const char *pattern) {
+        Print print;
+        Model model;
+        init_print({shallow_cone()}, print, model, {{"layer_height", "0.2"},
+            {"initial_layer_print_height", "0.2"}, {"wall_loops", "2"}, {"skirt_loops", "0"},
+            {"wall_generator", "arachne"}, {"wall_sublayer_height", "0.05"},
+            {"wall_sublayer_fill_pattern", pattern}});
+        print.process();
+
+        int closed = 0, open = 0;
+        for (const Layer *layer : print.objects().front()->layers())
+            for (size_t k = 0; k < layer->wall_sub_slices.size(); ++ k) {
+                Polylines fill;
+                for (const LayerRegion *layerm : layer->regions())
+                    if (k < layerm->sublayer_perimeters.size())
+                        for (const ExtrusionEntity *ee : layerm->sublayer_perimeters[k].entities)
+                            collect_pass_fill(ee, fill);
+                for (const Polyline &p : fill) {
+                    if (p.size() < 3)
+                        continue;
+                    // A loop comes back to where it started; a line across the ring does not.
+                    const double span = unscale<double>((p.last_point() - p.first_point()).cast<double>().norm());
+                    (span < 0.5 ? closed : open) ++;
+                }
+            }
+        INFO(pattern << ": " << closed << " closed fill paths, " << open << " open ones");
+        REQUIRE(closed + open > 20);
+        return double(closed) / double(closed + open);
+    };
+
+    CHECK(closed_fraction("concentric") > 0.75);
+    CHECK(closed_fraction("rectilinear") < 0.25);
+}

@@ -33,6 +33,17 @@ static constexpr double SUBLAYER_MAX_BRIDGE_CHORD = 8.;  // x external wall widt
 // surface needs is narrow but long.
 static constexpr double SUBLAYER_MIN_SUPPORT_AREA = 12.;  // x solid infill width^2
 
+// The passes are only a fraction of a layer tall but would otherwise keep the configured wall width,
+// leaving the extrusion several times wider than it is tall - a shape that is hard to lay down evenly
+// and shows up as a rippled surface. wall_sublayer_line_width narrows them back; 0 keeps the width the
+// region uses for that role.
+static Flow sublayer_flow(const LayerRegion &layerm, FlowRole role, coordf_t height)
+{
+    const Flow   base  = layerm.flow(role, height);
+    const double width = layerm.region().config().wall_sublayer_line_width.get_abs_value(base.nozzle_diameter());
+    return width > 0. ? base.with_width(float(width)) : base;
+}
+
 
 int wall_sublayer_count(const PrintRegionConfig &config, coordf_t layer_height)
 {
@@ -59,19 +70,30 @@ static void append_sublayer_support_fill(ExtrusionEntityCollection &out,
                                          const Layer               &layer,
                                          const PrintRegionConfig   &region_config)
 {
-    std::unique_ptr<Fill> filler(Fill::new_from_type(ipRectilinear));
+    // What a pass has to fill is the tread of the staircase a sloped surface makes: a long narrow ring
+    // following the wall. Rectilinear crosses it in short lines with a travel between each, laid at a
+    // right angle to the pass below so that consecutive passes bond - an alternation that repeats at
+    // the height of one layer. Concentric follows the ring instead, in one loop per line, with no
+    // direction to alternate, which on a gently sloped surface may come out smoother. Which of the two
+    // suits a given model is not something the slicer can tell, so it is left to the user.
+    const bool concentric = region_config.wall_sublayer_fill_pattern.value == ipConcentric;
+
+    std::unique_ptr<Fill> filler(Fill::new_from_type(concentric ? ipConcentric : ipRectilinear));
     filler->set_bounding_box(layer.object()->bounding_box());
     filler->layer_id            = layer.id();
     filler->z                   = layer.print_z;
     filler->angle               = angle;
     filler->spacing             = flow.spacing();
-    filler->link_max_length     = (coord_t) scale_(3. * filler->spacing);
+    if (! concentric)
+        filler->link_max_length = (coord_t) scale_(3. * filler->spacing);
     filler->print_config        = &layer.object()->print()->config();
     filler->print_object_config = &layer.object()->config();
 
     FillParams params;
     params.density        = 1.f;
-    params.dont_adjust    = true;
+    // Concentric closes its spacing over the real width of the ring, which a tread only a few lines
+    // wide needs; rectilinear is held at the nominal spacing, as it was.
+    params.dont_adjust    = ! concentric;
     params.flow           = flow;
     params.extrusion_role = erSolidInfill;
     params.config         = &region_config;
@@ -208,6 +230,12 @@ WallSublayerContext wall_sublayer_prepare(const LayerRegion &layerm, const Layer
     ctx.band_walls = std::clamp(region_config.wall_sublayer_loops.value, 0, region_config.wall_loops.value);
     if (ctx.band_walls == 0)
         return ctx;
+    // The layer's own run drops band_walls of its own loops at the region's full width, so the band has
+    // to cover that same strip with however many of its own - possibly narrower - loops that takes.
+    const double normal_width = layerm.flow(frExternalPerimeter, layer->height).width();
+    const double band_width_1 = sublayer_flow(layerm, frExternalPerimeter, layer->height).width();
+    ctx.band_loops = band_width_1 > 0. ? std::max(1, (int) std::lround(ctx.band_walls * normal_width / band_width_1))
+                                       : ctx.band_walls;
 
     ctx.pass_slices.resize(num_passes);
     for (size_t k = 0; k < num_passes; ++ k) {
@@ -261,7 +289,7 @@ WallSublayerContext wall_sublayer_prepare(const LayerRegion &layerm, const Layer
     // The wall band is printed everywhere the pass has material, so it is ground for the pass above
     // whether or not it overhangs. Approximated here from the sub-slice, because the real band is not
     // known until the generator has run and the core has to be settled before that.
-    const coord_t band_width = coord_t(ctx.band_walls * layerm.flow(frExternalPerimeter, layer->height).scaled_width());
+    const coord_t band_width = coord_t(ctx.band_loops * sublayer_flow(layerm, frExternalPerimeter, layer->height).scaled_width());
     const ExPolygons *below  = layer->wall_sublayer_support(0);
     ExPolygons        ground = below == nullptr ? ExPolygons() : *below;
     ExPolygons        stranded;
@@ -322,7 +350,7 @@ void wall_sublayer_generate(LayerRegion               &layerm,
         ExPolygons                band_fill_no_overlap;
 
         PerimeterGenerator bg(
-            &band_slices, &compatible_regions, sub.height, sub.slice_z, layerm.flow(frPerimeter, sub.height),
+            &band_slices, &compatible_regions, sub.height, sub.slice_z, sublayer_flow(layerm, frPerimeter, sub.height),
             &region_config, &object_config, &print_config, spiral_mode, model_rotation_rad,
             &layerm.sublayer_perimeters[k], &band_gap_fill, &band_fill_surfaces, &band_fill_no_overlap);
 
@@ -332,13 +360,13 @@ void wall_sublayer_generate(LayerRegion               &layerm,
             bg.upper_slices_same_region = &layer->upper_layer->get_region(region_id)->slices;
         }
         bg.layer_id            = (int) layer->id();
-        bg.sublayer_band_walls = ctx.band_walls;
-        bg.ext_perimeter_flow  = layerm.flow(frExternalPerimeter, sub.height);
+        bg.sublayer_band_walls = ctx.band_loops;
+        bg.ext_perimeter_flow  = sublayer_flow(layerm, frExternalPerimeter, sub.height);
         // Not a bridge flow: that is a thread as thick as the nozzle, which inside a pass a fraction
         // of a layer high would stand proud of the pass and the one above would plough through it.
         // The overhang role is kept, so these still print at bridge speed with the part cooling fan.
-        bg.overhang_flow     = layerm.flow(frPerimeter, sub.height);
-        bg.solid_infill_flow = layerm.flow(frSolidInfill, sub.height);
+        bg.overhang_flow     = sublayer_flow(layerm, frPerimeter, sub.height);
+        bg.solid_infill_flow = sublayer_flow(layerm, frSolidInfill, sub.height);
 
         if (arachne)
             bg.process_arachne();
@@ -359,10 +387,12 @@ void wall_sublayer_generate(LayerRegion               &layerm,
     // and it is what the wall band of every pass above comes down on. wall_sublayer_prepare() has
     // already handed anything a pass would have to fill over air back to the layer's own pass, so
     // what is left here stands on material by construction.
-    const Flow  support_flow  = layerm.flow(frSolidInfill, layer->wall_sub_slices.front().height);
-    const float support_angle = float(Geometry::deg2rad(region_config.solid_infill_direction.value) + model_rotation_rad);
-    const float support_width = float(support_flow.scaled_width());
-    const double min_area     = SUBLAYER_MIN_SUPPORT_AREA * double(support_width) * double(support_width);
+    const Flow   support_flow  = sublayer_flow(layerm, frSolidInfill, layer->wall_sub_slices.front().height);
+    const float  support_angle = float(Geometry::deg2rad(region_config.solid_infill_direction.value) + model_rotation_rad);
+    const float  support_width = float(support_flow.scaled_width());
+    const double min_area      = SUBLAYER_MIN_SUPPORT_AREA * double(support_width) * double(support_width);
+    // A concentric fill has no direction, so there is nothing to turn between passes.
+    const float  pass_turn     = region_config.wall_sublayer_fill_pattern.value == ipConcentric ? 0.f : float(M_PI / 2.);
 
     const ExPolygons *below  = layer->wall_sublayer_support(0);
     ExPolygons        ground = below == nullptr ? ExPolygons() : *below;
@@ -395,7 +425,7 @@ void wall_sublayer_generate(LayerRegion               &layerm,
                    fill.end());
         if (! fill.empty())
             append_sublayer_support_fill(layerm.sublayer_perimeters[k], fill, support_flow,
-                                         support_angle + float((k % 2) * M_PI / 2.), *layer, region_config);
+                                         support_angle + float(k % 2) * pass_turn, *layer, region_config);
     }
 }
 
