@@ -7176,10 +7176,7 @@ std::string GCode::extrude_loop(const ExtrusionLoop&        loop_ref,
     bool enable_seam_slope = ((seam_scarf_type == SeamScarfType::External && !is_hole) || seam_scarf_type == SeamScarfType::All) &&
         !m_config.spiral_mode &&
         (loop.role() == erExternalPerimeter || (loop.role() == erPerimeter && m_config.seam_slope_inner_walls)) &&
-        layer_id() > 0 &&
-        // Orca: a scarf ramps down over a full layer height, which would dip below the sub-layer
-        // wall pass underneath this one.
-        !m_in_sublayer_wall_pass;
+        layer_id() > 0;
     const auto nozzle_diameter = EXTRUDER_CONFIG(nozzle_diameter);
     if (enable_seam_slope && m_config.seam_slope_conditional.value) {
         enable_seam_slope = loop.is_smooth(m_config.scarf_angle_threshold.value * M_PI / 180., nozzle_diameter);

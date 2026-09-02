@@ -1300,3 +1300,49 @@ TEST_CASE("A concentric sub-layer fill follows the surface it fills", "[WallSubl
     CHECK(closed_fraction("concentric") > 0.75);
     CHECK(closed_fraction("rectilinear") < 0.25);
 }
+
+TEST_CASE("A scarf seam inside a pass ramps within that pass", "[WallSublayers]")
+{
+    // The passes own the outer wall, so disabling scarf seams inside them silently dropped the
+    // setting from the only walls it applies to. A scarf ramps over the height of the path it is on,
+    // and a pass path is a sub-layer tall, so it stays inside its own pass instead of cutting into
+    // the one beneath - the same relationship an ordinary scarf has with the layer below it.
+    DynamicPrintConfig config = base_config("0.05", "arachne");
+    config.set_deserialize_strict({{"seam_slope_type", "external"}, {"seam_slope_start_height", "50%"}});
+    const std::string gcode = slice({cube(20)}, config);
+    REQUIRE(!gcode.empty());
+
+    // Z values seen while extruding, per layer, without collapsing duplicates.
+    std::vector<std::vector<double>> layers;
+    GCodeReader                      reader;
+    reader.parse_buffer(gcode, [&layers](GCodeReader &self, const GCodeReader::GCodeLine &line) {
+        if (line.comment().find("LAYER_CHANGE") != std::string_view::npos) {
+            layers.emplace_back();
+            return;
+        }
+        if (!layers.empty() && line.extruding(self) && line.dist_XY(self) > 0)
+            layers.back().emplace_back(self.z());
+    });
+    REQUIRE(layers.size() > 5);
+
+    // A scarf has to actually be emitted, or the test proves nothing: Z takes values off the
+    // sub-layer grid as the ramp climbs.
+    int off_grid = 0;
+    for (size_t i = 3; i < layers.size(); ++i)
+        for (const double z : layers[i])
+            if (std::abs(std::remainder(z, 0.05)) > 1e-4)
+                ++off_grid;
+    INFO(off_grid << " extruding moves at a ramped Z");
+    CHECK(off_grid > 0);
+
+    // And it must never dip a whole sub-layer below the pass it is ramping within, which is what
+    // would put the nozzle into the pass underneath.
+    for (size_t i = 3; i < layers.size(); ++i) {
+        double high = 0.;
+        for (const double z : layers[i]) {
+            high = std::max(high, z);
+            INFO("layer " << i << " z " << z << " after reaching " << high);
+            REQUIRE(z > high - 0.05 - EPSILON);
+        }
+    }
+}
