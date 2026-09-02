@@ -1419,6 +1419,9 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionEnum<WallDirection>,  wall_direction))
     ((ConfigOptionFloatOrPercent,      wall_sublayer_height))
     ((ConfigOptionInt,                 wall_sublayer_loops))
+    ((ConfigOptionEnum<InfillPattern>, wall_sublayer_fill_pattern))
+    ((ConfigOptionFloatOrPercent,      wall_sublayer_line_width))
+    ((ConfigOptionFloatOrPercent,      wall_sublayer_speed))
 
     // Orca: other flow ratios (available for overriding, if set_other_flow_ratios is enabled)
     ((ConfigOptionFloat,                first_layer_flow_ratio))
@@ -1918,6 +1921,7 @@ PRINT_CONFIG_CLASS_DERIVED_DEFINE(
     ((ConfigOptionInts,                support_material_interface_fan_speed))
     ((ConfigOptionInts,                internal_bridge_fan_speed)) // ORCA: Add support for separate internal bridge fan speed control
     ((ConfigOptionInts,                ironing_fan_speed))
+    ((ConfigOptionInts,                wall_sublayer_fan_speed)) // Orca: part cooling fan speed for sub-layered wall passes
     // Orca: notes for profiles from PrusaSlicer
     ((ConfigOptionStrings,             filament_notes))
     ((ConfigOptionString,              notes))

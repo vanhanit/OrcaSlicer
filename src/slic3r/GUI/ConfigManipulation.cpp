@@ -1191,7 +1191,11 @@ void ConfigManipulation::toggle_print_fff_options(DynamicPrintConfig *config, in
 
     // Orca: sub-layered walls.
     toggle_field("wall_sublayer_height", !has_spiral_vase);
-    toggle_line("wall_sublayer_loops", !has_spiral_vase && config->get_abs_value("wall_sublayer_height") > 0);
+    const bool has_wall_sublayers = !has_spiral_vase && config->get_abs_value("wall_sublayer_height") > 0;
+    toggle_line("wall_sublayer_loops", has_wall_sublayers);
+    toggle_line("wall_sublayer_line_width", has_wall_sublayers);
+    toggle_line("wall_sublayer_fill_pattern", has_wall_sublayers);
+    toggle_line("wall_sublayer_speed", has_wall_sublayers);
 
     bool use_beam_interlocking = config->opt_bool("interlocking_beam");
     toggle_line("mmu_segmented_region_interlocking_depth", !use_beam_interlocking);

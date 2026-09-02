@@ -183,6 +183,9 @@ struct LayerResult {
 	// Is indicating if this LayerResult should be processed, or it is just inserted artificial LayerResult.
     // It is used for the pressure equalizer because it needs to buffer one layer back.
     bool        nop_layer_result { false };
+    // Orca: how many sub-layered wall passes this layer printed, 1 meaning the walls printed once at
+    // the full layer height as usual. The cooling buffer regulates the minimum layer time per pass.
+    size_t      sublayer_passes { 1 };
 
     static LayerResult make_nop_layer_result() { return {"", std::numeric_limits<size_t>::max(), false, false, true}; }
 };
@@ -678,6 +681,10 @@ private:
     // ORCA: Add support for role based fan speed control
     std::array<bool, ExtrusionRole::erCount> m_is_role_based_fan_on;
     std::array<int, ExtrusionRole::erCount>  m_role_based_fan_marker_layer;
+    // Orca: the same marker state for the sub-layered wall passes, which are a phase of the layer
+    // rather than an extrusion role.
+    bool                                m_is_sublayer_fan_on { false };
+    int                                 m_sublayer_fan_marker_layer { -1 };
     // Markers for the Pressure Equalizer to recognize the extrusion type.
     // The Pressure Equalizer removes the markers from the final G-code.
     bool                                m_enable_extrusion_role_markers;

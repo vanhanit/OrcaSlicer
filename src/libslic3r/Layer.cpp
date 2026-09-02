@@ -191,7 +191,9 @@ bool Layer::is_perimeter_compatible(const Print& print, const PrintRegion& a, co
         // Orca: sub-layered walls replace the outermost loops of the shared perimeter run, so two
         // regions must agree on them before their slices can be merged.
         && config.opt_serialize("wall_sublayer_height") == other_config.opt_serialize("wall_sublayer_height")
-        && config.wall_sublayer_loops     == other_config.wall_sublayer_loops;
+        && config.wall_sublayer_loops     == other_config.wall_sublayer_loops
+        && config.opt_serialize("wall_sublayer_line_width") == other_config.opt_serialize("wall_sublayer_line_width")
+        && config.wall_sublayer_fill_pattern == other_config.wall_sublayer_fill_pattern;
 }
 
 // Here the perimeters are created cummulatively for all layer regions sharing the same parameters influencing the perimeters.

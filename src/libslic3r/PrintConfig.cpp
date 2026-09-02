@@ -2557,6 +2557,56 @@ void PrintConfigDef::init_fff_params()
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionInt(1));
 
+    def = this->add("wall_sublayer_fill_pattern", coEnum);
+    def->label = L("Sub-layered wall fill pattern");
+    def->category = L("Quality");
+    def->tooltip = L("Pattern used to fill the step a sloped surface leaves inside a sub-layer wall pass, which the "
+                     "pass above it stands on.\n\n"
+                     "That step is a long narrow ring following the wall. Rectilinear crosses it in short lines with a "
+                     "travel between each, laid at a right angle to the pass below so consecutive passes bond; that "
+                     "alternation repeats at the height of one layer and can show on a gently sloped surface. "
+                     "Concentric follows the ring instead, in one loop per line, with no direction to alternate.\n\n"
+                     "Only used when the outer wall sub-layer height is set.");
+    def->enum_keys_map = &ConfigOptionEnum<InfillPattern>::get_enum_values();
+    def->enum_values.push_back("rectilinear");
+    def->enum_values.push_back("concentric");
+    def->enum_labels.push_back(L("Rectilinear"));
+    def->enum_labels.push_back(L("Concentric"));
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionEnum<InfillPattern>(ipRectilinear));
+
+    def = this->add("wall_sublayer_line_width", coFloatOrPercent);
+    def->label = L("Sub-layered wall line width");
+    def->category = L("Quality");
+    def->tooltip = L("Line width of the sub-layered wall passes. A pass is only a fraction of a layer tall but is as "
+                     "wide as an ordinary wall, which leaves the extrusion far flatter than it is wide and makes it "
+                     "hard to lay down evenly. Narrowing the passes restores a printable shape and improves the "
+                     "surface finish.\n\n"
+                     "The passes still cover the same strip as the walls they replace, using proportionally more of "
+                     "them. Set to 0 to use the outer wall line width. Only used when the outer wall sub-layer height "
+                     "is set.");
+    def->sidetext = L("mm or %");
+    def->ratio_over = "nozzle_diameter";
+    def->min = 0;
+    def->max = 1000;
+    def->max_literal = 10;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloatOrPercent(0., false));
+
+    def = this->add("wall_sublayer_speed", coFloatOrPercent);
+    def->label = L("Sub-layered wall speed");
+    def->category = L("Quality");
+    def->tooltip = L("Speed of the sub-layered wall passes, as a percentage of the outer wall speed or as an absolute "
+                     "value. Because each pass lays down only a fraction of a layer, slowing them down costs less "
+                     "print time than slowing the whole outer wall, and gives the thin extrusions time to settle.\n\n"
+                     "Set to 100% to print them at the speed their extrusion type would use anyway. Only used when the "
+                     "outer wall sub-layer height is set.");
+    def->sidetext = L("mm/s or %");
+    def->ratio_over = "outer_wall_speed";
+    def->min = 0;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloatOrPercent(100, true));
+
     def = this->add("extruder", coInt);
     def->gui_type = ConfigOptionDef::GUIType::i_enum_open;
     def->label = L("Extruder");
@@ -3829,6 +3879,19 @@ void PrintConfigDef::init_fff_params()
                      "\nIf \"Full fan speed at layer\" is also set, the fan ramps smoothly from this value "
                      "on the first layer up to your target by the chosen layer."
                      "\nOnly available when \"No cooling for the first\" is 0."
+                     "\nSet to -1 to disable it.");
+    def->sidetext = "%";
+    def->min = -1;
+    def->max = 100;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionInts { -1 });
+
+    def = this->add("wall_sublayer_fan_speed", coInts);
+    def->label = L("Sub-layered wall fan speed");
+    def->tooltip = L("This part cooling fan speed is applied to the sub-layered wall passes. Because the passes revisit "
+                     "the same spot once per sub-layer, that spot gets only a fraction of the layer time to cool, which "
+                     "shows on small cross sections such as a chimney or a mast. Setting a speed here cools them without "
+                     "the full part cooling fan, which materials like ABS do not tolerate on the outer wall."
                      "\nSet to -1 to disable it.");
     def->sidetext = "%";
     def->min = -1;

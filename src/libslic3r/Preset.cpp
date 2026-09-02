@@ -1050,6 +1050,9 @@ static std::vector<std::string> s_Preset_print_options{
     "is_infill_first",
     "wall_sublayer_height",
     "wall_sublayer_loops",
+    "wall_sublayer_fill_pattern",
+    "wall_sublayer_line_width",
+    "wall_sublayer_speed",
     "sparse_infill_density",
     "fill_multiline",
     "gyroid_optimized",
@@ -1383,6 +1386,7 @@ static std::vector<std::string> s_Preset_filament_options {/*"filament_colour", 
     //SoftFever
     "enable_pressure_advance", "pressure_advance","adaptive_pressure_advance","adaptive_pressure_advance_model","adaptive_pressure_advance_overhangs", "adaptive_pressure_advance_bridges","chamber_temperature", "filament_shrink","filament_shrinkage_compensation_z", "support_material_interface_fan_speed","internal_bridge_fan_speed", "filament_notes" /*,"filament_seam_gap"*/,
     "ironing_fan_speed",
+    "wall_sublayer_fan_speed",
     // Filament ironing overrides
     "filament_ironing_flow", "filament_ironing_spacing", "filament_ironing_inset", "filament_ironing_speed",
     "filament_loading_speed", "filament_loading_speed_start",

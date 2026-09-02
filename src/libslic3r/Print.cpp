@@ -198,6 +198,9 @@ bool Print::invalidate_state_by_config_options(const ConfigOptionResolver & /* n
         "retraction_speed",
         "use_firmware_retraction",
         "slow_down_layer_time",
+        // Orca: sub-layered walls, both applied while writing the G-code.
+        "wall_sublayer_speed",
+        "wall_sublayer_fan_speed",
         "standby_temperature_delta",
         "preheat_time",
         "preheat_steps",

@@ -2909,6 +2909,8 @@ void GCode::_do_export(Print& print, GCodeOutputStream &file, ThumbnailsGenerato
     m_last_layer_accumulated_mass = 0.0;
     m_is_role_based_fan_on.fill(false);
     m_role_based_fan_marker_layer.fill(-1);
+    m_is_sublayer_fan_on = false;
+    m_sublayer_fan_marker_layer = -1;
 
     m_fan_mover.release();
     m_ordering_cache.clear();
@@ -4308,7 +4310,7 @@ void GCode::process_layers(
         [&cooling_buffer = *this->m_cooling_buffer.get()](LayerResult in) -> std::string {
         	if (in.nop_layer_result)
                 return in.gcode;
-            return cooling_buffer.process_layer(std::move(in.gcode), in.layer_id, in.cooling_buffer_flush);
+            return cooling_buffer.process_layer(std::move(in.gcode), in.layer_id, in.cooling_buffer_flush, in.sublayer_passes);
         });
     const auto pa_processor_filter = tbb::make_filter<std::string, std::string>(slic3r_tbb_filtermode::serial_in_order,
             [&pa_processor = *this->m_pa_processor](std::string in) -> std::string {
@@ -4408,7 +4410,7 @@ void GCode::process_layers(
         [&cooling_buffer = *this->m_cooling_buffer.get()](LayerResult in)->std::string {
             if (in.nop_layer_result)
                 return in.gcode;
-            return cooling_buffer.process_layer(std::move(in.gcode), in.layer_id, in.cooling_buffer_flush);
+            return cooling_buffer.process_layer(std::move(in.gcode), in.layer_id, in.cooling_buffer_flush, in.sublayer_passes);
         });
     const auto pa_processor_filter = tbb::make_filter<std::string, std::string>(slic3r_tbb_filtermode::serial_in_order,
         [&pa_processor = *this->m_pa_processor](std::string in) -> std::string {
@@ -5489,6 +5491,14 @@ LayerResult GCode::process_layer(
     if (layer_tools.extruders.empty())
         // Nothing to extrude.
         return result;
+
+    // Orca: sub-layered walls revisit the same XY once per pass, so the interval between two
+    // depositions at nearly the same height is the layer time divided by the number of passes. Hand
+    // the count to the cooling buffer, which regulates the minimum layer time against it.
+    for (const LayerToPrint &l : layers)
+        if (l.object_layer != nullptr)
+            for (const LayerRegion *layerm : l.object_layer->regions())
+                result.sublayer_passes = std::max(result.sublayer_passes, layerm->sublayer_perimeters.size());
 
     // Extract 1st object_layer and support_layer of this set of layers with an equal print_z.
     coordf_t             print_z       = layer.print_z;
@@ -8142,7 +8152,17 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
 
     if (speed == 0)
         speed = filament_max_volumetric_speed / _mm3_per_mm;
-    
+
+    // Orca: sub-layered walls. Applied to everything a pass emits - its walls, its gap fill and the
+    // fill it lays on its own tread - rather than to a role, because it is the pass that is thin, not
+    // the extrusion type. A pass costs a fraction of a layer, so slowing one down costs far less print
+    // time than slowing the outer wall everywhere.
+    if (m_in_sublayer_wall_pass) {
+        const double sublayer_speed = m_config.wall_sublayer_speed.get_abs_value(speed);
+        if (sublayer_speed > 0)
+            speed = sublayer_speed;
+    }
+
     const auto _layer = layer_id();
     if (this->on_first_layer() || object_layer_over_raft()) {
         //BBS: for solid infill of first layer, speed can be higher as long as
@@ -8477,39 +8497,49 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
             comment += ";_EXTERNAL_PERIMETER";
     }
 
-    // Change fan speed based on current extrusion role
-    auto append_role_based_fan_marker = [this, &gcode](const ExtrusionRole role, const std::string_view& marker_prefix, const bool fan_on) {
+    // Open and close a cooling-marker fan region. The caller owns the pair of state variables, so a
+    // region that is not an extrusion role - a sub-layered wall pass - can use the same emitter.
+    auto append_fan_marker = [this, &gcode](bool &is_on, int &marker_layer, const std::string_view& marker_prefix, const bool fan_on) {
         assert(m_enable_cooling_markers);
 
         if (fan_on) {
             // Orca: CoolingBuffer consumes role fan markers per layer, so continuing
             // role-based fan regions need a fresh START marker on each new layer.
-            if (!m_is_role_based_fan_on[role] || m_role_based_fan_marker_layer[role] != m_layer_index) {
+            if (!is_on || marker_layer != m_layer_index) {
                 gcode += ";";
                 gcode += marker_prefix;
                 gcode += "_FAN_START\n";
-                m_is_role_based_fan_on[role] = true;
-                m_role_based_fan_marker_layer[role] = m_layer_index;
+                is_on = true;
+                marker_layer = m_layer_index;
             }
         } else {
-            if (m_is_role_based_fan_on[role]) {
+            if (is_on) {
                 gcode += ";";
                 gcode += marker_prefix;
                 gcode += "_FAN_END\n";
-                m_is_role_based_fan_on[role] = false;
-                m_role_based_fan_marker_layer[role] = -1;
+                is_on = false;
+                marker_layer = -1;
             }
         }
     };
+    // Change fan speed based on current extrusion role
+    auto append_role_based_fan_marker = [this, &append_fan_marker](const ExtrusionRole role, const std::string_view& marker_prefix, const bool fan_on) {
+        append_fan_marker(m_is_role_based_fan_on[role], m_role_based_fan_marker_layer[role], marker_prefix, fan_on);
+    };
     auto apply_role_based_fan_speed = [
-        &path, &append_role_based_fan_marker,
+        this, &path, &append_fan_marker, &append_role_based_fan_marker,
         supp_interface_fan_speed = FILAMENT_CONFIG(support_material_interface_fan_speed),
-        ironing_fan_speed        = FILAMENT_CONFIG(ironing_fan_speed)
+        ironing_fan_speed        = FILAMENT_CONFIG(ironing_fan_speed),
+        sublayer_fan_speed       = FILAMENT_CONFIG(wall_sublayer_fan_speed)
     ] {
         append_role_based_fan_marker(erSupportMaterialInterface, "_SUPP_INTERFACE"sv,
                                      supp_interface_fan_speed >= 0 && path.role() == erSupportMaterialInterface);
         append_role_based_fan_marker(erIroning, "_IRONING"sv,
                                      ironing_fan_speed >= 0 && path.role() == erIroning);
+        // Orca: sub-layered walls. Keyed on the pass rather than on a role, and the lowest priority of
+        // the role fans in CoolingBuffer, so an overhang inside a pass still gets the overhang fan.
+        append_fan_marker(m_is_sublayer_fan_on, m_sublayer_fan_marker_layer, "_SUBLAYER"sv,
+                          sublayer_fan_speed >= 0 && m_in_sublayer_wall_pass);
     };
 
     // Farthest-point timelapse inline hook. When the photo head reaches (within 0.5 mm of) the

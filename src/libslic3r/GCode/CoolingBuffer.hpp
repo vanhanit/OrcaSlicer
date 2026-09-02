@@ -26,7 +26,7 @@ public:
     CoolingBuffer(GCode &gcodegen);
     void        reset(const Vec3d &position);
     void        set_current_extruder(unsigned int extruder_id, unsigned int nozzle_id) { m_current_extruder = extruder_id; m_current_nozzle = nozzle_id; }
-    std::string process_layer(std::string &&gcode, size_t layer_id, bool flush);
+    std::string process_layer(std::string &&gcode, size_t layer_id, bool flush, size_t sublayer_passes = 1);
 
 private:
 	CoolingBuffer& operator=(const CoolingBuffer&) = delete;
@@ -58,6 +58,11 @@ private:
     unsigned int                m_current_nozzle;
     //BBS: current fan speed
     int                         m_current_fan_speed;
+    // Orca: sub-layered walls print the outermost loops as m_sublayer_passes stacked passes, so the
+    // nozzle returns to the same spot that many times per layer. The minimum layer time is required
+    // per pass rather than per layer, which is what this scales. Accumulated as a maximum over the
+    // support layers collected into one cooling layer, and reset when they are flushed.
+    size_t                      m_sublayer_passes { 1 };
 };
 
 }

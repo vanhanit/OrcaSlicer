@@ -26,8 +26,12 @@ int wall_sublayer_count(const PrintRegionConfig &config, coordf_t layer_height);
 // full-height pass. band_walls == 0 means the feature is off for this region and the rest is empty.
 struct WallSublayerContext
 {
-    // How many outermost loops the passes take over from the layer's own perimeter run.
+    // How many outermost loops the passes take over from the layer's own perimeter run, at the width
+    // that run uses. This is what the layer's own run drops.
     int                     band_walls = 0;
+    // How many loops the passes actually print to cover that strip. Equal to band_walls unless
+    // wall_sublayer_line_width makes the passes narrower than the loops they replace.
+    int                     band_loops = 0;
     // Per pass, lowest first: this layer re-sliced at that sub-layer's height, over all the regions
     // sharing this perimeter run.
     std::vector<ExPolygons> pass_slices;

@@ -41,6 +41,7 @@ void CoolingBuffer::reset(const Vec3d &position)
     m_fan_speed = -1;
     m_additional_fan_speed = -1;
     m_current_fan_speed = -1;
+    m_sublayer_passes = 1;
 }
 
 struct CoolingLine
@@ -71,6 +72,9 @@ struct CoolingLine
         // ORCA: Add support for ironing fan speed control
         TYPE_IRONING_FAN_START         = 1 << 19,
         TYPE_IRONING_FAN_END           = 1 << 20,
+        // Orca: part cooling fan speed for the sub-layered wall passes
+        TYPE_SUBLAYER_FAN_START        = 1 << 21,
+        TYPE_SUBLAYER_FAN_END          = 1 << 22,
     };
 
     CoolingLine(unsigned int type, size_t  line_start, size_t  line_end) :
@@ -313,13 +317,16 @@ finished:
 	return new_feedrate;
 }
 
-std::string CoolingBuffer::process_layer(std::string &&gcode, size_t layer_id, bool flush)
+std::string CoolingBuffer::process_layer(std::string &&gcode, size_t layer_id, bool flush, size_t sublayer_passes)
 {
     // Cache the input G-code.
     if (m_gcode.empty())
         m_gcode = std::move(gcode);
     else
         m_gcode += gcode;
+    // Orca: the support layers collected ahead of the object layer carry no passes of their own, so
+    // the object layer's count has to survive being accumulated with them.
+    m_sublayer_passes = std::max(m_sublayer_passes, std::max<size_t>(sublayer_passes, 1));
 
     std::string out;
     if (flush) {
@@ -329,6 +336,7 @@ std::string CoolingBuffer::process_layer(std::string &&gcode, size_t layer_id, b
         float layer_time_stretched = this->calculate_layer_slowdown(per_extruder_adjustments);
         out = this->apply_layer_cooldown(m_gcode, layer_id, layer_time_stretched, per_extruder_adjustments);
         m_gcode.clear();
+        m_sublayer_passes = 1;
     }
     return out;
 }
@@ -344,7 +352,9 @@ std::vector<PerExtruderAdjustments> CoolingBuffer::parse_layer_gcode(const std::
         unsigned int            extruder_id = m_extruder_ids[i];
         adj.extruder_id               = extruder_id;
         adj.cooling_slow_down_enabled = m_config.slow_down_for_layer_cooling.get_at(extruder_id);
-        adj.slow_down_layer_time = float(m_config.slow_down_layer_time.get_at(extruder_id));
+        // Orca: with sub-layered walls the layer time is shared between the passes, so the whole
+        // layer has to last as many minimum layer times as there are passes for each pass to get one.
+        adj.slow_down_layer_time = float(m_config.slow_down_layer_time.get_at(extruder_id)) * float(m_sublayer_passes);
         adj.slow_down_min_speed           = float(m_config.slow_down_min_speed.get_at(extruder_id));
         // ORCA: To enable dont slow down external perimeters feature per filament (extruder)
         adj.dont_slow_down_outer_wall   = m_config.dont_slow_down_outer_wall.get_at(extruder_id);
@@ -531,6 +541,10 @@ std::vector<PerExtruderAdjustments> CoolingBuffer::parse_layer_gcode(const std::
             line.type = CoolingLine::TYPE_IRONING_FAN_START;
         } else if (boost::starts_with(sline, ";_IRONING_FAN_END")) { // ORCA: Add support for ironing fan speed control
             line.type = CoolingLine::TYPE_IRONING_FAN_END;
+        } else if (boost::starts_with(sline, ";_SUBLAYER_FAN_START")) { // Orca: sub-layered walls
+            line.type = CoolingLine::TYPE_SUBLAYER_FAN_START;
+        } else if (boost::starts_with(sline, ";_SUBLAYER_FAN_END")) { // Orca: sub-layered walls
+            line.type = CoolingLine::TYPE_SUBLAYER_FAN_END;
         } else if (boost::starts_with(sline, "G4 ")) {
             // Parse the wait time.
             line.type = CoolingLine::TYPE_G4;
@@ -730,11 +744,14 @@ std::string CoolingBuffer::apply_layer_cooldown(
     int  supp_interface_fan_speed = 0;
     bool ironing_fan_control= false; // ORCA: Add support for ironing fan speed control
     int  ironing_fan_speed   = 0; // ORCA: Add support for ironing fan speed control
+    bool sublayer_fan_control = false; // Orca: sub-layered walls
+    int  sublayer_fan_speed   = 0; // Orca: sub-layered walls
     auto change_extruder_set_fan = [ this, layer_id, layer_time, &new_gcode, part_cooling_fan_min_pwm,
         &overhang_fan_control, &overhang_fan_speed,
         &internal_bridge_fan_control, &internal_bridge_fan_speed,
         &supp_interface_fan_control, &supp_interface_fan_speed,
-        &ironing_fan_control, &ironing_fan_speed
+        &ironing_fan_control, &ironing_fan_speed,
+        &sublayer_fan_control, &sublayer_fan_speed
     ](bool immediately_apply) {
 #define EXTRUDER_CONFIG(OPT) m_config.OPT.get_at(m_current_extruder)
         float fan_min_speed = EXTRUDER_CONFIG(fan_min_speed);
@@ -773,12 +790,17 @@ std::string CoolingBuffer::apply_layer_cooldown(
             supp_interface_fan_control  = false;
             ironing_fan_speed           = initial_layer_fan_speed;
             ironing_fan_control         = false;
+            sublayer_fan_speed          = initial_layer_fan_speed;
+            sublayer_fan_control        = false;
             // additional_fan_speed_new is left at its configured value (auxiliary fan is independent of the
             // part-cooling override).
         } else if (int(layer_id) >= close_fan_the_first_x_layers) {
             float   fan_max_speed             = EXTRUDER_CONFIG(fan_max_speed);
-            float slow_down_layer_time = float(EXTRUDER_CONFIG(slow_down_layer_time));
-            float fan_cooling_layer_time      = float(EXTRUDER_CONFIG(fan_cooling_layer_time));
+            // Orca: layer_time has been regulated against the sub-layer scaled threshold, so the fan
+            // curve is read on the same scale - otherwise a stretched sub-layered layer reads as a
+            // slow layer and the fan drops off.
+            float slow_down_layer_time = float(EXTRUDER_CONFIG(slow_down_layer_time)) * float(m_sublayer_passes);
+            float fan_cooling_layer_time      = float(EXTRUDER_CONFIG(fan_cooling_layer_time)) * float(m_sublayer_passes);
             //BBS: always enable the fan speed interpolation according to layer time
             //if (EXTRUDER_CONFIG(cooling)) {
                 if (layer_time < slow_down_layer_time) {
@@ -830,6 +852,10 @@ std::string CoolingBuffer::apply_layer_cooldown(
             // ORCA: Add support for ironing fan speed control
             ironing_fan_speed   = EXTRUDER_CONFIG(ironing_fan_speed);
             ironing_fan_control = ironing_fan_speed >= 0;
+
+            // Orca: sub-layered walls
+            sublayer_fan_speed   = EXTRUDER_CONFIG(wall_sublayer_fan_speed);
+            sublayer_fan_control = sublayer_fan_speed >= 0;
 #undef EXTRUDER_CONFIG
             
         } else {
@@ -843,6 +869,8 @@ std::string CoolingBuffer::apply_layer_cooldown(
             internal_bridge_fan_speed = 0; // ORCA: Add support for separate internal bridge fan speed control
             ironing_fan_control = false; // ORCA: Add support for ironing fan speed control
             ironing_fan_speed = 0; // ORCA: Add support for ironing fan speed control
+            sublayer_fan_control = false; // Orca: sub-layered walls
+            sublayer_fan_speed = 0; // Orca: sub-layered walls
         }
         // A tool change may keep the same configured base fan speed while the physical fan is
         // still running at the previous filament's overhang speed. Restore the base speed before
@@ -871,6 +899,7 @@ std::string CoolingBuffer::apply_layer_cooldown(
                                                                {CoolingLine::TYPE_INTERNAL_BRIDGE_FAN_START, false}, // ORCA: Add support for separate internal bridge fan speed control
                                                                {CoolingLine::TYPE_SUPPORT_INTERFACE_FAN_START, false},
                                                                {CoolingLine::TYPE_IRONING_FAN_START, false}, // ORCA: Add support for ironing fan speed control
+                                                               {CoolingLine::TYPE_SUBLAYER_FAN_START, false}, // Orca: sub-layered walls
                                                                {CoolingLine::TYPE_FORCE_RESUME_FAN, false}};
     bool need_set_fan = false;
 
@@ -927,6 +956,16 @@ std::string CoolingBuffer::apply_layer_cooldown(
         } else if (line->type & CoolingLine::TYPE_IRONING_FAN_END) {
             if (ironing_fan_control && fan_speed_change_requests[CoolingLine::TYPE_IRONING_FAN_START]) {
                 fan_speed_change_requests[CoolingLine::TYPE_IRONING_FAN_START] = false;
+            }
+            need_set_fan = true;
+        } else if (line->type & CoolingLine::TYPE_SUBLAYER_FAN_START) { // Orca: sub-layered walls
+            if (sublayer_fan_control && !fan_speed_change_requests[CoolingLine::TYPE_SUBLAYER_FAN_START]) {
+                fan_speed_change_requests[CoolingLine::TYPE_SUBLAYER_FAN_START] = true;
+                need_set_fan = true;
+            }
+        } else if (line->type & CoolingLine::TYPE_SUBLAYER_FAN_END) { // Orca: sub-layered walls
+            if (sublayer_fan_control && fan_speed_change_requests[CoolingLine::TYPE_SUBLAYER_FAN_START]) {
+                fan_speed_change_requests[CoolingLine::TYPE_SUBLAYER_FAN_START] = false;
             }
             need_set_fan = true;
         } else if (line->type & CoolingLine::TYPE_FORCE_RESUME_FAN) {
@@ -1038,6 +1077,10 @@ std::string CoolingBuffer::apply_layer_cooldown(
             else if (fan_speed_change_requests[CoolingLine::TYPE_IRONING_FAN_START]){
                 new_gcode += GCodeWriter::set_fan(m_config.gcode_flavor, ironing_fan_speed, part_cooling_fan_min_pwm);
                 m_current_fan_speed = ironing_fan_speed;
+            }
+            else if (fan_speed_change_requests[CoolingLine::TYPE_SUBLAYER_FAN_START]){ // Orca: sub-layered walls
+                new_gcode += GCodeWriter::set_fan(m_config.gcode_flavor, sublayer_fan_speed, part_cooling_fan_min_pwm);
+                m_current_fan_speed = sublayer_fan_speed;
             }
             else if(fan_speed_change_requests[CoolingLine::TYPE_FORCE_RESUME_FAN] && m_current_fan_speed != -1){
                 new_gcode += GCodeWriter::set_fan(m_config.gcode_flavor, m_current_fan_speed, part_cooling_fan_min_pwm);

@@ -2723,6 +2723,9 @@ void TabPrint::build()
         optgroup->append_single_option_line("wall_direction", "quality_settings_wall_and_surfaces#wall-loop-direction");
         optgroup->append_single_option_line("wall_sublayer_height", "quality_settings_wall_and_surfaces#sub-layered-outer-walls");
         optgroup->append_single_option_line("wall_sublayer_loops", "quality_settings_wall_and_surfaces#sub-layered-outer-walls");
+        optgroup->append_single_option_line("wall_sublayer_line_width", "quality_settings_wall_and_surfaces#sub-layered-outer-walls");
+        optgroup->append_single_option_line("wall_sublayer_fill_pattern", "quality_settings_wall_and_surfaces#sub-layered-outer-walls");
+        optgroup->append_single_option_line("wall_sublayer_speed", "quality_settings_wall_and_surfaces#sub-layered-outer-walls");
         optgroup->append_single_option_line("print_flow_ratio", "quality_settings_wall_and_surfaces#surface-flow-ratio");
         optgroup->append_single_option_line("top_solid_infill_flow_ratio", "quality_settings_wall_and_surfaces#surface-flow-ratio");
         optgroup->append_single_option_line("bottom_solid_infill_flow_ratio", "quality_settings_wall_and_surfaces#surface-flow-ratio");
@@ -4502,6 +4505,7 @@ void TabFilament::build()
         optgroup->append_single_option_line("internal_bridge_fan_speed", "material_cooling#internal-bridges-fan-speed"); // ORCA: Add support for separate internal bridge fan speed control
         optgroup->append_single_option_line("support_material_interface_fan_speed", "material_cooling#support-interface-fan-speed");
         optgroup->append_single_option_line("ironing_fan_speed", "material_cooling#ironing-fan-speed"); // ORCA: Add support for ironing fan speed control
+        optgroup->append_single_option_line("wall_sublayer_fan_speed", "material_cooling#sub-layered-wall-fan-speed"); // Orca: sub-layered walls
 
         optgroup = page->new_optgroup(L("Auxiliary part cooling fan"), L"param_cooling_aux_fan");
         optgroup->append_single_option_line("additional_cooling_fan_speed", "material_cooling#auxiliary-part-cooling-fan");

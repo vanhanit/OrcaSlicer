@@ -1482,7 +1482,9 @@ bool PrintObject::invalidate_state_by_config_options(
             || opt_key == "detect_thin_wall"
             || opt_key == "precise_outer_wall"
             || opt_key == "wall_sublayer_height"
-            || opt_key == "wall_sublayer_loops") {
+            || opt_key == "wall_sublayer_loops"
+            || opt_key == "wall_sublayer_line_width"
+            || opt_key == "wall_sublayer_fill_pattern") {
             steps.emplace_back(posPerimeters);
             steps.emplace_back(posSupportMaterial);
         } else if (opt_key == "bridge_flow" || opt_key == "internal_bridge_flow") {
@@ -1534,6 +1536,8 @@ bool PrintObject::invalidate_state_by_config_options(
             || opt_key == "inner_wall_speed"
             || opt_key == "internal_solid_infill_speed"
             || opt_key == "top_surface_speed"
+            // Orca: sub-layered walls, resolved while writing the G-code.
+            || opt_key == "wall_sublayer_speed"
             || opt_key == "bed_mesh_min"
             || opt_key == "bed_mesh_max"
             || opt_key == "adaptive_bed_mesh_margin"

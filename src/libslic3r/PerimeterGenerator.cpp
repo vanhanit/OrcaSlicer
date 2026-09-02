@@ -1439,9 +1439,11 @@ void PerimeterGenerator::process_classic()
         int sparse_infill_density = this->config->sparse_infill_density.value;
         if (this->config->alternate_extra_wall && this->layer_id % 2 == 1 && !m_spiral_vase && sparse_infill_density > 0) // add alternating extra wall
             loop_number++;
-        // ORCA: a band pass only produces the outermost walls, which the core pass then drops.
+        // ORCA: a band pass only produces the outermost walls, which the core pass then drops. Set
+        // rather than clamped: wall_sublayer_line_width can make the band's loops narrower than the
+        // ones it replaces, so it takes more of them than the region has walls to cover the same strip.
         if (this->sublayer_band_walls > 0)
-            loop_number = std::min(loop_number, this->sublayer_band_walls - 1);
+            loop_number = this->sublayer_band_walls - 1;
         if (this->layer_id == object_config->raft_layers && only_one_wall_first_layer)
             loop_number = 0;
         // Set the topmost layer to be one wall
@@ -2437,9 +2439,11 @@ void PerimeterGenerator::process_arachne()
         int sparse_infill_density = this->config->sparse_infill_density.value;
         if (this->config->alternate_extra_wall && this->layer_id % 2 == 1 && !m_spiral_vase && sparse_infill_density > 0) // add alternating extra wall
             loop_number++;
-        // ORCA: a band pass only produces the outermost walls, which the core pass then drops.
+        // ORCA: a band pass only produces the outermost walls, which the core pass then drops. Set
+        // rather than clamped: wall_sublayer_line_width can make the band's loops narrower than the
+        // ones it replaces, so it takes more of them than the region has walls to cover the same strip.
         if (this->sublayer_band_walls > 0)
-            loop_number = std::min(loop_number, this->sublayer_band_walls - 1);
+            loop_number = this->sublayer_band_walls - 1;
 
         // Set the bottommost layer to be one wall
         const bool is_bottom_layer = (this->layer_id == object_config->raft_layers) ? true : false;
