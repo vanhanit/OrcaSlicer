@@ -33,6 +33,9 @@ static constexpr double SUBLAYER_MAX_BRIDGE_CHORD = 8.;  // x external wall widt
 // shows on the surface and costs a travel. Area rather than width, because the ring a gently sloped
 // surface needs is narrow but long.
 static constexpr double SUBLAYER_MIN_SUPPORT_AREA = 12.;  // x solid infill width^2
+// A gap fill run shorter than this is a dab: it holds nothing together and costs a travel, a stop and
+// a start, which on a curved wall is repeated thousands of times over.
+static constexpr double SUBLAYER_MIN_GAP_FILL = 2.;  // x solid infill width
 
 // The passes are only a fraction of a layer tall but would otherwise keep the configured wall width,
 // leaving the extrusion several times wider than it is tall - a shape that is hard to lay down evenly
@@ -127,10 +130,14 @@ static void append_sublayer_gap_fill(ExtrusionEntityCollection &out,
                                  offset2_ex(areas, - float(max / 2.), float(max / 2. + ClipperSafetyOffset))))
         ex.medial_axis(min, max, &polylines);
 
+    // A gap this short carries a few hundredths of a cubic millimetre and costs a travel, a stop and a
+    // start to place it - on a curved wall the strip shatters into thousands of them against the jagged
+    // edge of what the pass below printed, and every one of those is somewhere a blob can form. The
+    // user's own filter still applies on top where it is set higher.
+    const double min_length = std::max(SUBLAYER_MIN_GAP_FILL * double(flow.scaled_width()),
+                                       scale_(region_config.filter_out_gap_fill.value));
     polylines.erase(std::remove_if(polylines.begin(), polylines.end(),
-                                   [&region_config](const ThickPolyline &p) {
-                                       return p.length() < scale_(region_config.filter_out_gap_fill.value);
-                                   }),
+                                   [min_length](const ThickPolyline &p) { return p.length() < min_length; }),
                     polylines.end());
     if (! polylines.empty())
         variable_width(polylines, erGapFill, flow, out.entities);
@@ -358,6 +365,11 @@ void wall_sublayer_generate(LayerRegion               &layerm,
     // Overhangs and bridges are classified against the sub-layer below, so a wall supported by the
     // pass beneath it is no longer treated as an overhang of the whole layer.
     layerm.sublayer_perimeters.resize(num_passes);
+
+    // Where the walls the layer keeps for itself begin: the passes have to reach this, or the outer
+    // wall stack stands free of the rest of the layer with a void between them.
+    const coord_t core_strip = coord_t(ctx.band_walls * layerm.flow(frExternalPerimeter, layer->height).scaled_spacing());
+    const ExPolygons core_interior = offset_ex(ctx.core_region, - float(core_strip));
     // The footprint of each pass's wall band. The band of pass k+1 is laid on what pass k printed, so
     // this drives the support fill below.
     std::vector<ExPolygons> pass_band(num_passes);
@@ -414,14 +426,6 @@ void wall_sublayer_generate(LayerRegion               &layerm,
     // and it is what the wall band of every pass above comes down on. wall_sublayer_prepare() has
     // already handed anything a pass would have to fill over air back to the layer's own pass, so
     // what is left here stands on material by construction.
-    // Where the layer's own run starts the first wall it keeps. The passes have to reach it, or the
-    // outer wall stack stands free of the rest of the layer with a void between them: on a wall that
-    // flares, every pass sits further out than the core boundary by the flare over one sub-layer, and
-    // a wall_sublayer_line_width that does not divide the strip evenly leaves a fraction of a line
-    // over on top of that.
-    const coord_t core_strip  = coord_t(ctx.band_walls * layerm.flow(frExternalPerimeter, layer->height).scaled_spacing());
-    const ExPolygons core_inner = offset_ex(ctx.core_region, - float(core_strip));
-
     const Flow   support_flow  = sublayer_flow(layerm, frSolidInfill, layer->wall_sub_slices.front().height);
     const float  support_angle = float(Geometry::deg2rad(region_config.solid_infill_direction.value) + model_rotation_rad);
     const float  support_width = float(support_flow.scaled_width());
@@ -441,18 +445,21 @@ void wall_sublayer_generate(LayerRegion               &layerm,
         const ExPolygons *below = layer->wall_sublayer_support(k);
         drop_airborne_islands(layerm.sublayer_perimeters[k], below == nullptr ? ExPolygons() : *below);
 
-        // The tread: solid at this pass, outside the column the layer's own pass may occupy, not
-        // already covered by this pass's walls, and standing on what the pass below put down.
-        // Repeating it pass after pass is how the staircase a sloped surface makes is filled up to
-        // print_z.
-        const ExPolygons tread = intersection_ex(diff_ex(diff_ex(ctx.pass_slices[k], ctx.core_region), pass_band[k]), ground);
+        // Everything this pass owes and has not covered: solid at this pass, short of the walls the
+        // layer keeps for itself, not already under this pass's own walls, and standing on what the
+        // pass below put down.
+        const ExPolygons bare = intersection_ex(diff_ex(diff_ex(ctx.pass_slices[k], core_interior), pass_band[k]), ground);
 
-        // The strip between the band and the first wall the layer keeps for itself. On a wall that
-        // flares, every pass sits further out than the core boundary by the flare over one sub-layer,
-        // and a wall_sublayer_line_width that does not divide the strip evenly leaves a fraction of a
-        // line over on top of that. Unprinted, the outer wall stack stands free of the rest of the
-        // layer. It is only ever a fraction of a line wide, so it is gap fill, never solid fill.
-        const ExPolygons join = intersection_ex(diff_ex(diff_ex(ctx.core_region, core_inner), pass_band[k]), ground);
+        // The tread, outside the column the layer's own pass may occupy: the staircase a sloped
+        // surface makes, filled pass after pass up to print_z.
+        const ExPolygons tread = diff_ex(bare, ctx.core_region);
+
+        // And the strip between the band and the walls the layer keeps, which is only ever a fraction
+        // of a line wide: the flare over one sub-layer, plus whatever a wall_sublayer_line_width that
+        // does not divide the strip evenly leaves over. Gap fill, never solid fill - a solid line
+        // would either be dropped as too narrow or laid down at full width into a third of a line of
+        // room. No loop count can span it, because it is a fraction of a line and it varies with Z.
+        const ExPolygons join = intersection_ex(bare, ctx.core_region);
 
         // Ground for the pass above is the whole tread, before the quality filter below drops the
         // dabs, so that dropping one does not punch a hole and fragment every pass above it, and only
