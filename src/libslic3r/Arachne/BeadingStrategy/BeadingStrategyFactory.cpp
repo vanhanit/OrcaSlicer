@@ -12,6 +12,7 @@
 #include "DistributedBeadingStrategy.hpp"
 #include "RedistributeBeadingStrategy.hpp"
 #include "OuterWallInsetBeadingStrategy.hpp"
+#include "FixedCountBeadingStrategy.hpp"
 #include "libslic3r/Arachne/BeadingStrategy/BeadingStrategy.hpp"
 
 namespace Slic3r::Arachne {
@@ -28,7 +29,9 @@ BeadingStrategyPtr BeadingStrategyFactory::makeStrategy(const coord_t preferred_
                                                         const coord_t max_bead_count,
                                                         const coord_t outer_wall_offset,
                                                         const int     inward_distributed_center_wall_count,
-                                                        const double  minimum_variable_line_ratio)
+                                                        const double  minimum_variable_line_ratio,
+                                                        const coord_t fixed_bead_count,
+                                                        const coord_t max_stretch_width)
 {
     // Handle a special case when there is just one external perimeter.
     // Because big differences in bead width for inner and other perimeters cause issues with current beading strategies.
@@ -48,6 +51,15 @@ BeadingStrategyPtr BeadingStrategyFactory::makeStrategy(const coord_t preferred_
     if (outer_wall_offset != 0) {
         BOOST_LOG_TRIVIAL(trace) << "Applying the OuterWallOffset meta-strategy with offset = " << outer_wall_offset << ".";
         ret = std::make_unique<OuterWallInsetBeadingStrategy>(outer_wall_offset, std::move(ret));
+    }
+
+    // Orca: sub-layered walls ask for a fixed number of beads and let their widths stretch to cover
+    // whatever thickness there is, rather than the count changing along the wall. Above Widening so
+    // that a feature too thin to print stays unprinted, below Limited so the marker wall is still the
+    // outermost thing added.
+    if (fixed_bead_count > 0) {
+        BOOST_LOG_TRIVIAL(trace) << "Applying the FixedCount meta-strategy with bead count = " << fixed_bead_count << ".";
+        ret = std::make_unique<FixedCountBeadingStrategy>(fixed_bead_count, max_stretch_width, std::move(ret));
     }
 
     // Apply the LimitedBeadingStrategy last, since that adds a 0-width marker wall which other beading strategies shouldn't touch.

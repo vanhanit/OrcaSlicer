@@ -1227,9 +1227,17 @@ TEST_CASE("A narrower sub-layer line still covers the wall it replaces", "[WallS
         if (z < 1. || ! pass_z(z))
             continue;
         ++ pass_zs;
+        // The band's outermost bead is the surface, and it prints at the width it was asked for. The
+        // beads behind it stretch or squeeze to meet the walls the layer keeps for itself, since the
+        // strip between the two is whatever the model leaves and not a whole number of lines, so they
+        // are held to a sane range rather than to the nominal width.
+        INFO("z " << z);
+        CHECK(std::any_of(widths.begin(), widths.end(),
+                          [](double w) { return std::abs(w - 0.3) < 0.05; }));
         for (const double w : widths) {
             INFO("z " << z << " width " << w);
-            REQUIRE_THAT(w, Catch::Matchers::WithinAbs(0.3, 0.05));
+            REQUIRE(w > 0.3 * 0.5);
+            REQUIRE(w < 0.3 * 1.6);
         }
     }
     REQUIRE(pass_zs > 10);
@@ -1417,4 +1425,57 @@ TEST_CASE("Sub-layered walls stay joined to the walls the layer keeps", "[WallSu
     // printed this was 0.58mm - a void right behind the outer wall over most of the surface.
     CHECK(median < 0.45);
     CHECK(gaps.front() < 0.42);
+}
+
+TEST_CASE("Sub-layer wall beads stretch to meet the walls the layer keeps", "[WallSublayers]")
+{
+    // The band and the walls the layer prints at its own full height are apart by however far the
+    // model's surface moves over one sub-layer: a fraction of a line, varying along the wall, and no
+    // whole number of lines. Left as a gap it was closed with thousands of medial-axis slivers. Held
+    // at a fixed bead count, the generator answers the same variation with width instead, and the
+    // strip is laid as wall.
+    auto measure = [](const char *loops) {
+        Print print; Model model;
+        init_print({mesh(TestMesh::sphere_50mm)}, print, model, {{"layer_height", "0.2"},
+            {"initial_layer_print_height", "0.2"}, {"wall_loops", "4"}, {"skirt_loops", "0"},
+            {"wall_generator", "arachne"}, {"wall_sublayer_height", "0.05"},
+            {"wall_sublayer_loops", loops}});
+        print.process();
+
+        struct Totals { double gap = 0., wall = 0., widest = 0.; };
+        Totals t;
+        std::function<void(const ExtrusionEntity*)> walk = [&](const ExtrusionEntity *ee) {
+            if (const auto *c = dynamic_cast<const ExtrusionEntityCollection*>(ee)) {
+                for (const ExtrusionEntity *ch : c->entities) walk(ch);
+                return;
+            }
+            Polylines pl; ee->collect_polylines(pl);
+            double len = 0.; for (const Polyline &p : pl) len += unscale<double>(p.length());
+            if (ee->role() == erGapFill) { t.gap += len; return; }
+            t.wall += len;
+            if (const auto *lo = dynamic_cast<const ExtrusionLoop*>(ee))
+                for (const auto &pp : lo->paths) t.widest = std::max(t.widest, double(pp.width));
+            else if (const auto *pa = dynamic_cast<const ExtrusionPath*>(ee))
+                t.widest = std::max(t.widest, double(pa->width));
+        };
+        for (const Layer *layer : print.objects().front()->layers())
+            for (const LayerRegion *lr : layer->regions())
+                for (const auto &pass : lr->sublayer_perimeters)
+                    for (const ExtrusionEntity *ee : pass.entities) walk(ee);
+        REQUIRE(t.wall > 1000.);
+        return t;
+    };
+
+    // One band loop is the surface itself, with nothing behind it to take the give, so it is left
+    // alone and the strip stays gap fill.
+    const auto lone = measure("1");
+    CHECK(lone.gap > 0.01 * lone.wall);
+
+    // With a wall behind it the strip is absorbed: what was 13% of the pass extrusion becomes a
+    // rounding error, and the beads that took it up stay inside a printable width.
+    const auto stretched = measure("2");
+    INFO("gap fill " << stretched.gap << "mm against " << stretched.wall << "mm of wall, widest bead "
+         << stretched.widest);
+    CHECK(stretched.gap < 0.01 * stretched.wall);
+    CHECK(stretched.widest < 2.0 * 0.45);
 }
