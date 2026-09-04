@@ -7675,6 +7675,14 @@ std::string GCode::extrude_sublayer_walls(const Print &print, const std::vector<
                 }
             }
 
+            // Match the start marker this pass wrote. Without it every pass of every instance opens an
+            // object that is never closed, and anything reading the G-code back - the preview, a tool
+            // counting per object - attributes what follows to whichever object was opened last.
+            if (this->config().gcode_label_objects)
+                gcode += std::string("; stop printing object ") +
+                         instance_to_print.print_object.model_object()->name +
+                         " id:" + std::to_string(instance_to_print.print_object.get_id()) + " copy " +
+                         std::to_string(inst.id) + "\n";
             this->object_end_labels(print, instance_to_print, inst);
         }
         any_pass_printed = any_pass_printed || this_pass_printed;

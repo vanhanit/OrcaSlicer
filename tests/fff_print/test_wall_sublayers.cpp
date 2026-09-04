@@ -1500,3 +1500,27 @@ TEST_CASE("Every object keeps printing when another is on the plate", "[WallSubl
         CHECK(silent == 0);
     }
 }
+
+TEST_CASE("Sub-layered walls open and close their object labels in pairs", "[WallSublayers]")
+{
+    // Each pass of each instance writes a "printing object" marker of its own. Left unmatched, every
+    // one of them opens an object that is never closed, and a reader of the G-code hands everything
+    // that follows to whichever object was opened last.
+    DynamicPrintConfig config = base_config("0.05", "arachne");
+    config.set_deserialize_strict({{"gcode_label_objects", "1"}});
+    const std::string gcode = slice({cube(20)}, config);
+    REQUIRE(! gcode.empty());
+
+    int open = 0, close = 0, worst = 0;
+    GCodeReader reader;
+    reader.parse_buffer(gcode, [&](GCodeReader &, const GCodeReader::GCodeLine &line) {
+        const std::string_view c = line.comment();
+        if (c.rfind(" printing object", 0) == 0) { ++ open; worst = std::max(worst, open - close); }
+        else if (c.rfind(" stop printing object", 0) == 0) ++ close;
+    });
+    INFO(open << " opened, " << close << " closed, deepest " << worst);
+    REQUIRE(open > 10);
+    CHECK(open == close);
+    // Never more than one object open at a time.
+    CHECK(worst == 1);
+}
