@@ -36,14 +36,6 @@ static constexpr double SUBLAYER_MIN_SUPPORT_AREA = 12.;  // x solid infill widt
 // A gap fill run shorter than this is a dab: it holds nothing together and costs a travel, a stop and
 // a start, which on a curved wall is repeated thousands of times over.
 static constexpr double SUBLAYER_MIN_GAP_FILL = 2.;  // x solid infill width
-// How wide a band's beads may be stretched to meet the walls the layer keeps for itself, and how much
-// wider than its nominal loops the band may reach to do it. The two are apart by the flare over one
-// sub-layer, which is a fraction of a line, so a line of slack covers it; past that the surface is flat
-// enough that what lies between them is the staircase, and belongs to the tread fill. Without the
-// second bound a shallow slope hands the generator a strip millimetres wide, and it answers a wide
-// strip with one very wide bead in the middle - which at a fraction of a layer high is not a wall.
-static constexpr double SUBLAYER_MAX_BEAD_STRETCH = 1.5;  // x sub-layer wall width
-static constexpr double SUBLAYER_MAX_BAND_SLACK   = 1.;   // x sub-layer wall width
 
 // The passes are only a fraction of a layer tall but would otherwise keep the configured wall width,
 // leaving the extrusion several times wider than it is tall - a shape that is hard to lay down evenly
@@ -149,38 +141,6 @@ static void append_sublayer_gap_fill(ExtrusionEntityCollection &out,
                     polylines.end());
     if (! polylines.empty())
         variable_width(polylines, erGapFill, flow, out.entities);
-}
-
-// A band cut from an annulus has two boundaries, and the generator calls the outermost bead of each an
-// external perimeter - it goes by inset index alone, which is 0 against the model's contour and 0
-// against the inner edge cut out for the walls the layer keeps. Only the first is a surface. Demote the
-// beads that are not on the model so they take the inner wall's speed, width and flow ratio, and so the
-// overhang estimator and the seam placer treat them as the inside of the wall that they are.
-static void demote_core_side_beads(ExtrusionEntityCollection &entities, const ExPolygons &surface_band)
-{
-    for (ExtrusionEntity *entity : entities.entities) {
-        if (auto *nested = dynamic_cast<ExtrusionEntityCollection*>(entity)) {
-            demote_core_side_beads(*nested, surface_band);
-            continue;
-        }
-        auto *loop = dynamic_cast<ExtrusionLoop*>(entity);
-        if (loop == nullptr || loop->inset_idx != 0)
-            continue;
-        Polylines centreline;
-        loop->collect_polylines(centreline);
-        bool on_model = false;
-        for (const Polyline &p : centreline)
-            if (! intersection_pl(Polylines{p}, surface_band).empty()) {
-                on_model = true;
-                break;
-            }
-        if (on_model)
-            continue;
-        loop->inset_idx = 1;
-        for (ExtrusionPath &path : loop->paths)
-            if (path.role() == erExternalPerimeter)
-                path.set_extrusion_role(erPerimeter);
-    }
 }
 
 // Tidy the overhang paths the wall generator split each loop into against the material below the
@@ -416,18 +376,6 @@ void wall_sublayer_generate(LayerRegion               &layerm,
     // splitting into two walls with a gap between them.
     const float core_min = float(layerm.flow(frPerimeter, layer->height).scaled_width());
     const ExPolygons core_interior = opening_ex(offset_ex(ctx.core_region, - float(core_strip)), core_min / 2.f);
-    // Arachne holds the bead count and stretches bead widths to cover whatever it is given, so the
-    // band is handed everything from this pass's own contour in to that boundary and lays the strip
-    // between the two as wall rather than leaving it to gap fill. Bounded, because past the point
-    // where a bead would have to double in width it is the staircase of a flat surface, not a wall.
-    const Flow    band_flow   = sublayer_flow(layerm, frExternalPerimeter, layer->height);
-    const double  bead_max    = SUBLAYER_MAX_BEAD_STRETCH * band_flow.width();
-    const coord_t max_band    = coord_t(scale_((ctx.band_loops + SUBLAYER_MAX_BAND_SLACK) * band_flow.width()));
-    // Only with a wall behind the outermost one is there somewhere to put the give. A lone band loop
-    // is the surface itself, and widening it walks its centre line inward, away from the edge the
-    // model puts the surface on - the wall then reads as more of an overhang than it is and is slowed
-    // for it. There the strip stays gap fill.
-    const bool    stretch     = arachne && ctx.band_loops > 1;
     // The footprint of each pass's wall band. The band of pass k+1 is laid on what pass k printed, so
     // this drives the support fill below.
     std::vector<ExPolygons> pass_band(num_passes);
@@ -436,17 +384,8 @@ void wall_sublayer_generate(LayerRegion               &layerm,
         if (ctx.pass_slices[k].empty())
             continue;
 
-        // Classic offsets a contour and its holes together, so an annulus a fraction of a line wide
-        // collapses to nothing there; it keeps the plain slice and the gap fill below closes the strip.
-        const ExPolygons band_region =
-            stretch ? intersection_ex(diff_ex(ctx.pass_slices[k], core_interior),
-                                      diff_ex(ctx.pass_slices[k], offset_ex(ctx.pass_slices[k], - float(max_band))))
-                    : ctx.pass_slices[k];
-        if (band_region.empty())
-            continue;
-
         SurfaceCollection band_slices;
-        band_slices.append(offset_ex(band_region, ClipperSafetyOffset), stInternal);
+        band_slices.append(offset_ex(ctx.pass_slices[k], ClipperSafetyOffset), stInternal);
 
         // The fill surfaces and the extra perimeters belong to the layer's own pass, which sees the
         // whole layer. The gap fill is kept and appended after the walls of this same sub-layer; the
@@ -467,8 +406,6 @@ void wall_sublayer_generate(LayerRegion               &layerm,
         }
         bg.layer_id            = (int) layer->id();
         bg.sublayer_band_walls = ctx.band_loops;
-        if (stretch)
-            bg.sublayer_bead_stretch_width = float(bead_max);
         bg.ext_perimeter_flow  = sublayer_flow(layerm, frExternalPerimeter, sub.height);
         // Not a bridge flow: that is a thread as thick as the nozzle, which inside a pass a fraction
         // of a layer high would stand proud of the pass and the one above would plough through it.
@@ -482,20 +419,12 @@ void wall_sublayer_generate(LayerRegion               &layerm,
             bg.process_classic();
 
         const double ext_width = double(bg.ext_perimeter_flow.scaled_width());
-        if (stretch)
-            demote_core_side_beads(layerm.sublayer_perimeters[k],
-                                   diff_ex(ctx.pass_slices[k], offset_ex(ctx.pass_slices[k], - float(ext_width))));
         tidy_pass_overhangs(layerm.sublayer_perimeters[k], SUBLAYER_MIN_OVERHANG * ext_width,
                             SUBLAYER_MAX_BRIDGE_CHORD * ext_width);
 
         layerm.sublayer_perimeters[k].append(std::move(band_gap_fill.entities));
 
-        // What the band actually laid down. A band cut from an annulus leaves no interior inside itself
-        // to subtract the way one cut from the solid slice does, and the region it was handed overstates
-        // it wherever the generator declined to fill - which would hand the pass above ground that was
-        // never printed.
-        pass_band[k] = stretch ? union_ex(layerm.sublayer_perimeters[k].polygons_covered_by_width(float(SCALED_EPSILON)))
-                               : diff_ex(ctx.pass_slices[k], union_ex(band_fill_no_overlap));
+        pass_band[k] = diff_ex(ctx.pass_slices[k], union_ex(band_fill_no_overlap));
     }
 
     // Everything the passes own but their walls do not cover, the pass fills itself: the layer's own

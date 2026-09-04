@@ -2479,14 +2479,6 @@ void PerimeterGenerator::process_arachne()
             loop_number = 0;
 
         Arachne::WallToolPathsParams input_params_tmp = input_params;
-        // ORCA: a sub-layer wall band spans from the model's surface to the walls the layer prints at
-        // its own full height, and those two are apart by however far the surface moves over one
-        // sub-layer - a fraction of a line, varying along the wall. Asking for a fixed bead count
-        // turns that into width rather than into a wall count that changes around the perimeter.
-        if (this->sublayer_band_walls > 0 && this->sublayer_bead_stretch_width > 0.f) {
-            input_params_tmp.fixed_bead_count     = this->sublayer_band_walls;
-            input_params_tmp.fixed_bead_max_width = this->sublayer_bead_stretch_width;
-        }
         
         Polygons   last_p = to_polygons(last);
         Arachne::WallToolPaths wallToolPaths(last_p, bead_width_0, perimeter_spacing, coord_t(loop_number + 1),

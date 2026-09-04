@@ -108,10 +108,6 @@ public:
     // Core mode: the outermost loops up to this inset index are printed by the band passes, so drop
     // them from the output once the wall ordering has been applied.
     int                                             sublayer_drop_walls = 0;
-    // Band mode, Arachne only: hold the bead count at sublayer_band_walls and let the beads stretch up
-    // to this width each to cover whatever thickness there is, rather than the count changing along
-    // the wall. 0 leaves the count to the beading strategies.
-    float                                           sublayer_bead_stretch_width = 0.f;
 
     bool                                            has_fuzzy_skin = false;
     bool                                            has_fuzzy_hole = false;

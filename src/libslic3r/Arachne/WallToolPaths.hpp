@@ -31,10 +31,6 @@ public:
     float   wall_transition_filter_deviation = 0.f;
     int     wall_distribution_count          = 1;
     bool    is_top_or_bottom_layer           = false;
-    // Orca: sub-layered walls. Ask for exactly this many beads whatever the thickness, stretching
-    // their widths to cover it, up to fixed_bead_max_width each. 0 leaves the count to the strategies.
-    int     fixed_bead_count                 = 0;
-    float   fixed_bead_max_width             = 0.f;
 
     coord_t wall_maximum_resolution = meshfix_maximum_resolution();
     coord_t wall_maximum_deviation  = meshfix_maximum_deviation();

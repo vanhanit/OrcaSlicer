@@ -35,8 +35,6 @@ set(lisbslic3r_sources
     AppConfig.hpp
     Arachne/BeadingStrategy/BeadingStrategy.cpp
     Arachne/BeadingStrategy/BeadingStrategyFactory.cpp
-    Arachne/BeadingStrategy/FixedCountBeadingStrategy.hpp
-    Arachne/BeadingStrategy/FixedCountBeadingStrategy.cpp
     Arachne/BeadingStrategy/BeadingStrategyFactory.hpp
     Arachne/BeadingStrategy/BeadingStrategy.hpp
     Arachne/BeadingStrategy/DistributedBeadingStrategy.cpp
