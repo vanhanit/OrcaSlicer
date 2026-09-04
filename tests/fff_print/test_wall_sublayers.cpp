@@ -1479,3 +1479,51 @@ TEST_CASE("Sub-layer wall beads stretch to meet the walls the layer keeps", "[Wa
     CHECK(stretched.gap < 0.01 * stretched.wall);
     CHECK(stretched.widest < 2.0 * 0.45);
 }
+
+TEST_CASE("A sub-layered thin feature is covered end to end", "[WallSublayers]")
+{
+    // A railing, a mast, a chimney wall: too thin for the layer's own run to keep a wall of its own,
+    // because the outermost loops all belong to the band. The band must then cover the feature
+    // outright. Standing it off a strip of interior that nothing else prints leaves that strip as a
+    // void down the middle of the feature - which comes out as the wall splitting into two loops with
+    // a gap between them.
+    // Swept, because the strip only appears over the range of thicknesses where what is left inside
+    // the band is too narrow for a wall but not narrow enough to have closed up on its own.
+    const double thickness = GENERATE(1.6, 2.0, 2.4, 2.8, 3.2);
+    INFO("feature " << thickness << "mm thick");
+    Print print; Model model;
+    init_print({make_cube(thickness, 18., 10.)}, print, model, {{"layer_height", "0.2"},
+        {"initial_layer_print_height", "0.2"}, {"wall_loops", "3"}, {"skirt_loops", "0"},
+        {"wall_generator", "arachne"}, {"wall_sublayer_height", "0.05"},
+        {"wall_sublayer_loops", "2"}});
+    print.process();
+
+    double worst = 0.;
+    int    passes = 0;
+    for (const Layer *layer : print.objects().front()->layers()) {
+        if (layer->id() < 3 || layer->wall_sub_slices.empty())
+            continue;
+        Polygons core;
+        for (const LayerRegion *lr : layer->regions()) {
+            append(core, lr->perimeters.polygons_covered_by_width(float(SCALED_EPSILON)));
+            append(core, lr->fills.polygons_covered_by_width(float(SCALED_EPSILON)));
+            append(core, lr->thin_fills.polygons_covered_by_width(float(SCALED_EPSILON)));
+        }
+        for (size_t k = 0; k < layer->wall_sub_slices.size(); ++ k) {
+            Polygons covered = core;
+            for (const LayerRegion *lr : layer->regions())
+                if (k < lr->sublayer_perimeters.size())
+                    append(covered, lr->sublayer_perimeters[k].polygons_covered_by_width(float(SCALED_EPSILON)));
+            const ExPolygons slice = layer->wall_sub_slices[k].merged;
+            if (slice.empty())
+                continue;
+            double total = 0., bare = 0.;
+            for (const ExPolygon &e : slice) total += e.area();
+            for (const ExPolygon &e : diff_ex(slice, union_ex(covered))) bare += e.area();
+            if (total > 0.) { worst = std::max(worst, bare / total); ++ passes; }
+        }
+    }
+    REQUIRE(passes > 20);
+    INFO("worst uncovered fraction of a sub-slice: " << worst);
+    CHECK(worst < 0.05);
+}
