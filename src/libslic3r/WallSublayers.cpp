@@ -161,9 +161,20 @@ static void tidy_pass_overhangs(ExtrusionEntityCollection &entities, double min_
         auto *loop = dynamic_cast<ExtrusionLoop*>(entity);
         if (loop == nullptr || loop->paths.size() < 3)
             continue;
-        for (ExtrusionPath &path : loop->paths)
-            if (path.role() == erOverhangPerimeter && path.polyline.length() < min_overhang)
-                path.set_extrusion_role(erExternalPerimeter);
+        // Back to the role the rest of the loop carries, not to an external one: an inner wall whose
+        // overhang runs are demoted would otherwise print half of itself at the outer wall's speed
+        // and acceleration, alternating between the two every few tenths of a millimetre. A loop that
+        // is overhang end to end has no role to fall back on and no hitch to remove.
+        ExtrusionRole base = erNone;
+        for (const ExtrusionPath &path : loop->paths)
+            if (path.role() != erOverhangPerimeter) {
+                base = path.role();
+                break;
+            }
+        if (base != erNone)
+            for (ExtrusionPath &path : loop->paths)
+                if (path.role() == erOverhangPerimeter && path.polyline.length() < min_overhang)
+                    path.set_extrusion_role(base);
         for (size_t i = 0; i < loop->paths.size(); ++ i) {
             ExtrusionPath &path = loop->paths[i];
             if (path.role() != erOverhangPerimeter || path.polyline.size() < 3)
