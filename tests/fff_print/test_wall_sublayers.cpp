@@ -1524,3 +1524,44 @@ TEST_CASE("Sub-layered walls open and close their object labels in pairs", "[Wal
     // Never more than one object open at a time.
     CHECK(worst == 1);
 }
+
+TEST_CASE("A sub-layered hollow shell keeps its walls all the way up", "[WallSublayers]")
+{
+    // The wall of a sphere is a ring standing on the ring below it, and it is supported: there is
+    // material directly under the thread. Judged instead by how much of the area the ring bounds is
+    // filled, it reads as airborne - what a ring encircles is mostly the void inside the shell - and
+    // the pass's outer wall is thrown away. It cost the outer wall of every pass over a third of the
+    // height of an ellipsoid shell, which showed in the preview as the shell reduced to a bare rim.
+    TriangleMesh outer = make_sphere(20., 1.);
+    TriangleMesh inner = make_sphere(18.3, 1.);
+    MeshBoolean::cgal::minus(outer, inner);
+    outer.translate(0., 0., 20.);
+
+    Print print; Model model;
+    init_print({outer}, print, model, {{"layer_height", "0.3"}, {"initial_layer_print_height", "0.2"},
+        {"wall_loops", "3"}, {"skirt_loops", "0"}, {"wall_generator", "arachne"},
+        {"wall_sublayer_height", "0.075"}, {"wall_sublayer_loops", "2"}});
+    print.process();
+
+    std::vector<double> band;
+    for (const Layer *layer : print.objects().front()->layers()) {
+        // The sphere's crown and its footprint shrink to nothing, so only the body is measured.
+        if (layer->print_z < 6. || layer->print_z > 34. || layer->wall_sub_slices.empty()) continue;
+        double len = 0.;
+        for (const LayerRegion *lr : layer->regions())
+            for (const auto &pass : lr->sublayer_perimeters) {
+                Polylines pl; pass.collect_polylines(pl);
+                for (const Polyline &q : pl) len += unscale<double>(q.length());
+            }
+        band.push_back(len);
+    }
+    REQUIRE(band.size() > 30);
+    std::vector<double> sorted = band;
+    std::sort(sorted.begin(), sorted.end());
+    const double median = sorted[sorted.size() / 2];
+    REQUIRE(median > 100.);
+    // No layer may lose most of its band: the shell's wall is supported at every height.
+    const double worst = *std::min_element(band.begin(), band.end());
+    INFO("median band " << median << "mm, worst layer " << worst << "mm");
+    CHECK(worst > 0.4 * median);
+}

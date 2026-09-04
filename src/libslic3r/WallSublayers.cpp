@@ -183,32 +183,28 @@ static void tidy_pass_overhangs(ExtrusionEntityCollection &entities, double min_
 // to it, lay it in mid air and jump away. It is left to the layer's own pass, which prints it at
 // print_z over the whole layer height, with the bridge handling that needs.
 //
-// An overhanging perimeter still encloses the material it is growing out from, so a closed loop is
-// judged by whether the model below fills what it bounds, and an open path - a thin wall, a single
-// line with nothing either side of it - by whether the model below lies under the line itself.
+// Whether a wall has nothing to hold on to: the model below reaches neither under the thread nor up
+// against it. Judged against the model below grown by a wall's width, because a wall that steps
+// outward over the one beneath it is still carried by it - which is what an overhanging wall is.
+//
+// This used to ask, for a closed loop, how much of the area the loop bounds the model below fills.
+// That is the same question only for a loop drawn around solid material. Around a hollow shell - the
+// wall of a sphere, a vase, a cup - what a loop bounds is mostly the void it encircles, so a ring
+// standing squarely on the ring below it read as 8% supported and was thrown away, taking the outer
+// wall of every pass with it over a third of the height of an ellipsoid shell.
 static bool stranded_over_air(const Polyline &q, const ExPolygons &below)
 {
-    if (q.points.size() > 2 && q.points.front() == q.points.back()) {
-        Polygon pg(q.points);
-        pg.points.pop_back();
-        const double enclosed = std::abs(pg.area());
-        if (enclosed <= 0.)
-            return false;
-        double covered = 0.;
-        for (const ExPolygon &e : intersection_ex(ExPolygons{ExPolygon(pg)}, below))
-            covered += e.area();
-        return covered < 0.1 * enclosed;
-    }
     double air = 0.;
     for (const Polyline &r : diff_pl(Polylines{q}, below))
         air += r.length();
     return air > 0.9 * q.length();
 }
 
-static void drop_airborne_islands(ExtrusionEntityCollection &entities, const ExPolygons &below)
+static void drop_airborne_islands(ExtrusionEntityCollection &entities, const ExPolygons &below, float reach)
 {
     if (below.empty())
         return;
+    const ExPolygons anchored = reach > 0.f ? offset_ex(below, reach) : below;
     ExtrusionEntitiesPtr kept;
     kept.reserve(entities.entities.size());
     for (ExtrusionEntity *entity : entities.entities) {
@@ -216,7 +212,7 @@ static void drop_airborne_islands(ExtrusionEntityCollection &entities, const ExP
         entity->collect_polylines(pl);
         bool stranded = ! pl.empty();
         for (const Polyline &q : pl)
-            if (! stranded_over_air(q, below)) {
+            if (! stranded_over_air(q, anchored)) {
                 stranded = false;
                 break;
             }
@@ -449,7 +445,8 @@ void wall_sublayer_generate(LayerRegion               &layerm,
         // Measured against the model at the sub-layer below, not against what was printed there: a
         // thin wall needs something under it, and material merely beside it does not hold it up.
         const ExPolygons *below = layer->wall_sublayer_support(k);
-        drop_airborne_islands(layerm.sublayer_perimeters[k], below == nullptr ? ExPolygons() : *below);
+        drop_airborne_islands(layerm.sublayer_perimeters[k], below == nullptr ? ExPolygons() : *below,
+                              float(sublayer_flow(layerm, frExternalPerimeter, layer->height).scaled_width()));
 
         // Everything this pass owes and has not covered: solid at this pass, short of the walls the
         // layer keeps for itself, not already under this pass's own walls, and standing on what the
