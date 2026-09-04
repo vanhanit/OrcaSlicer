@@ -1466,3 +1466,37 @@ TEST_CASE("A sub-layered thin feature is covered end to end", "[WallSublayers]")
     INFO("worst uncovered fraction of a sub-slice: " << worst);
     CHECK(worst < 0.05);
 }
+
+TEST_CASE("Every object keeps printing when another is on the plate", "[WallSublayers]")
+{
+    // Two objects of differing height, sub-layered. Each must keep printing something on every layer
+    // it reaches: an object that falls silent for a stretch of layers has vanished from the print.
+    TriangleMesh shortish = make_cube(20., 20., 12.);
+    TriangleMesh tall     = make_cube(20., 20., 30.);
+    tall.translate(40., 0., 0.);
+
+    DynamicPrintConfig cfg = DynamicPrintConfig::full_print_config();
+    cfg.set_deserialize_strict({{"layer_height", "0.3"}, {"initial_layer_print_height", "0.2"},
+        {"wall_loops", "3"}, {"skirt_loops", "0"}, {"wall_generator", "arachne"},
+        {"wall_sublayer_height", "0.075"}, {"wall_sublayer_loops", "2"}});
+    std::vector<TriangleMesh> meshes; meshes.push_back(shortish); meshes.push_back(tall);
+    Print print; Model model;
+    init_print(std::move(meshes), print, model, cfg, nullptr, false);
+    print.process();
+
+    REQUIRE(print.objects().size() == 2);
+    for (const PrintObject *obj : print.objects()) {
+        int silent = 0;
+        for (const Layer *layer : obj->layers()) {
+            if (layer->id() < 2) continue;
+            size_t n = 0;
+            for (const LayerRegion *lr : layer->regions()) {
+                n += lr->perimeters.entities.size() + lr->thin_fills.entities.size();
+                for (const auto &pass : lr->sublayer_perimeters) n += pass.entities.size();
+            }
+            if (n == 0) ++ silent;
+        }
+        INFO("an object has " << silent << " layers printing nothing");
+        CHECK(silent == 0);
+    }
+}
