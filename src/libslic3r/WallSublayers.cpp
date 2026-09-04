@@ -369,7 +369,13 @@ void wall_sublayer_generate(LayerRegion               &layerm,
     // Where the walls the layer keeps for itself begin: the passes have to reach this, or the outer
     // wall stack stands free of the rest of the layer with a void between them.
     const coord_t core_strip = coord_t(ctx.band_walls * layerm.flow(frExternalPerimeter, layer->height).scaled_spacing());
-    const ExPolygons core_interior = offset_ex(ctx.core_region, - float(core_strip));
+    // Only where the layer's own run can actually lay a wall. On a feature too thin to hold one - a
+    // railing, a mast, the wall of a chimney - every loop it would have made is one the band took over,
+    // so it prints nothing there and what is left in the middle is not interior at all. Standing the
+    // band off it would leave that strip a void down the centre of the feature, which is the feature
+    // splitting into two walls with a gap between them.
+    const float core_min = float(layerm.flow(frPerimeter, layer->height).scaled_width());
+    const ExPolygons core_interior = opening_ex(offset_ex(ctx.core_region, - float(core_strip)), core_min / 2.f);
     // The footprint of each pass's wall band. The band of pass k+1 is laid on what pass k printed, so
     // this drives the support fill below.
     std::vector<ExPolygons> pass_band(num_passes);
