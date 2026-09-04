@@ -36,6 +36,11 @@ static constexpr double SUBLAYER_MIN_SUPPORT_AREA = 12.;  // x solid infill widt
 // A gap fill run shorter than this is a dab: it holds nothing together and costs a travel, a stop and
 // a start, which on a curved wall is repeated thousands of times over.
 static constexpr double SUBLAYER_MIN_GAP_FILL = 2.;  // x solid infill width
+// How far beside or under a wall the model below has to reach for the wall to be carried by it. A
+// pass is a fraction of a layer tall, so a whole wall's width of reach lets a wall run away at eighty
+// degrees off vertical and a ring can close over a cavity in mid air; half of one is the usual limit
+// for how much of a thread may hang over nothing.
+static constexpr double SUBLAYER_ANCHOR_REACH = 1.0;  // x sub-layer wall width
 
 // The passes are only a fraction of a layer tall but would otherwise keep the configured wall width,
 // leaving the extrusion several times wider than it is tall - a shape that is hard to lay down evenly
@@ -200,14 +205,24 @@ static bool stranded_over_air(const Polyline &q, const ExPolygons &below)
     return air > 0.9 * q.length();
 }
 
-static void drop_airborne_islands(ExtrusionEntityCollection &entities, const ExPolygons &below, float reach)
+// Per wall, not per island. An island holds the loops around its contour and the loops around each of
+// its holes, and they do not stand or fall together: where a cavity closes over - the crown of a dome,
+// the inside of a shell - the loop around the closing hole hangs in mid air while the loop around the
+// contour beside it is carried by the wall below. Judged as one island the airborne loop rode along
+// with its supported neighbour and was printed over nothing.
+static void drop_airborne_walls(ExtrusionEntityCollection &entities, const ExPolygons &anchored)
 {
-    if (below.empty())
-        return;
-    const ExPolygons anchored = reach > 0.f ? offset_ex(below, reach) : below;
     ExtrusionEntitiesPtr kept;
     kept.reserve(entities.entities.size());
     for (ExtrusionEntity *entity : entities.entities) {
+        if (auto *nested = dynamic_cast<ExtrusionEntityCollection*>(entity)) {
+            drop_airborne_walls(*nested, anchored);
+            if (nested->empty())
+                delete entity;
+            else
+                kept.emplace_back(entity);
+            continue;
+        }
         Polylines pl;
         entity->collect_polylines(pl);
         bool stranded = ! pl.empty();
@@ -222,6 +237,13 @@ static void drop_airborne_islands(ExtrusionEntityCollection &entities, const ExP
             kept.emplace_back(entity);
     }
     entities.entities = std::move(kept);
+}
+
+static void drop_airborne_islands(ExtrusionEntityCollection &entities, const ExPolygons &below, float reach)
+{
+    if (below.empty())
+        return;
+    drop_airborne_walls(entities, reach > 0.f ? offset_ex(below, reach) : below);
 }
 
 // A void the layer's own slice does not have is one that closes part way up the layer. The sub-slices
@@ -446,7 +468,7 @@ void wall_sublayer_generate(LayerRegion               &layerm,
         // thin wall needs something under it, and material merely beside it does not hold it up.
         const ExPolygons *below = layer->wall_sublayer_support(k);
         drop_airborne_islands(layerm.sublayer_perimeters[k], below == nullptr ? ExPolygons() : *below,
-                              float(sublayer_flow(layerm, frExternalPerimeter, layer->height).scaled_width()));
+                              float(SUBLAYER_ANCHOR_REACH * sublayer_flow(layerm, frExternalPerimeter, layer->height).scaled_width()));
 
         // Everything this pass owes and has not covered: solid at this pass, short of the walls the
         // layer keeps for itself, not already under this pass's own walls, and standing on what the
