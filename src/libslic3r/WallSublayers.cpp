@@ -36,11 +36,18 @@ static constexpr double SUBLAYER_MIN_SUPPORT_AREA = 12.;  // x solid infill widt
 // A gap fill run shorter than this is a dab: it holds nothing together and costs a travel, a stop and
 // a start, which on a curved wall is repeated thousands of times over.
 static constexpr double SUBLAYER_MIN_GAP_FILL = 2.;  // x solid infill width
-// How far beside or under a wall the model below has to reach for the wall to be carried by it. A
-// pass is a fraction of a layer tall, so a whole wall's width of reach lets a wall run away at eighty
-// degrees off vertical and a ring can close over a cavity in mid air; half of one is the usual limit
-// for how much of a thread may hang over nothing.
+// How far beside or under a wall the model below has to reach for the wall to be carried by it. On a
+// surface rolling outward - a hull flaring out of the bilge, a gunwale, the lower lip of a hole -
+// every pass lands outside the one below by design, and a wall's width of reach is what lets that
+// surface keep its sub-layer resolution instead of falling back to one step per layer.
 static constexpr double SUBLAYER_ANCHOR_REACH = 1.0;  // x sub-layer wall width
+// Inside a void that is closing over - the ceiling of a cavity, the lip of a countersink narrowing
+// with Z - that reach is far too generous: a ring stepping half a millimetre inward per pass sits
+// with a few hundredths of its width on the ring below and the rest over the hole. Nothing is gained
+// by printing it either, because the layer's own pass bridges that void at print_z with a bridge flow
+// and the fan on, and these threads only droop into its way. Here a wall has to genuinely rest on
+// what is below it: a quarter of its width, no further out than that.
+static constexpr double SUBLAYER_VOID_ANCHOR_REACH = 0.25;  // x sub-layer wall width
 
 // The passes are only a fraction of a layer tall but would otherwise keep the configured wall width,
 // leaving the extrusion several times wider than it is tall - a shape that is hard to lay down evenly
@@ -221,13 +228,13 @@ static bool stranded_over_air(const Polyline &q, const ExPolygons &below)
 // the inside of a shell - the loop around the closing hole hangs in mid air while the loop around the
 // contour beside it is carried by the wall below. Judged as one island the airborne loop rode along
 // with its supported neighbour and was printed over nothing.
-static void drop_airborne_walls(ExtrusionEntityCollection &entities, const ExPolygons &anchored)
+static void drop_airborne_walls(ExtrusionEntityCollection &entities, const ExPolygons &anchored, Polygons &dropped)
 {
     ExtrusionEntitiesPtr kept;
     kept.reserve(entities.entities.size());
     for (ExtrusionEntity *entity : entities.entities) {
         if (auto *nested = dynamic_cast<ExtrusionEntityCollection*>(entity)) {
-            drop_airborne_walls(*nested, anchored);
+            drop_airborne_walls(*nested, anchored, dropped);
             if (nested->empty())
                 delete entity;
             else
@@ -242,19 +249,43 @@ static void drop_airborne_walls(ExtrusionEntityCollection &entities, const ExPol
                 stranded = false;
                 break;
             }
-        if (stranded)
+        if (stranded) {
+            entity->polygons_covered_by_width(dropped, 10.f);
             delete entity;
-        else
+        } else
             kept.emplace_back(entity);
     }
     entities.entities = std::move(kept);
 }
 
-static void drop_airborne_islands(ExtrusionEntityCollection &entities, const ExPolygons &below, float reach)
+// The voids the model below encloses, as areas: the holes of an ExPolygon, taken on their own.
+static ExPolygons enclosed_voids(const ExPolygons &src)
+{
+    ExPolygons out;
+    for (const ExPolygon &expoly : src)
+        for (const Polygon &hole : expoly.holes) {
+            out.emplace_back(hole);
+            out.back().contour.reverse();
+        }
+    return out;
+}
+
+// What the walls that were dropped would have covered, so that the passes above do not come down on
+// a wall that was never printed.
+static ExPolygons drop_airborne_islands(ExtrusionEntityCollection &entities, const ExPolygons &below,
+                                        float reach, float void_reach)
 {
     if (below.empty())
-        return;
-    drop_airborne_walls(entities, reach > 0.f ? offset_ex(below, reach) : below);
+        return {};
+    // The generous reach applies where the wall hangs over open space beside the model. Over a void
+    // the model below encloses it does not: there only a wall that still rests on the material around
+    // the void is carried by it. See SUBLAYER_ANCHOR_REACH and SUBLAYER_VOID_ANCHOR_REACH.
+    ExPolygons anchored = reach > 0.f ? offset_ex(below, reach) : below;
+    if (void_reach < reach)
+        anchored = diff_ex(anchored, offset_ex(enclosed_voids(below), - void_reach));
+    Polygons dropped;
+    drop_airborne_walls(entities, anchored, dropped);
+    return union_ex(dropped);
 }
 
 // A void the layer's own slice does not have is one that closes part way up the layer. The sub-slices
@@ -477,9 +508,16 @@ void wall_sublayer_generate(LayerRegion               &layerm,
         }
         // Measured against the model at the sub-layer below, not against what was printed there: a
         // thin wall needs something under it, and material merely beside it does not hold it up.
-        const ExPolygons *below = layer->wall_sublayer_support(k);
-        drop_airborne_islands(layerm.sublayer_perimeters[k], below == nullptr ? ExPolygons() : *below,
-                              float(SUBLAYER_ANCHOR_REACH * sublayer_flow(layerm, frExternalPerimeter, layer->height).scaled_width()));
+        const ExPolygons *below      = layer->wall_sublayer_support(k);
+        const float       wall_width = float(sublayer_flow(layerm, frExternalPerimeter, layer->height).scaled_width());
+        const ExPolygons  dropped    = drop_airborne_islands(layerm.sublayer_perimeters[k],
+                                                             below == nullptr ? ExPolygons() : *below,
+                                                             float(SUBLAYER_ANCHOR_REACH * wall_width),
+                                                             float(SUBLAYER_VOID_ANCHOR_REACH * wall_width));
+        // A dropped wall is not ground. Left in, the pass above would fill the ceiling of a closing
+        // cavity pass by pass on the strength of a band that was never laid down.
+        if (! dropped.empty())
+            pass_band[k] = diff_ex(pass_band[k], dropped);
 
         // Everything this pass owes and has not covered: solid at this pass, short of the walls the
         // layer keeps for itself, not already under this pass's own walls, and standing on what the
