@@ -1485,6 +1485,13 @@ TEST_CASE("Every object keeps printing when another is on the plate", "[WallSubl
     print.process();
 
     REQUIRE(print.objects().size() == 2);
+    {
+        const std::string g = Slic3r::Test::gcode(print);
+        FILE *f = fopen("/tmp/claude-1000/-workspaces-OrcaSlicer/a6c5ba7a-7a76-4bb8-b5a1-87b848e045f6/scratchpad/user.gcode", "wb");
+        fwrite(g.data(), 1, g.size(), f);
+        fclose(f);
+        printf("GCODE %zu bytes\n", g.size());
+    }
     for (const PrintObject *obj : print.objects()) {
         int silent = 0;
         for (const Layer *layer : obj->layers()) {
@@ -1565,3 +1572,60 @@ TEST_CASE("A sub-layered hollow shell keeps its walls all the way up", "[WallSub
     INFO("median band " << median << "mm, worst layer " << worst << "mm");
     CHECK(worst > 0.4 * median);
 }
+
+TEST_CASE("A sub-layered pass does not ring a cavity that is closing over", "[WallSublayers]")
+{
+    // A conical void closing under a ceiling. Its wall rises 2mm while the hole closes 14, so the
+    // hole shrinks 0.52mm per 0.075mm pass - more than a wall is wide, so each pass's ring is clear
+    // of the ring below it with no part of the thread over material at all. A wall's width of reach
+    // still read it as carried. The layer's own pass bridges that void at print_z, with a bridge flow
+    // and the fan on; a pass cannot, and the rings it drew were left drooping in the bridge's way.
+    // Reported from the crown of a dome, where every pass drew a circle in mid air.
+    TriangleMesh block = make_cube(34., 34., 8.);
+    TriangleMesh cone  = make_cone(14., 2.);
+    cone.translate(17., 17., 3.);
+    MeshBoolean::cgal::minus(block, cone);
+
+    Print print; Model model;
+    init_print({block}, print, model, {{"layer_height", "0.3"}, {"initial_layer_print_height", "0.2"},
+        {"wall_loops", "3"}, {"skirt_loops", "0"}, {"wall_generator", "arachne"},
+        {"wall_sublayer_height", "0.075"}, {"wall_sublayer_loops", "2"}});
+    print.process();
+
+    double over_void = 0., total = 0.;
+    for (const Layer *layer : print.objects().front()->layers()) {
+        if (layer->print_z < 3.2 || layer->print_z > 5. || layer->wall_sub_slices.empty())
+            continue;
+        for (size_t k = 0; k < layer->wall_sub_slices.size(); ++ k) {
+            const ExPolygons *support = layer->wall_sublayer_support(k);
+            if (support == nullptr)
+                continue;
+            // The voids the model below encloses, less half a wall's width around their edge: a wall
+            // whose centreline is in what remains has no part of its thread over material below.
+            ExPolygons voids;
+            for (const ExPolygon &expoly : *support)
+                for (const Polygon &hole : expoly.holes) {
+                    voids.emplace_back(hole);
+                    voids.back().contour.reverse();
+                }
+            const float width = float(print.objects().front()->layers().front()->regions().front()->flow(frExternalPerimeter).scaled_width());
+            voids = offset_ex(voids, - 0.5f * width);
+
+            Polylines walls;
+            for (const LayerRegion *region : layer->regions())
+                if (k < region->sublayer_perimeters.size())
+                    region->sublayer_perimeters[k].collect_polylines(walls);
+            for (const Polyline &q : walls)
+                total += unscale<double>(q.length());
+            for (const Polyline &q : intersection_pl(walls, voids))
+                over_void += unscale<double>(q.length());
+        }
+    }
+
+    // The walls of the block itself are still printed at every pass - the cone must not take the
+    // feature with it.
+    INFO(over_void << "mm of " << total << "mm of sub-layer wall wholly over the closing void");
+    REQUIRE(total > 500.);
+    CHECK(over_void < 0.01 * total);
+}
+
