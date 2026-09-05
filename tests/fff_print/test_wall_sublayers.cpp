@@ -1594,7 +1594,7 @@ TEST_CASE("A sub-layered pass does not ring a cavity that is closing over", "[Wa
 
     const float width = float(print.objects().front()->layers().front()->regions().front()->flow(frExternalPerimeter).scaled_width());
     const Vec2d centre = unscale(get_extents(print.objects().front()->layers().front()->lslices).center());
-    double over_model = 0., total = 0., crept = 0.;
+    double over_model = 0., over_below = 0., total = 0., crept = 0.;
     std::vector<double> reach;
     for (const Layer *layer : print.objects().front()->layers()) {
         if (layer->print_z < 3.2 || layer->print_z > 5. || layer->wall_sub_slices.empty())
@@ -1621,6 +1621,28 @@ TEST_CASE("A sub-layered pass does not ring a cavity that is closing over", "[Wa
             for (const Polyline &q : intersection_pl(walls, offset_ex(voids, - 0.5f * width)))
                 over_model += unscale<double>(q.length());
 
+            // And the same against what the layer below left: its own run reaches the columns solid
+            // for its whole height, and no pass may come down inside the void that leaves. Judged
+            // per layer, so that refusing the ceiling does not simply start the stair again one
+            // layer up.
+            if (layer->lower_layer != nullptr) {
+                ExPolygons core;
+                bool       core_set = false;
+                for (const WallSubSlice &sub : layer->lower_layer->wall_sub_slices) {
+                    if (sub.merged.empty()) continue;
+                    core = core_set ? intersection_ex(core, sub.merged) : sub.merged;
+                    core_set = true;
+                }
+                ExPolygons below_voids;
+                for (const ExPolygon &expoly : core_set ? core : layer->lower_layer->lslices)
+                    for (const Polygon &hole : expoly.holes) {
+                        below_voids.emplace_back(hole);
+                        below_voids.back().contour.reverse();
+                    }
+                for (const Polyline &q : intersection_pl(walls, offset_ex(below_voids, - 0.5f * width)))
+                    over_below += unscale<double>(q.length());
+            }
+
             // How far into the cone each pass reaches. A ring that steps inward pass by pass is the
             // stair a closing ceiling makes: every step lands on the step the pass below was not
             // allowed to print, and the model says every one of them is carried.
@@ -1638,13 +1660,16 @@ TEST_CASE("A sub-layered pass does not ring a cavity that is closing over", "[Wa
 
     // The walls of the block itself are still printed at every pass - the cone must not take the
     // feature with it.
-    INFO(over_model << "mm of " << total << "mm of sub-layer wall over the model's void; the passes "
-         "creep " << crept << "mm into the cone within a layer");
+    INFO(over_model << "mm of " << total << "mm of sub-layer wall over the model's void, " << over_below
+         << "mm inside the void the layer below left; the passes creep " << crept << "mm into the cone "
+         "within a layer");
     REQUIRE(total > 500.);
     CHECK(over_model < 0.01 * total);
+    CHECK(over_below < 0.01 * total);
     // One wall's width of movement is the band itself following the model; a stair is three times that
     // by the end of a layer.
     CHECK(crept < unscale<double>(width));
 }
+
 
 

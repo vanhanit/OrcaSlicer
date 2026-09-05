@@ -292,6 +292,50 @@ static ExPolygons drop_airborne_islands(ExtrusionEntityCollection &entities, con
     return union_ex(dropped);
 }
 
+// What the layer below left at the height this one starts from. Its own run prints at print_z over
+// the whole layer height, so it is there wherever the model is solid for that height - the
+// intersection of the sub-slices - and above that only the last pass reaches the top of the layer.
+// That pass is taken as far into a void the layer closed over as it could have been carried, pass by
+// pass, by the same rule that carries a wall here: SUBLAYER_VOID_ANCHOR_REACH.
+//
+// Without this the stair starts again at every layer boundary. The model at the last sub-slice says
+// the ceiling of a closing cavity was printed down to the last ring; the layer refused most of it,
+// and the first pass of the next layer comes down half a millimetre inside anything that is there.
+static ExPolygons layer_top_footprint(const Layer &below, float void_reach)
+{
+    ExPolygons core;
+    bool       core_set = false;
+    for (const WallSubSlice &sub : below.wall_sub_slices) {
+        if (sub.merged.empty())
+            continue;
+        core     = core_set ? intersection_ex(core, sub.merged) : sub.merged;
+        core_set = true;
+    }
+    if (! core_set)
+        return below.lslices;
+
+    ExPolygons ground = core, kept;
+    for (const WallSubSlice &sub : below.wall_sub_slices) {
+        if (sub.merged.empty())
+            continue;
+        const ExPolygons voids = diff_ex(enclosed_voids(ground), ground);
+        kept = voids.empty() ? sub.merged
+                             : diff_ex(sub.merged, diff_ex(voids, offset_ex(ground, void_reach)));
+        ground = kept;
+        append(ground, core);
+        ground = union_ex(ground);
+    }
+    return ground;
+}
+
+// The ground the first pass of a layer comes down on.
+static ExPolygons sublayer_ground_below(const Layer &layer, float void_reach)
+{
+    if (layer.lower_layer == nullptr)
+        return ExPolygons();
+    return layer_top_footprint(*layer.lower_layer, void_reach);
+}
+
 // A void the layer's own slice does not have is one that closes part way up the layer. The sub-slices
 // below it see it open, so left alone the passes trace its outline and the core carves it out of the
 // layer. Neither is wanted: the layer prints across it at print_z and bridges it the way an ordinary
@@ -387,10 +431,10 @@ WallSublayerContext wall_sublayer_prepare(const LayerRegion &layerm, const Layer
     // The wall band is printed everywhere the pass has material, so it is ground for the pass above
     // whether or not it overhangs. Approximated here from the sub-slice, because the real band is not
     // known until the generator has run and the core has to be settled before that.
-    const coord_t band_width = coord_t(ctx.band_loops * sublayer_flow(layerm, frExternalPerimeter, layer->height).scaled_width());
-    const ExPolygons *below  = layer->wall_sublayer_support(0);
-    ExPolygons        ground = below == nullptr ? ExPolygons() : *below;
-    ExPolygons        stranded;
+    const float   wall_width = float(sublayer_flow(layerm, frExternalPerimeter, layer->height).scaled_width());
+    const coord_t band_width = coord_t(ctx.band_loops * wall_width);
+    ExPolygons    ground     = sublayer_ground_below(*layer, float(SUBLAYER_VOID_ANCHOR_REACH * wall_width));
+    ExPolygons    stranded;
     for (size_t k = 0; k < num_passes; ++ k) {
         if (ctx.pass_slices[k].empty()) {
             ground.clear();
@@ -503,8 +547,8 @@ void wall_sublayer_generate(LayerRegion               &layerm,
     // A concentric fill has no direction, so there is nothing to turn between passes.
     const float  pass_turn     = region_config.wall_sublayer_fill_pattern.value == ipConcentric ? 0.f : float(M_PI / 2.);
 
-    const ExPolygons *below  = layer->wall_sublayer_support(0);
-    ExPolygons        ground = below == nullptr ? ExPolygons() : *below;
+    const float       wall_width = float(sublayer_flow(layerm, frExternalPerimeter, layer->height).scaled_width());
+    ExPolygons        ground     = sublayer_ground_below(*layer, float(SUBLAYER_VOID_ANCHOR_REACH * wall_width));
     ExPolygons        unprinted;
     for (size_t k = 0; k < num_passes; ++ k) {
         if (ctx.pass_slices[k].empty()) {
@@ -519,9 +563,8 @@ void wall_sublayer_generate(LayerRegion               &layerm,
         // model says every step is carried, and every step is in fact hanging in the air behind the
         // one before it. The whole ceiling is then left to the layer above, which bridges it in one
         // pass at print_z from the material the layer below ended with.
-        const ExPolygons *below      = layer->wall_sublayer_support(k);
-        const float       wall_width = float(sublayer_flow(layerm, frExternalPerimeter, layer->height).scaled_width());
-        ExPolygons        support    = below == nullptr ? ExPolygons() : *below;
+        const ExPolygons *below   = k == 0 ? nullptr : layer->wall_sublayer_support(k);
+        ExPolygons        support = below == nullptr ? ground : *below;
         if (! unprinted.empty() && ! support.empty())
             support = diff_ex(support, unprinted);
         const ExPolygons  dropped    = drop_airborne_islands(layerm.sublayer_perimeters[k], support,
