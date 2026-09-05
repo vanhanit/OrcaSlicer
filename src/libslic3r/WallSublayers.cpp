@@ -281,8 +281,12 @@ static ExPolygons drop_airborne_islands(ExtrusionEntityCollection &entities, con
     // the model below encloses it does not: there only a wall that still rests on the material around
     // the void is carried by it. See SUBLAYER_ANCHOR_REACH and SUBLAYER_VOID_ANCHOR_REACH.
     ExPolygons anchored = reach > 0.f ? offset_ex(below, reach) : below;
-    if (void_reach < reach)
-        anchored = diff_ex(anchored, offset_ex(enclosed_voids(below), - void_reach));
+    if (void_reach < reach) {
+        // What stands inside a void is not part of it: a box hollowed out around a pillar has the
+        // pillar inside its hole, and the pillar carries its own walls.
+        const ExPolygons voids = diff_ex(enclosed_voids(below), below);
+        anchored = diff_ex(anchored, offset_ex(voids, - void_reach));
+    }
     Polygons dropped;
     drop_airborne_walls(entities, anchored, dropped);
     return union_ex(dropped);
@@ -501,19 +505,29 @@ void wall_sublayer_generate(LayerRegion               &layerm,
 
     const ExPolygons *below  = layer->wall_sublayer_support(0);
     ExPolygons        ground = below == nullptr ? ExPolygons() : *below;
+    ExPolygons        unprinted;
     for (size_t k = 0; k < num_passes; ++ k) {
         if (ctx.pass_slices[k].empty()) {
             ground.clear();
+            unprinted.clear();
             continue;
         }
-        // Measured against the model at the sub-layer below, not against what was printed there: a
-        // thin wall needs something under it, and material merely beside it does not hold it up.
+        // Measured against the model at the sub-layer below, less whatever the pass below was not
+        // allowed to print there: a thin wall needs something under it, and material merely beside it
+        // does not hold it up. Without the correction the ceiling of a closing cavity comes out as a
+        // stair of rings, each one standing on the ring the pass below had dropped as airborne - the
+        // model says every step is carried, and every step is in fact hanging in the air behind the
+        // one before it. The whole ceiling is then left to the layer above, which bridges it in one
+        // pass at print_z from the material the layer below ended with.
         const ExPolygons *below      = layer->wall_sublayer_support(k);
         const float       wall_width = float(sublayer_flow(layerm, frExternalPerimeter, layer->height).scaled_width());
-        const ExPolygons  dropped    = drop_airborne_islands(layerm.sublayer_perimeters[k],
-                                                             below == nullptr ? ExPolygons() : *below,
+        ExPolygons        support    = below == nullptr ? ExPolygons() : *below;
+        if (! unprinted.empty() && ! support.empty())
+            support = diff_ex(support, unprinted);
+        const ExPolygons  dropped    = drop_airborne_islands(layerm.sublayer_perimeters[k], support,
                                                              float(SUBLAYER_ANCHOR_REACH * wall_width),
                                                              float(SUBLAYER_VOID_ANCHOR_REACH * wall_width));
+        unprinted = dropped;
         // A dropped wall is not ground. Left in, the pass above would fill the ceiling of a closing
         // cavity pass by pass on the strength of a band that was never laid down.
         if (! dropped.empty())
@@ -522,7 +536,11 @@ void wall_sublayer_generate(LayerRegion               &layerm,
         // Everything this pass owes and has not covered: solid at this pass, short of the walls the
         // layer keeps for itself, not already under this pass's own walls, and standing on what the
         // pass below put down.
-        const ExPolygons bare = intersection_ex(diff_ex(diff_ex(ctx.pass_slices[k], core_interior), pass_band[k]), ground);
+        // Where a wall was refused, nothing else is laid either: filling behind an airborne wall only
+        // moves the problem from the wall to the fill.
+        ExPolygons bare = intersection_ex(diff_ex(diff_ex(ctx.pass_slices[k], core_interior), pass_band[k]), ground);
+        if (! dropped.empty())
+            bare = diff_ex(bare, dropped);
 
         // The tread, outside the column the layer's own pass may occupy: the staircase a sloped
         // surface makes, filled pass after pass up to print_z.

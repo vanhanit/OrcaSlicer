@@ -1592,7 +1592,10 @@ TEST_CASE("A sub-layered pass does not ring a cavity that is closing over", "[Wa
         {"wall_sublayer_height", "0.075"}, {"wall_sublayer_loops", "2"}});
     print.process();
 
-    double over_void = 0., total = 0.;
+    const float width = float(print.objects().front()->layers().front()->regions().front()->flow(frExternalPerimeter).scaled_width());
+    const Vec2d centre = unscale(get_extents(print.objects().front()->layers().front()->lslices).center());
+    double over_model = 0., total = 0., crept = 0.;
+    std::vector<double> reach;
     for (const Layer *layer : print.objects().front()->layers()) {
         if (layer->print_z < 3.2 || layer->print_z > 5. || layer->wall_sub_slices.empty())
             continue;
@@ -1600,32 +1603,48 @@ TEST_CASE("A sub-layered pass does not ring a cavity that is closing over", "[Wa
             const ExPolygons *support = layer->wall_sublayer_support(k);
             if (support == nullptr)
                 continue;
-            // The voids the model below encloses, less half a wall's width around their edge: a wall
-            // whose centreline is in what remains has no part of its thread over material below.
+            // The voids the model below encloses.
             ExPolygons voids;
             for (const ExPolygon &expoly : *support)
                 for (const Polygon &hole : expoly.holes) {
                     voids.emplace_back(hole);
                     voids.back().contour.reverse();
                 }
-            const float width = float(print.objects().front()->layers().front()->regions().front()->flow(frExternalPerimeter).scaled_width());
-            voids = offset_ex(voids, - 0.5f * width);
-
             Polylines walls;
             for (const LayerRegion *region : layer->regions())
                 if (k < region->sublayer_perimeters.size())
                     region->sublayer_perimeters[k].collect_polylines(walls);
             for (const Polyline &q : walls)
                 total += unscale<double>(q.length());
-            for (const Polyline &q : intersection_pl(walls, voids))
-                over_void += unscale<double>(q.length());
+            // Half a wall's width inside the void: past that, no part of the thread is over material
+            // at all.
+            for (const Polyline &q : intersection_pl(walls, offset_ex(voids, - 0.5f * width)))
+                over_model += unscale<double>(q.length());
+
+            // How far into the cone each pass reaches. A ring that steps inward pass by pass is the
+            // stair a closing ceiling makes: every step lands on the step the pass below was not
+            // allowed to print, and the model says every one of them is carried.
+            double closest = std::numeric_limits<double>::max();
+            for (const Polyline &q : walls)
+                for (const Point &pt : q.points)
+                    closest = std::min(closest, (unscale(pt) - centre).norm());
+            reach.resize(std::max(reach.size(), k + 1), std::numeric_limits<double>::max());
+            reach[k] = std::min(reach[k], closest);
         }
+        for (size_t k = 1; k < reach.size(); ++ k)
+            crept = std::max(crept, reach.front() - reach[k]);
+        reach.clear();
     }
 
     // The walls of the block itself are still printed at every pass - the cone must not take the
     // feature with it.
-    INFO(over_void << "mm of " << total << "mm of sub-layer wall wholly over the closing void");
+    INFO(over_model << "mm of " << total << "mm of sub-layer wall over the model's void; the passes "
+         "creep " << crept << "mm into the cone within a layer");
     REQUIRE(total > 500.);
-    CHECK(over_void < 0.01 * total);
+    CHECK(over_model < 0.01 * total);
+    // One wall's width of movement is the band itself following the model; a stair is three times that
+    // by the end of a layer.
+    CHECK(crept < unscale<double>(width));
 }
+
 
