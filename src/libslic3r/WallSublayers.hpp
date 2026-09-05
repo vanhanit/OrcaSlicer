@@ -42,6 +42,10 @@ struct WallSublayerContext
     // of core_region is printed at print_z, above the passes, so it is air while they run.
     ExPolygons              core_base;
     bool                    core_region_set = false;
+    // Where the passes cannot print at all: the part of the layer that hangs inside a void the layer
+    // below closed over. The layer's own run keeps its outermost walls there - the band that would
+    // have printed them is refused as airborne - and bridges the rest at print_z.
+    ExPolygons              ceiling;
 };
 
 // Compute the above for one region. Cheap and inert when the feature is off.

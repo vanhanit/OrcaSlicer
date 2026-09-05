@@ -108,6 +108,10 @@ public:
     // Core mode: the outermost loops up to this inset index are printed by the band passes, so drop
     // them from the output once the wall ordering has been applied.
     int                                             sublayer_drop_walls = 0;
+    // Core mode: over the ceiling of a void closing under the layer a pass has nothing to come down
+    // on and prints nothing, so the loops it would have taken are kept here instead of dropped. Null
+    // when the layer has no such area.
+    const ExPolygons                               *sublayer_keep_walls = nullptr;
 
     bool                                            has_fuzzy_skin = false;
     bool                                            has_fuzzy_hole = false;

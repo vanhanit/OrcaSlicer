@@ -101,14 +101,34 @@ static bool detect_steep_overhang(const PrintRegionConfig *config,
 // them from the layer's own perimeters once the wall ordering has been applied - that way the kept
 // walls stay in the order wall_sequence asked for. Thin walls carry no inset index and come from the
 // outermost onion step, so the band passes own those too.
-static void drop_sublayer_band_walls(ExtrusionEntityCollection &entities, int drop)
+//
+// Except over the ceiling of a void closing under the layer, where a pass has nothing to come down on
+// and prints nothing: there the layer keeps the walls itself and bridges them at print_z, as it would
+// without the feature. Judged by where the wall mostly runs, so a loop crossing the edge of that area
+// goes whole to whichever side owns most of it.
+static void drop_sublayer_band_walls(ExtrusionEntityCollection &entities, int drop, const ExPolygons *keep)
 {
     if (drop <= 0)
         return;
     ExtrusionEntitiesPtr kept;
     kept.reserve(entities.entities.size());
     for (ExtrusionEntity *entity : entities.entities) {
-        if (entity->inset_idx >= drop)
+        if (entity->inset_idx >= drop) {
+            kept.emplace_back(entity);
+            continue;
+        }
+        bool over_ceiling = false;
+        if (keep != nullptr && ! keep->empty()) {
+            Polylines pl;
+            entity->collect_polylines(pl);
+            double total = 0., inside = 0.;
+            for (const Polyline &q : pl)
+                total += q.length();
+            for (const Polyline &q : intersection_pl(pl, *keep))
+                inside += q.length();
+            over_ceiling = total > 0. && inside > 0.5 * total;
+        }
+        if (over_ceiling)
             kept.emplace_back(entity);
         else
             delete entity;
@@ -1842,7 +1862,7 @@ void PerimeterGenerator::process_classic()
                 }
             }
             
-            drop_sublayer_band_walls(entities, this->sublayer_drop_walls);
+            drop_sublayer_band_walls(entities, this->sublayer_drop_walls, this->sublayer_keep_walls);
 
             // append perimeters for this slice as a collection
             if (! entities.empty())
@@ -2793,7 +2813,7 @@ void PerimeterGenerator::process_arachne()
                 reorient_perimeters(extrusion_coll, steep_overhang_contour, steep_overhang_hole,
                                     this->config->overhang_reverse_internal_only);
             }
-            drop_sublayer_band_walls(extrusion_coll, this->sublayer_drop_walls);
+            drop_sublayer_band_walls(extrusion_coll, this->sublayer_drop_walls, this->sublayer_keep_walls);
             if (! extrusion_coll.empty())
                 this->loops->append(extrusion_coll);
         }

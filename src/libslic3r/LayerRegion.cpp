@@ -149,6 +149,7 @@ void LayerRegion::make_perimeters(const SurfaceCollection &slices, const LayerRe
     const bool arachne = this->layer()->object()->config().wall_generator.value == PerimeterGeneratorType::Arachne && !spiral_mode;
 
     g.sublayer_drop_walls = sublayers.band_walls;
+    g.sublayer_keep_walls = sublayers.ceiling.empty() ? nullptr : &sublayers.ceiling;
 
     if (arachne)
         g.process_arachne();

@@ -1658,6 +1658,52 @@ TEST_CASE("A sub-layered pass does not ring a cavity that is closing over", "[Wa
         reach.clear();
     }
 
+    // The ceiling the passes refuse is the layer's own to print, walls and all. Measured at the edge
+    // of the cone: with the band dropped there and the layer still handing its outermost walls over,
+    // the first thread sits two wall spacings inside the contour and the ceiling comes out as one
+    // ring with a gap around it.
+    std::vector<double> edge_gaps;
+    for (const Layer *layer : print.objects().front()->layers()) {
+        if (layer->print_z < 3.2 || layer->print_z > 5. || layer->wall_sub_slices.empty())
+            continue;
+        Polylines threads;
+        for (const LayerRegion *region : layer->regions()) {
+            region->perimeters.collect_polylines(threads);
+            for (const auto &pass : region->sublayer_perimeters)
+                pass.collect_polylines(threads);
+        }
+        if (threads.empty())
+            continue;
+        // The contour the layer actually prints to is its own run's, which is confined to the columns
+        // solid for the whole layer height - the intersection of the sub-slices - not the mid-height
+        // slice.
+        ExPolygons core;
+        bool       core_set = false;
+        for (const WallSubSlice &sub : layer->wall_sub_slices) {
+            if (sub.merged.empty()) continue;
+            core = core_set ? intersection_ex(core, sub.merged) : sub.merged;
+            core_set = true;
+        }
+        double worst = 0.;
+        for (const ExPolygon &expoly : core)
+            for (const Polygon &hole : expoly.holes)
+                for (size_t i = 0; i < hole.points.size(); i += 8) {
+                    double best = std::numeric_limits<double>::max();
+                    for (const Polyline &q : threads)
+                        for (const Point &pt : q.points)
+                            best = std::min(best, (pt - hole.points[i]).cast<double>().norm());
+                    worst = std::max(worst, unscale<double>(best));
+                }
+        edge_gaps.push_back(worst);
+    }
+    std::sort(edge_gaps.begin(), edge_gaps.end());
+    REQUIRE(! edge_gaps.empty());
+    const double edge_gap = edge_gaps[edge_gaps.size() / 2];
+    // Half a wall's width is the outermost thread sitting on the contour; a wall and a half is the
+    // two the band was handed and never printed.
+    INFO("furthest the cone's edge is from a thread, median over layers: " << edge_gap << "mm");
+    CHECK(edge_gap < 1.5 * unscale<double>(width));
+
     // The walls of the block itself are still printed at every pass - the cone must not take the
     // feature with it.
     INFO(over_model << "mm of " << total << "mm of sub-layer wall over the model's void, " << over_below
@@ -1670,6 +1716,7 @@ TEST_CASE("A sub-layered pass does not ring a cavity that is closing over", "[Wa
     // by the end of a layer.
     CHECK(crept < unscale<double>(width));
 }
+
 
 
 

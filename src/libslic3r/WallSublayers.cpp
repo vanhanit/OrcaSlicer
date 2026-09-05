@@ -435,6 +435,14 @@ WallSublayerContext wall_sublayer_prepare(const LayerRegion &layerm, const Layer
     const coord_t band_width = coord_t(ctx.band_loops * wall_width);
     ExPolygons    ground     = sublayer_ground_below(*layer, float(SUBLAYER_VOID_ANCHOR_REACH * wall_width));
     ExPolygons    stranded;
+
+    // The ceiling of a void the layer below closed over. A pass may not come down inside it - see
+    // SUBLAYER_VOID_ANCHOR_REACH - so the band prints nothing there and the layer's own run has to
+    // keep the walls it would otherwise hand over, or the ceiling comes out as one wall ringed by a
+    // gap the width of the band.
+    if (const ExPolygons voids = diff_ex(enclosed_voids(ground), ground); ! voids.empty())
+        ctx.ceiling = intersection_ex(ctx.core_region,
+                                      diff_ex(voids, offset_ex(ground, float(SUBLAYER_VOID_ANCHOR_REACH * wall_width))));
     for (size_t k = 0; k < num_passes; ++ k) {
         if (ctx.pass_slices[k].empty()) {
             ground.clear();
