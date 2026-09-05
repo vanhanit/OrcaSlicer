@@ -435,6 +435,15 @@ WallSublayerContext wall_sublayer_prepare(const LayerRegion &layerm, const Layer
     const coord_t band_width = coord_t(ctx.band_loops * wall_width);
     ExPolygons    ground     = sublayer_ground_below(*layer, float(SUBLAYER_VOID_ANCHOR_REACH * wall_width));
     ExPolygons    stranded;
+
+    // The ceiling of a void the layer below closed over. A pass may not come down inside it - see
+    // SUBLAYER_VOID_ANCHOR_REACH - so the band prints nothing there and the layer's own run has to
+    // keep the walls it would otherwise hand over, or the ceiling comes out as one wall ringed by a
+    // gap the width of the band.
+    if (const ExPolygons voids = diff_ex(enclosed_voids(ground), ground); ! voids.empty())
+        ctx.ceiling = intersection_ex(ctx.core_region,
+                                      diff_ex(voids, offset_ex(ground, float(SUBLAYER_VOID_ANCHOR_REACH * wall_width))));
+    ExPolygons    refused;
     for (size_t k = 0; k < num_passes; ++ k) {
         if (ctx.pass_slices[k].empty()) {
             ground.clear();
@@ -442,11 +451,34 @@ WallSublayerContext wall_sublayer_prepare(const LayerRegion &layerm, const Layer
         }
         const ExPolygons band     = diff_ex(ctx.pass_slices[k], offset_ex(ctx.pass_slices[k], - float(band_width)));
         const ExPolygons fillable = diff_ex(diff_ex(ctx.pass_slices[k], ctx.core_region), band);
-        append(stranded, diff_ex(fillable, ground));
 
-        ExPolygons printed = band;
+        // Where a pass can come down at all, by the same rule the generator's anchor test applies, so
+        // that what is predicted here is what it will actually refuse: a wall standing beside the
+        // material below is carried by it, a wall creeping inward over a void that material encloses
+        // is not. See SUBLAYER_ANCHOR_REACH and SUBLAYER_VOID_ANCHOR_REACH.
+        ExPolygons anchored = offset_ex(ground, float(SUBLAYER_ANCHOR_REACH * wall_width));
+        if (const ExPolygons voids = diff_ex(enclosed_voids(ground), ground); ! voids.empty())
+            anchored = diff_ex(anchored, offset_ex(voids, - float(SUBLAYER_VOID_ANCHOR_REACH * wall_width)));
+
+        // Everything a pass cannot print goes back to the layer's own run, which prints at print_z over
+        // the whole layer height and bridges it: the fill it would have to lay over air, and the wall
+        // band over the ceiling of a cavity closing under the layer. Handing back only the fill left
+        // that ceiling belonging to no one - the passes refuse it, and the layer was held out of it -
+        // so it came out as a ring of bare hole the bridge stopped short of and never closed.
+        const ExPolygons band_refused = diff_ex(band, anchored);
+        append(stranded, band_refused);
+        append(stranded, diff_ex(fillable, ground));
+        append(refused, band_refused);
+
+        ExPolygons printed = intersection_ex(band, anchored);
         append(printed, intersection_ex(fillable, ground));
         ground = union_ex(printed);
+    }
+    // The layer keeps its own walls wherever a pass prints none, or the ceiling comes out as one wall
+    // ringed by a gap the width of the band.
+    if (! refused.empty()) {
+        append(ctx.ceiling, refused);
+        ctx.ceiling = union_ex(ctx.ceiling);
     }
     if (! stranded.empty()) {
         append(stranded, ctx.core_region);
