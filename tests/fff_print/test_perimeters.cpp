@@ -1,8 +1,10 @@
 #include <catch2/catch_all.hpp>
 
+#include "libslic3r/ClipperUtils.hpp"
 #include "libslic3r/ExtrusionEntity.hpp"
 #include "libslic3r/ExtrusionEntityCollection.hpp"
 #include "libslic3r/Layer.hpp"
+#include "libslic3r/MeshBoolean.hpp"
 #include "libslic3r/Print.hpp"
 
 #include <algorithm>
@@ -254,4 +256,84 @@ TEST_CASE("Only one wall on the first layer needs a bottom shell", "[Perimeters]
     CHECK(one_wall < plain);
     // No bottom shell: the option is inert, down to the same walls an unchecked box gives.
     CHECK_THAT(one_wall_no_shell, Catch::Matchers::WithinAbs(plain_no_shell, 1.0));
+}
+
+// A cavity whose ceiling closes over: a cone standing inside a block, subtracted from it, so each
+// layer's slice has a hole a couple of millimetres narrower than the layer below. The walls around
+// that hole have nothing at all under them - a ring drawn in mid air - which is what the option is
+// for. The same shape a dome, a countersink or the crown of a hollow sphere makes.
+TriangleMesh block_with_closing_cavity()
+{
+    TriangleMesh block = make_cube(34., 34., 8.);
+    TriangleMesh cone  = make_cone(14., 2.);
+    cone.translate(17., 17., 3.);
+    MeshBoolean::cgal::minus(block, cone);
+    return block;
+}
+
+// Extruded wall length whose thread has no part of itself over the layer below.
+double airborne_wall_length(const Print &print)
+{
+    double len = 0.;
+    for (const Layer *layer : print.objects().front()->layers()) {
+        if (layer->lower_layer == nullptr)
+            continue;
+        const Polygons below = to_polygons(layer->lower_layer->lslices);
+        for (const LayerRegion *region : layer->regions())
+            for (const ExtrusionEntity *entity : region->perimeters.flatten().entities) {
+                if (entity->is_collection())
+                    continue;
+                const Polygons covered = entity->polygons_covered_by_width(10.f);
+                if (! covered.empty() && intersection(covered, below).empty())
+                    len += unscale<double>(entity->length());
+            }
+    }
+    return len;
+}
+
+TEST_CASE("A wall with nothing under it is bridged instead of drawn in mid air", "[Perimeters]")
+{
+    const auto wall_generator = GENERATE("arachne", "classic");
+    INFO("wall_generator=" << wall_generator);
+
+    DynamicPrintConfig config = base_config(wall_generator);
+    config.set_deserialize_strict({{ "bridge_unsupported_wall", "0" }});
+
+    Print print_off;
+    Model model_off;
+    init_print({block_with_closing_cavity()}, print_off, model_off, config);
+    print_off.process();
+    const SliceLengths off = slice_lengths(print_off);
+    const double       air_off = airborne_wall_length(print_off);
+
+    // The control: the ceiling of the cavity is walled in mid air without the option.
+    INFO("airborne wall with the option off: " << air_off << "mm");
+    REQUIRE(air_off > 50.);
+
+    config.set_deserialize_strict({{ "bridge_unsupported_wall", "1" }});
+    Print print_on;
+    Model model_on;
+    init_print({block_with_closing_cavity()}, print_on, model_on, config);
+    print_on.process();
+    const SliceLengths on = slice_lengths(print_on);
+    const double       air_on = airborne_wall_length(print_on);
+
+    INFO("airborne wall with the option on: " << air_on << "mm");
+    CHECK(air_on < 0.02 * air_off);
+
+    // What the walls gave up, the fill takes over - it is not simply left unprinted.
+    double fill_off = 0., fill_on = 0.;
+    for (double len : off.fills) fill_off += len;
+    for (double len : on.fills)  fill_on  += len;
+    INFO("fill " << unscale<double>(fill_off) << "mm -> " << unscale<double>(fill_on) << "mm");
+    CHECK(fill_on > fill_off);
+
+    // And nothing changes where every wall has something under it: the layers below the cavity are
+    // untouched.
+    for (size_t i = 0; i < off.perimeters.size() && i < on.perimeters.size(); ++ i) {
+        if (print_off.objects().front()->layers()[i]->print_z > 3.)
+            break;
+        INFO("layer " << i);
+        CHECK(off.perimeters[i] == Catch::Approx(on.perimeters[i]));
+    }
 }

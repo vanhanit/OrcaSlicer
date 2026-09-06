@@ -136,6 +136,38 @@ static void drop_sublayer_band_walls(ExtrusionEntityCollection &entities, int dr
     entities.entities = std::move(kept);
 }
 
+// ORCA: bridge_unsupported_wall. A wall with nothing at all under it - the ceiling of a hole closing
+// over, an island that starts part way up a wall - is drawn from a starting point with nothing to
+// stick to, and the nozzle drags it. The fill reaches the same place with both ends of every line
+// anchored on material that exists, so the wall is dropped and its band handed to the fill, which
+// then bridges it. A wall that is merely overhanging still has part of its line on the layer below
+// and is left alone.
+// Returns the band of what was dropped.
+static ExPolygons drop_unsupported_walls(ExtrusionEntityCollection &entities, const ExPolygons &below)
+{
+    Polygons             dropped;
+    ExtrusionEntitiesPtr kept;
+    kept.reserve(entities.entities.size());
+    for (ExtrusionEntity *entity : entities.entities) {
+        if (auto *nested = dynamic_cast<ExtrusionEntityCollection*>(entity)) {
+            append(dropped, to_polygons(drop_unsupported_walls(*nested, below)));
+            if (nested->empty())
+                delete entity;
+            else
+                kept.emplace_back(entity);
+            continue;
+        }
+        const Polygons covered = entity->polygons_covered_by_width(10.f);
+        if (! covered.empty() && intersection(covered, to_polygons(below)).empty()) {
+            append(dropped, covered);
+            delete entity;
+        } else
+            kept.emplace_back(entity);
+    }
+    entities.entities = std::move(kept);
+    return union_ex(dropped);
+}
+
 static ExtrusionEntityCollection traverse_loops(const PerimeterGenerator &perimeter_generator, const PerimeterGeneratorLoops &loops, ThickPolylines &thin_walls,
     bool &steep_overhang_contour, bool &steep_overhang_hole, bool reverse_thin_wall_hole)
 {
@@ -1480,6 +1512,8 @@ void PerimeterGenerator::process_classic()
         ExPolygons one_wall_top_region;
         ExPolygons one_wall_top_reclaimed;
         Polygons   one_wall_top_kept_bands;
+        // ORCA: bridge_unsupported_wall - the bands of the walls dropped for having nothing under them.
+        ExPolygons unsupported_reclaimed;
         bool       apply_one_wall_top = false;
         if (loop_number >= 0) {
             // In case no perimeters are to be generated, loop_number will equal to -1.
@@ -1864,6 +1898,9 @@ void PerimeterGenerator::process_classic()
             
             drop_sublayer_band_walls(entities, this->sublayer_drop_walls, this->sublayer_keep_walls);
 
+            if (this->config->bridge_unsupported_wall && this->lower_slices != nullptr)
+                append(unsupported_reclaimed, drop_unsupported_walls(entities, *this->lower_slices));
+
             // append perimeters for this slice as a collection
             if (! entities.empty())
                 this->loops->append(entities);
@@ -1976,6 +2013,9 @@ void PerimeterGenerator::process_classic()
         // ORCA: only_one_wall_top - what the top fill does not cover of the dropped walls goes to infill.
         if (!one_wall_top_reclaimed.empty())
             infill_exp = union_ex(infill_exp, one_wall_top_reclaimed);
+        // ORCA: bridge_unsupported_wall - the fill takes over the band of every wall dropped as airborne.
+        if (!unsupported_reclaimed.empty())
+            infill_exp = union_ex(infill_exp, unsupported_reclaimed);
         this->fill_surfaces->append(infill_exp, stInternal);
 
         apply_extra_perimeters(infill_exp);
@@ -1996,6 +2036,8 @@ void PerimeterGenerator::process_classic()
                 polyWithoutOverlap = union_ex(polyWithoutOverlap, top_infill_exp);
             if (!one_wall_top_reclaimed.empty())
                 polyWithoutOverlap = union_ex(polyWithoutOverlap, one_wall_top_reclaimed);
+            if (!unsupported_reclaimed.empty())
+                polyWithoutOverlap = union_ex(polyWithoutOverlap, unsupported_reclaimed);
             this->fill_no_overlap->insert(this->fill_no_overlap->end(), polyWithoutOverlap.begin(), polyWithoutOverlap.end());
         }
 
@@ -2814,6 +2856,11 @@ void PerimeterGenerator::process_arachne()
                                     this->config->overhang_reverse_internal_only);
             }
             drop_sublayer_band_walls(extrusion_coll, this->sublayer_drop_walls, this->sublayer_keep_walls);
+            // ORCA: bridge_unsupported_wall - the fill takes over the band of every wall dropped as
+            // airborne, and bridges it from the material around it.
+            if (this->config->bridge_unsupported_wall && this->lower_slices != nullptr)
+                if (const ExPolygons reclaimed = drop_unsupported_walls(extrusion_coll, *this->lower_slices); ! reclaimed.empty())
+                    infill_contour = union_ex(infill_contour, reclaimed);
             if (! extrusion_coll.empty())
                 this->loops->append(extrusion_coll);
         }
