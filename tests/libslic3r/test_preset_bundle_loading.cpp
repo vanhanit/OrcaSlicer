@@ -500,6 +500,23 @@ TEST_CASE("Plugin capability override keys are scoped per preset type", "[Preset
         }
 }
 
+// An option in PrintObjectConfig or PrintRegionConfig that is missing from Preset::print_options() is not in
+// the print preset's config at all. Slicing still runs, since the region config keeps its own default, but the
+// Print tab builds a field for the key and then reads its value out of the preset config, dereferencing a null
+// option: the app crashes on the way up, before it shows a window. The only keys allowed off the list are the
+// legacy names handle_legacy() rewrites and the ironing overrides the filament preset owns.
+TEST_CASE("Every print object and region option is on the print preset's option list", "[Preset]")
+{
+    const std::vector<std::string> legacy { "ironing_direction", "wall_infill_order" }; // see handle_legacy()
+    for (const t_config_option_keys &keys : { PrintObjectConfig().keys(), PrintRegionConfig().keys() })
+        for (const std::string &key : keys) {
+            if (contains(legacy, key) || contains(Preset::filament_options(), key))
+                continue;
+            CAPTURE(key);
+            CHECK(contains(Preset::print_options(), key));
+        }
+}
+
 namespace {
 
 // A standalone filament collection that exposes the protected library masking builder, so the Orca
