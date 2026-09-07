@@ -159,7 +159,10 @@ static ExPolygons drop_unsupported_walls(ExtrusionEntityCollection &entities, co
         }
         const Polygons covered = entity->polygons_covered_by_width(10.f);
         if (! covered.empty() && intersection(covered, to_polygons(below)).empty()) {
-            append(dropped, covered);
+            // Hand over the strip the wall occupied, not the narrower one its thread covered: the
+            // difference between the two is a hairline the fill would be left to bridge on its own,
+            // and it splits what should be one bridging surface into a stack of thin rings.
+            append(dropped, entity->polygons_covered_by_spacing(10.f));
             delete entity;
         } else
             kept.emplace_back(entity);

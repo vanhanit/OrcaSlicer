@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <functional>
 #include <vector>
 
 #include "test_helpers.hpp"
@@ -289,6 +290,116 @@ double airborne_wall_length(const Print &print)
             }
     }
     return len;
+}
+
+// Length of extrusion that nothing holds: a closed loop with no part of itself over material already
+// there, or an open line with an end in mid air. Material already there is the layer below plus what
+// this layer laid down before it. A straight bridge line across a hole is held at both ends and does
+// not count; the same line drawn out into a hole that is still closing over has its far end over
+// nothing and does, and so does a wall drawn round that hole. A ring worked inward from the rim is a
+// closed loop lying on the ring before it. Only layers with something over air at all are walked.
+double unheld_extrusion_length(const Print &print)
+{
+    double len = 0.;
+    for (const Layer *layer : print.objects().front()->layers()) {
+        if (layer->lower_layer == nullptr || diff_ex(layer->lslices, layer->lower_layer->lslices).empty())
+            continue;
+        for (const LayerRegion *region : layer->regions()) {
+            const coord_t reach = region->flow(frExternalPerimeter).scaled_width();
+            ExPolygons    laid  = layer->lower_layer->lslices;
+            std::function<void(const ExtrusionEntity *)> lay = [&](const ExtrusionEntity *entity) {
+                if (const auto *collection = dynamic_cast<const ExtrusionEntityCollection *>(entity)) {
+                    for (const ExtrusionEntity *child : collection->entities)
+                        lay(child);
+                    return;
+                }
+                const Polygons covered = entity->polygons_covered_by_width(10.f);
+                const auto     reaches = [&laid, reach](const Point &pt) {
+                    Polygon around;
+                    around.points = { Point(pt.x() - reach, pt.y() - reach), Point(pt.x() + reach, pt.y() - reach),
+                                      Point(pt.x() + reach, pt.y() + reach), Point(pt.x() - reach, pt.y() + reach) };
+                    return ! intersection(Polygons{ around }, to_polygons(laid)).empty();
+                };
+                const bool held = entity->is_loop() ? ! intersection(covered, to_polygons(laid)).empty()
+                                                    : reaches(entity->first_point()) && reaches(entity->last_point());
+                if (held)
+                    // Only what is held holds the next thing: a raft of lines cantilevered side by side
+                    // over a hole props up nothing, however solid it looks in the slice preview.
+                    laid = union_ex(laid, covered);
+                else
+                    len += unscaled(entity->length());
+            };
+            lay(&region->perimeters);
+            lay(&region->fills);
+        }
+    }
+    return len;
+}
+
+// Bridge fill on the layers whose ceiling is still closing over - the slice has a hole and something in
+// the layer stands on nothing - split into what was laid as closed rings and the total. A ring is a
+// thread that comes back to where it started; a straight bridge line does not.
+std::pair<double, double> closing_ceiling_bridge(const Print &print)
+{
+    double rings = 0., total = 0.;
+    for (const Layer *layer : print.objects().front()->layers()) {
+        if (layer->lower_layer == nullptr || diff_ex(layer->lslices, layer->lower_layer->lslices).empty())
+            continue;
+        if (std::none_of(layer->lslices.begin(), layer->lslices.end(),
+                         [](const ExPolygon &island) { return ! island.holes.empty(); }))
+            continue;
+        for (const LayerRegion *region : layer->regions()) {
+            const double width = region->bridging_flow(frSolidInfill).width();
+            for (const ExtrusionEntity *entity : region->fills.flatten().entities) {
+                if (entity->role() != erBridgeInfill)
+                    continue;
+                const double len = unscaled(entity->length());
+                total += len;
+                if (len > 4. * width && (entity->first_point() - entity->last_point()).cast<double>().norm() < scaled<double>(width))
+                    rings += len;
+            }
+        }
+    }
+    return { rings, total };
+}
+
+// The ceiling of a cavity closing over is held only around its rim, so a straight bridge line laid
+// across it has its far end over the hole. Rings worked inward from the rim land on what is already
+// there, which is what the option asks the fill for.
+TEST_CASE("A ceiling closing over is bridged with rings, not lines that run into the hole", "[Perimeters]")
+{
+    const auto wall_generator = GENERATE("arachne", "classic");
+    INFO("wall_generator=" << wall_generator);
+
+    DynamicPrintConfig config = base_config(wall_generator);
+    config.set_deserialize_strict({{ "bridge_unsupported_wall", "0" }});
+    Print  print_off;
+    Model  model_off;
+    init_print({block_with_closing_cavity()}, print_off, model_off, config);
+    print_off.process();
+    const double off = unheld_extrusion_length(print_off);
+
+    // The control: walls around the hole and the far end of every line laid across it are over air.
+    INFO("extrusion nothing holds with the option off: " << off << "mm");
+    REQUIRE(off > 20.);
+
+    config.set_deserialize_strict({{ "bridge_unsupported_wall", "1" }});
+    Print  print_on;
+    Model  model_on;
+    init_print({block_with_closing_cavity()}, print_on, model_on, config);
+    print_on.process();
+    const double on = unheld_extrusion_length(print_on);
+
+    INFO("extrusion nothing holds with the option on: " << on << "mm");
+    CHECK(on < 0.05 * off);
+
+    // And the ceiling is laid down as rings, not as lines clipped to the annulus.
+    const auto [rings_off, bridge_off] = closing_ceiling_bridge(print_off);
+    const auto [rings_on,  bridge_on]  = closing_ceiling_bridge(print_on);
+    INFO("ceiling bridge in rings: " << rings_off << "/" << bridge_off << "mm -> " << rings_on << "/" << bridge_on << "mm");
+    REQUIRE(bridge_on > 10.);
+    CHECK(rings_off < 0.1 * bridge_off);
+    CHECK(rings_on  > 0.9 * bridge_on);
 }
 
 TEST_CASE("A wall with nothing under it is bridged instead of drawn in mid air", "[Perimeters]")

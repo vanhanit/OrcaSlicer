@@ -850,6 +850,40 @@ void split_solid_surface(size_t layer_id, const SurfaceFill &fill, ExPolygons &n
 #endif
 }
 
+// ORCA: bridge_unsupported_wall. A bridge held only around its rim and open in the middle - the ceiling
+// of a hole closing over, a countersink narrowing with Z - cannot be spanned: a straight line laid across
+// it runs off the inner edge and ends in mid air. Rings worked inward from the rim can, since every loop
+// after the first lands on the one before it, so report such a bridge here. What holds the rim is the
+// layer below and this layer's own walls, which are printed before the fill; a bridge whose outline is
+// not on either - a shelf off a wall, an island starting in mid air - has nothing to start the rings
+// from and is left to the straight bridge.
+static bool bridge_is_a_closing_ceiling(const ExPolygon &bridge, const ExPolygons &slices,
+                                        const ExPolygons &lower_slices, const Polygons &held)
+{
+    if (diff_ex(bridge, lower_slices).empty())
+        return false;
+    // A hole of the bridge that is open space in this layer too is the mouth of the cavity still closing
+    // over. What reaches it has nothing beyond to anchor the far end of a straight line to.
+    bool open_middle = false;
+    for (const Polygon &hole : bridge.holes) {
+        ExPolygon h(hole);
+        h.contour.reverse();    // a hole runs the other way round
+        if (! diff_ex(ExPolygons{ h }, slices).empty()) {
+            open_middle = true;
+            break;
+        }
+    }
+    if (! open_middle)
+        return false;
+    // The first ring runs just inside the bridge's outline, so that outline has to be on material. A short
+    // stretch of it that is not only bridges between the stretches that are, so allow a tenth.
+    const Polylines rim = { bridge.contour.split_at_first_point() };
+    double supported = 0.;
+    for (const Polyline &pl : intersection_pl(rim, held))
+        supported += pl.length();
+    return supported > 0.9 * rim.front().length();
+}
+
 std::vector<SurfaceFill> group_fills(const Layer &layer, LockRegionParam &lock_param)
 {
 	std::vector<SurfaceFill> surface_fills;
@@ -859,6 +893,21 @@ std::vector<SurfaceFill> group_fills(const Layer &layer, LockRegionParam &lock_p
     SurfaceFillParams									params;
     bool 												has_internal_voids = false;
 	const PrintObjectConfig&							object_config = layer.object()->config();
+
+    // ORCA: bridge_unsupported_wall - what a ring bridge can start from: the layer below and the walls
+    // this layer prints before its fill. Built once, and only for a layer that asks for it.
+    Polygons held_by;
+    bool     held_by_built = false;
+    auto     held_by_material = [&layer, &held_by, &held_by_built]() -> const Polygons & {
+        if (! held_by_built) {
+            held_by = to_polygons(layer.lower_layer->lslices);
+            for (const LayerRegion *region : layer.regions())
+                append(held_by, region->perimeters.polygons_covered_by_width(10.f));
+            held_by = union_(held_by);
+            held_by_built = true;
+        }
+        return held_by;
+    };
 
 	auto append_flow_param = [](std::map<Flow, ExPolygons> &flow_params, Flow flow, const ExPolygon &exp) {
         auto it = flow_params.find(flow);
@@ -1021,6 +1070,13 @@ std::vector<SurfaceFill> group_fills(const Layer &layer, LockRegionParam &lock_p
 		            // Don't limit anchor length for solid or bridging infill.
 		            params.anchor_length = 1000.f;
 					params.anchor_length_max = 1000.f;
+                    // ORCA: bridge_unsupported_wall - lay a ceiling that is closing over down as rings
+                    // worked inward from the rim it hangs on, instead of straight lines that run off its
+                    // inner edge into the hole. The loops come out of the concentric fill outside in.
+                    if (is_bridge && region_config.bridge_unsupported_wall && layer.lower_layer != nullptr &&
+                        bridge_is_a_closing_ceiling(surface.expolygon, layer.lslices, layer.lower_layer->lslices,
+                                                    held_by_material()))
+                        params.pattern = ipConcentric;
 		        } else {
 					// Internal infill. Calculating infill line spacing independent of the current layer height and 1st layer status,
 					// so that internall infill will be aligned over all layers of the current region.
@@ -1332,7 +1388,11 @@ void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive:
         params.anchor_length     = surface_fill.params.anchor_length;
 		params.anchor_length_max = surface_fill.params.anchor_length_max;
 		params.resolution        = resolution;
-        params.use_arachne       = surface_fill.params.pattern == ipConcentric || surface_fill.params.pattern == ipConcentricInternal;
+        // ORCA: a ring bridge has to run from the rim inward. Arachne numbers the beads of a ring from both
+        // of its boundaries, so the bead against the open middle is an inset 0 like the one on the rim and
+        // would be laid first, in mid air. The classic generator walks the loops outside in.
+        params.use_arachne       = (surface_fill.params.pattern == ipConcentric || surface_fill.params.pattern == ipConcentricInternal)
+                                   && ! surface_fill.params.bridge;
         params.layer_height      = layerm->layer()->height;
         params.lateral_lattice_angle_1   = surface_fill.params.lateral_lattice_angle_1;
         params.lateral_lattice_angle_2   = surface_fill.params.lateral_lattice_angle_2;

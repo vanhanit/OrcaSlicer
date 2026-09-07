@@ -1723,10 +1723,11 @@ void PrintConfigDef::init_fff_params()
     def->label = L("Bridge unsupported walls");
     def->category = L("Quality");
     def->tooltip  = L("Where a wall has nothing at all underneath it - the ceiling of a hole closing over, an island that "
-                      "starts in mid air - print the fill across it instead of laying the wall down in mid air. The fill is "
-                      "bridged from the material that does exist, so both ends of every line are anchored, where the wall "
-                      "would have been drawn from a starting point with nothing to stick to. Walls that are merely "
-                      "overhanging, with part of the line still on the layer below, are printed as usual.");
+                      "starts in mid air - print the fill across it instead of laying the wall down in mid air. The ceiling "
+                      "of a hole that is still closing is filled with rings worked inward from the rim it hangs on, so that "
+                      "every loop lands on the one before it, where a straight bridge line would run off the inner edge and "
+                      "end over the hole. Walls that are merely overhanging, with part of the line still on the layer below, "
+                      "are printed as usual.");
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionBool(false));
 
