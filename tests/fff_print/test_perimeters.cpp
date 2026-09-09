@@ -263,10 +263,10 @@ TEST_CASE("Only one wall on the first layer needs a bottom shell", "[Perimeters]
 // layer's slice has a hole a couple of millimetres narrower than the layer below. The walls around
 // that hole have nothing at all under them - a ring drawn in mid air - which is what the option is
 // for. The same shape a dome, a countersink or the crown of a hollow sphere makes.
-TriangleMesh block_with_closing_cavity()
+TriangleMesh block_with_closing_cavity(double cone_height = 2.)
 {
     TriangleMesh block = make_cube(34., 34., 8.);
-    TriangleMesh cone  = make_cone(14., 2.);
+    TriangleMesh cone  = make_cone(14., cone_height);
     cone.translate(17., 17., 3.);
     MeshBoolean::cgal::minus(block, cone);
     return block;
@@ -369,13 +369,17 @@ std::pair<double, double> closing_ceiling_bridge(const Print &print)
 TEST_CASE("A ceiling closing over is bridged with rings, not lines that run into the hole", "[Perimeters]")
 {
     const auto wall_generator = GENERATE("arachne", "classic");
-    INFO("wall_generator=" << wall_generator);
+    // The width of the ceiling ring a layer has to cover is the layer height times the slope, and how
+    // the rings divide it decides whether the last one lands on the one before it. Sweep the slope so
+    // that the awkward remainders are covered too.
+    const double cone_height = GENERATE(1.6, 1.8, 2.0);
+    INFO("wall_generator=" << wall_generator << " cone_height=" << cone_height);
 
     DynamicPrintConfig config = base_config(wall_generator);
     config.set_deserialize_strict({{ "bridge_unsupported_wall", "0" }});
     Print  print_off;
     Model  model_off;
-    init_print({block_with_closing_cavity()}, print_off, model_off, config);
+    init_print({block_with_closing_cavity(cone_height)}, print_off, model_off, config);
     print_off.process();
     const double off = unheld_extrusion_length(print_off);
 
@@ -386,7 +390,7 @@ TEST_CASE("A ceiling closing over is bridged with rings, not lines that run into
     config.set_deserialize_strict({{ "bridge_unsupported_wall", "1" }});
     Print  print_on;
     Model  model_on;
-    init_print({block_with_closing_cavity()}, print_on, model_on, config);
+    init_print({block_with_closing_cavity(cone_height)}, print_on, model_on, config);
     print_on.process();
     const double on = unheld_extrusion_length(print_on);
 

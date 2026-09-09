@@ -31,6 +31,46 @@ void FillConcentric::_fill_surface_single(
     // Contract surface polygon by half line width to avoid excesive overlap with perimeter
     ExPolygons contracted = offset_ex(expolygon, -float(scale_(0.5 * (params.multiline - 1) * this->spacing )));
 
+    // ORCA: bridge_unsupported_wall - a ring bridge is worked inward from the rim it hangs on, so its
+    // loops have to step one spacing at a time from the region's outline and stop where they no longer
+    // fit. A concentric fill takes the region's holes for a second boundary and works in from those as
+    // well; where the two families meet - and in a strip narrower than twice the spacing they never do
+    // - the loop against the open middle is the width of the strip away from the last loop that has
+    // anything under it, and is laid in mid air.
+    if (params.extrusion_role == erBridgeInfill || params.extrusion_role == erInternalBridgeInfill) {
+        ExPolygons rim;
+        for (const ExPolygon &region : contracted)
+            rim.emplace_back(region.contour);
+        rim = union_ex(rim);
+        const Polygons within = to_polygons(contracted);
+        for (coord_t inward = 0;; inward += distance) {
+            const ExPolygons ring = inward == 0 ? rim : offset_ex(rim, - float(inward));
+            if (ring.empty())
+                break;
+            Polygons outlines;
+            for (const ExPolygon &loop : ring)
+                outlines.emplace_back(loop.contour);
+            Polylines threads;
+            if (inward == 0)
+                // The rim itself. Clipping it to the region it was taken from is a degenerate case for
+                // the clipper - the two boundaries are the same line - and comes back in pieces.
+                for (const Polygon &outline : outlines)
+                    threads.emplace_back(outline.split_at_first_point());
+            else
+                // Kept only where the region actually is: a loop that has stepped past the far edge of
+                // the strip, or into the hole the ceiling is still closing over, is not laid there. What
+                // is left of one at the very edge is a string of dabs, which are not worth stopping and
+                // starting the nozzle for and are left to the layer above to bridge.
+                for (Polyline &thread : intersection_pl(outlines, within))
+                    if (thread.length() > 2 * distance)
+                        threads.emplace_back(std::move(thread));
+            if (threads.empty())
+                break;
+            append(polylines_out, std::move(threads));
+        }
+        return;
+    }
+
     Polygons loops = to_polygons(contracted);
 
     ExPolygons last { contracted };
