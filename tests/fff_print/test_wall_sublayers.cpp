@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <functional>
 #include <map>
 #include <set>
 #include <string>
@@ -1571,6 +1572,66 @@ TEST_CASE("A sub-layered hollow shell keeps its walls all the way up", "[WallSub
     const double worst = *std::min_element(band.begin(), band.end());
     INFO("median band " << median << "mm, worst layer " << worst << "mm");
     CHECK(worst > 0.4 * median);
+}
+
+// Sub-layer wall length with no part of its thread over anything that was there when it printed: the
+// layer below for the first pass, and after that whatever the passes under it actually laid down. The
+// model re-sliced at a pass's own height is not that - it has the whole ceiling of a closing cavity in
+// it, which nothing covers until the layer's own run at print_z, after every pass has gone.
+double airborne_pass_wall_length(const Print &print)
+{
+    double len = 0.;
+    for (const Layer *layer : print.objects().front()->layers()) {
+        if (layer->lower_layer == nullptr || layer->wall_sub_slices.empty())
+            continue;
+        Polygons laid = to_polygons(layer->lower_layer->lslices);
+        for (size_t k = 0; k < layer->wall_sub_slices.size(); ++ k) {
+            Polygons pass_covered;
+            std::function<void(const ExtrusionEntity *)> walk = [&](const ExtrusionEntity *entity) {
+                if (const auto *collection = dynamic_cast<const ExtrusionEntityCollection *>(entity)) {
+                    for (const ExtrusionEntity *child : collection->entities)
+                        walk(child);
+                    return;
+                }
+                const Polygons covered = entity->polygons_covered_by_width(10.f);
+                if (! covered.empty() && intersection(covered, laid).empty())
+                    len += unscaled(entity->length());
+                append(pass_covered, covered);
+            };
+            for (const LayerRegion *region : layer->regions())
+                if (k < region->sublayer_perimeters.size())
+                    walk(&region->sublayer_perimeters[k]);
+            append(laid, pass_covered);
+        }
+    }
+    return len;
+}
+
+// A cavity closing over fast enough that a pass's ring clears the ring below it: the hole shrinks a
+// wall's width and more per pass, so no part of a pass's thread is over anything a pass below laid
+// down. Taking the model re-sliced at the pass's own height for material carried these rings up the
+// ceiling one pass at a time, each hanging behind the one before it. Reported from the crown of a
+// dome, where the passes drew circles in mid air and the layer bridged onto them.
+TEST_CASE("A sub-layer pass stands on what the pass below printed, not on the model", "[WallSublayers]")
+{
+    const auto wall_generator = GENERATE("arachne", "classic");
+    INFO("wall_generator=" << wall_generator);
+
+    TriangleMesh block = make_cube(34., 34., 8.);
+    TriangleMesh cone  = make_cone(14., 2.);
+    cone.translate(17., 17., 3.);
+    MeshBoolean::cgal::minus(block, cone);
+
+    Print print;
+    Model model;
+    init_print({block}, print, model, {{"layer_height", "0.3"}, {"initial_layer_print_height", "0.2"},
+        {"wall_loops", "3"}, {"skirt_loops", "0"}, {"wall_generator", wall_generator},
+        {"wall_sublayer_height", "0.075"}, {"wall_sublayer_loops", "2"}});
+    print.process();
+
+    const double airborne = airborne_pass_wall_length(print);
+    INFO("sub-layer wall over nothing: " << airborne << "mm");
+    CHECK(airborne < 1.);
 }
 
 TEST_CASE("A sub-layered pass does not ring a cavity that is closing over", "[WallSublayers]")
