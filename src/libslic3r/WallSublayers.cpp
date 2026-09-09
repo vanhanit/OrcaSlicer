@@ -557,28 +557,20 @@ void wall_sublayer_generate(LayerRegion               &layerm,
 
     const float       wall_width = float(sublayer_flow(layerm, frExternalPerimeter, layer->height).scaled_width());
     ExPolygons        ground     = sublayer_ground_below(*layer, float(SUBLAYER_VOID_ANCHOR_REACH * wall_width));
-    ExPolygons        unprinted;
     for (size_t k = 0; k < num_passes; ++ k) {
         if (ctx.pass_slices[k].empty()) {
             ground.clear();
-            unprinted.clear();
             continue;
         }
-        // Measured against the model at the sub-layer below, less whatever the pass below was not
-        // allowed to print there: a thin wall needs something under it, and material merely beside it
-        // does not hold it up. Without the correction the ceiling of a closing cavity comes out as a
-        // stair of rings, each one standing on the ring the pass below had dropped as airborne - the
-        // model says every step is carried, and every step is in fact hanging in the air behind the
-        // one before it. The whole ceiling is then left to the layer above, which bridges it in one
-        // pass at print_z from the material the layer below ended with.
-        const ExPolygons *below   = k == 0 ? nullptr : layer->wall_sublayer_support(k);
-        ExPolygons        support = below == nullptr ? ground : *below;
-        if (! unprinted.empty() && ! support.empty())
-            support = diff_ex(support, unprinted);
-        const ExPolygons  dropped    = drop_airborne_islands(layerm.sublayer_perimeters[k], support,
+        // Measured against what the pass below actually laid down - ground, which the end of this loop
+        // sets to the footprint that pass printed - and not against the model re-sliced at its height.
+        // The two differ by everything the model has there that nothing has printed yet, which over the
+        // ceiling of a closing cavity is the whole ceiling: the layer's own walls and fill cover it, but
+        // only at print_z, after every pass has run. Taking the slice for material carried the ceiling
+        // up as a stair of rings, each one hanging behind the one before it.
+        const ExPolygons  dropped    = drop_airborne_islands(layerm.sublayer_perimeters[k], ground,
                                                              float(SUBLAYER_ANCHOR_REACH * wall_width),
                                                              float(SUBLAYER_VOID_ANCHOR_REACH * wall_width));
-        unprinted = dropped;
         // A dropped wall is not ground. Left in, the pass above would fill the ceiling of a closing
         // cavity pass by pass on the strength of a band that was never laid down.
         if (! dropped.empty())
