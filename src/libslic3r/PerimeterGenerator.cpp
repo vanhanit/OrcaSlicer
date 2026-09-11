@@ -143,14 +143,15 @@ static void drop_sublayer_band_walls(ExtrusionEntityCollection &entities, int dr
 // then bridges it. A wall that is merely overhanging still has part of its line on the layer below
 // and is left alone.
 // Returns the band of what was dropped.
-static ExPolygons drop_unsupported_walls(ExtrusionEntityCollection &entities, const ExPolygons &below)
+static ExPolygons drop_unsupported_walls(ExtrusionEntityCollection &entities, const ExPolygons &below,
+                                        coord_t line, bool nested_call = false)
 {
     Polygons             dropped;
     ExtrusionEntitiesPtr kept;
     kept.reserve(entities.entities.size());
     for (ExtrusionEntity *entity : entities.entities) {
         if (auto *nested = dynamic_cast<ExtrusionEntityCollection*>(entity)) {
-            append(dropped, to_polygons(drop_unsupported_walls(*nested, below)));
+            append(dropped, to_polygons(drop_unsupported_walls(*nested, below, line, true)));
             if (nested->empty())
                 delete entity;
             else
@@ -168,7 +169,16 @@ static ExPolygons drop_unsupported_walls(ExtrusionEntityCollection &entities, co
             kept.emplace_back(entity);
     }
     entities.entities = std::move(kept);
-    return union_ex(dropped);
+    if (nested_call)
+        return union_ex(dropped);
+    // Only where the fill can lay a line down. A single dropped wall leaves a strip one line wide, and
+    // a fill inset by half a line from each side of that has nothing left to work in: it comes out as
+    // a string of slivers, each traced up one side and back the other, which is worse than the wall it
+    // replaced. Two lines' width is the least the fill can use, and it is what the ceiling of a cavity
+    // closing over gives, where the walls come off several at a time. Anything narrower is left bare
+    // for the layer above to bridge.
+    const ExPolygons band = union_ex(dropped);
+    return intersection_ex(band, offset_ex(opening_ex(band, float(line)), float(line)));
 }
 
 static ExtrusionEntityCollection traverse_loops(const PerimeterGenerator &perimeter_generator, const PerimeterGeneratorLoops &loops, ThickPolylines &thin_walls,
@@ -1902,7 +1912,8 @@ void PerimeterGenerator::process_classic()
             drop_sublayer_band_walls(entities, this->sublayer_drop_walls, this->sublayer_keep_walls);
 
             if (this->config->bridge_unsupported_wall && this->lower_slices != nullptr)
-                append(unsupported_reclaimed, drop_unsupported_walls(entities, *this->lower_slices));
+                append(unsupported_reclaimed,
+                       drop_unsupported_walls(entities, *this->lower_slices, this->solid_infill_flow.scaled_spacing()));
 
             // append perimeters for this slice as a collection
             if (! entities.empty())
@@ -2862,7 +2873,9 @@ void PerimeterGenerator::process_arachne()
             // ORCA: bridge_unsupported_wall - the fill takes over the band of every wall dropped as
             // airborne, and bridges it from the material around it.
             if (this->config->bridge_unsupported_wall && this->lower_slices != nullptr)
-                if (const ExPolygons reclaimed = drop_unsupported_walls(extrusion_coll, *this->lower_slices); ! reclaimed.empty())
+                if (const ExPolygons reclaimed = drop_unsupported_walls(extrusion_coll, *this->lower_slices,
+                                                                        this->solid_infill_flow.scaled_spacing());
+                    ! reclaimed.empty())
                     infill_contour = union_ex(infill_contour, reclaimed);
             if (! extrusion_coll.empty())
                 this->loops->append(extrusion_coll);

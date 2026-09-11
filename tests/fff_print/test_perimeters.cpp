@@ -366,6 +366,22 @@ std::pair<double, double> closing_ceiling_bridge(const Print &print)
 // The ceiling of a cavity closing over is held only around its rim, so a straight bridge line laid
 // across it has its far end over the hole. Rings worked inward from the rim land on what is already
 // there, which is what the option asks the fill for.
+// Bridge fill laid in pieces shorter than a couple of lines. A strip one line wide handed to the fill
+// comes back as a string of these - each traced up one side of the strip and back down the other - at
+// a stop and a start apiece, all at bridging speed.
+double sliver_bridge_length(const Print &print)
+{
+    double len = 0.;
+    for (const Layer *layer : print.objects().front()->layers())
+        for (const LayerRegion *region : layer->regions()) {
+            const double least = 2. * region->bridging_flow(frSolidInfill).width();
+            for (const ExtrusionEntity *entity : region->fills.flatten().entities)
+                if (entity->role() == erBridgeInfill && unscaled(entity->length()) < least)
+                    len += unscaled(entity->length());
+        }
+    return len;
+}
+
 TEST_CASE("A ceiling closing over is bridged with rings, not lines that run into the hole", "[Perimeters]")
 {
     const auto wall_generator = GENERATE("arachne", "classic");
@@ -404,6 +420,10 @@ TEST_CASE("A ceiling closing over is bridged with rings, not lines that run into
     REQUIRE(bridge_on > 10.);
     CHECK(rings_off < 0.1 * bridge_off);
     CHECK(rings_on  > 0.9 * bridge_on);
+
+    // And none of it is laid in slivers: what the fill is given is wide enough to put a line in.
+    INFO("bridge laid in slivers: " << sliver_bridge_length(print_on) << "mm");
+    CHECK(sliver_bridge_length(print_on) < 1.);
 }
 
 TEST_CASE("A wall with nothing under it is bridged instead of drawn in mid air", "[Perimeters]")
