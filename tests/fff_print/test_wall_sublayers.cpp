@@ -1574,6 +1574,22 @@ TEST_CASE("A sub-layered hollow shell keeps its walls all the way up", "[WallSub
     CHECK(worst > 0.4 * median);
 }
 
+// What a layer actually put down: its own walls and fill, and every sub-layer pass. Not its slice -
+// bridge_unsupported_wall has a layer refuse the walls it would otherwise draw in mid air, and the
+// fill that takes their band over only reaches as far in as it can anchor, so the slice claims a band
+// nobody laid.
+Polygons layer_extrusion_footprint(const Layer &layer)
+{
+    Polygons out;
+    for (const LayerRegion *region : layer.regions()) {
+        region->perimeters.polygons_covered_by_width(out, 10.f);
+        region->fills.polygons_covered_by_width(out, 10.f);
+        for (const ExtrusionEntityCollection &pass : region->sublayer_perimeters)
+            pass.polygons_covered_by_width(out, 10.f);
+    }
+    return out;
+}
+
 // Sub-layer wall length with no part of its thread over anything that was there when it printed: the
 // layer below for the first pass, and after that whatever the passes under it actually laid down. The
 // model re-sliced at a pass's own height is not that - it has the whole ceiling of a closing cavity in
@@ -1584,7 +1600,7 @@ double airborne_pass_wall_length(const Print &print)
     for (const Layer *layer : print.objects().front()->layers()) {
         if (layer->lower_layer == nullptr || layer->wall_sub_slices.empty())
             continue;
-        Polygons laid = to_polygons(layer->lower_layer->lslices);
+        Polygons laid = layer_extrusion_footprint(*layer->lower_layer);
         for (size_t k = 0; k < layer->wall_sub_slices.size(); ++ k) {
             Polygons pass_covered;
             std::function<void(const ExtrusionEntity *)> walk = [&](const ExtrusionEntity *entity) {
@@ -1615,7 +1631,11 @@ double airborne_pass_wall_length(const Print &print)
 TEST_CASE("A sub-layer pass stands on what the pass below printed, not on the model", "[WallSublayers]")
 {
     const auto wall_generator = GENERATE("arachne", "classic");
-    INFO("wall_generator=" << wall_generator);
+    // With bridge_unsupported_wall on, the layer below refuses the walls it would have drawn in mid
+    // air, so its slice is no longer what it left behind and every judgement that read the slice for
+    // material claimed a band nobody laid.
+    const auto bridge_unsupported = GENERATE("0", "1");
+    INFO("wall_generator=" << wall_generator << " bridge_unsupported_wall=" << bridge_unsupported);
 
     TriangleMesh block = make_cube(34., 34., 8.);
     TriangleMesh cone  = make_cone(14., 2.);
@@ -1626,6 +1646,7 @@ TEST_CASE("A sub-layer pass stands on what the pass below printed, not on the mo
     Model model;
     init_print({block}, print, model, {{"layer_height", "0.3"}, {"initial_layer_print_height", "0.2"},
         {"wall_loops", "3"}, {"skirt_loops", "0"}, {"wall_generator", wall_generator},
+        {"bridge_unsupported_wall", bridge_unsupported},
         {"wall_sublayer_height", "0.075"}, {"wall_sublayer_loops", "2"}});
     print.process();
 
@@ -1642,6 +1663,9 @@ TEST_CASE("A sub-layered pass does not ring a cavity that is closing over", "[Wa
     // still read it as carried. The layer's own pass bridges that void at print_z, with a bridge flow
     // and the fan on; a pass cannot, and the rings it drew were left drooping in the bridge's way.
     // Reported from the crown of a dome, where every pass drew a circle in mid air.
+    const auto bridge_unsupported = GENERATE("0", "1");
+    INFO("bridge_unsupported_wall=" << bridge_unsupported);
+
     TriangleMesh block = make_cube(34., 34., 8.);
     TriangleMesh cone  = make_cone(14., 2.);
     cone.translate(17., 17., 3.);
@@ -1650,6 +1674,7 @@ TEST_CASE("A sub-layered pass does not ring a cavity that is closing over", "[Wa
     Print print; Model model;
     init_print({block}, print, model, {{"layer_height", "0.3"}, {"initial_layer_print_height", "0.2"},
         {"wall_loops", "3"}, {"skirt_loops", "0"}, {"wall_generator", "arachne"},
+        {"bridge_unsupported_wall", bridge_unsupported},
         {"wall_sublayer_height", "0.075"}, {"wall_sublayer_loops", "2"}});
     print.process();
 
@@ -1719,10 +1744,12 @@ TEST_CASE("A sub-layered pass does not ring a cavity that is closing over", "[Wa
         reach.clear();
     }
 
-    // The ceiling the passes refuse is the layer's own to print, walls and all. Measured at the edge
-    // of the cone: with the band dropped there and the layer still handing its outermost walls over,
-    // the first thread sits two wall spacings inside the contour and the ceiling comes out as one
-    // ring with a gap around it.
+    // The ceiling the passes refuse is the layer's own to print. Measured at the edge of the cone:
+    // with the band dropped there and the layer still handing its outermost walls over, the first
+    // thread sits two wall spacings inside the contour and the ceiling comes out as one ring with a
+    // gap around it. Whether that thread is a wall or a bridge is not the point and is not fixed -
+    // bridge_unsupported_wall drops the walls over a ceiling and has the fill bridge their band - so
+    // this counts everything the layer lays down.
     std::vector<double> edge_gaps;
     for (const Layer *layer : print.objects().front()->layers()) {
         if (layer->print_z < 3.2 || layer->print_z > 5. || layer->wall_sub_slices.empty())
@@ -1730,6 +1757,7 @@ TEST_CASE("A sub-layered pass does not ring a cavity that is closing over", "[Wa
         Polylines threads;
         for (const LayerRegion *region : layer->regions()) {
             region->perimeters.collect_polylines(threads);
+            region->fills.collect_polylines(threads);
             for (const auto &pass : region->sublayer_perimeters)
                 pass.collect_polylines(threads);
         }
@@ -1779,5 +1807,76 @@ TEST_CASE("A sub-layered pass does not ring a cavity that is closing over", "[Wa
 }
 
 
+// How far in towards the axis of a closing cavity each layer reached, over everything the layer put
+// down - its own walls and fill, and its passes. The cavity closes concentrically, so one radius per
+// layer says whether the ceiling was covered or left as a ring of bare hole.
+std::map<double, double> innermost_radius_by_layer(const Print &print, double from_z, double to_z)
+{
+    const PrintObject *object = print.objects().front();
+    const Vec2d        centre = unscale(get_extents(object->layers().front()->lslices).center());
+    std::map<double, double> out;
+    for (const Layer *layer : object->layers()) {
+        if (layer->print_z < from_z || layer->print_z > to_z)
+            continue;
+        double nearest = std::numeric_limits<double>::max();
+        Polylines threads;
+        for (const LayerRegion *region : layer->regions()) {
+            region->perimeters.collect_polylines(threads);
+            region->fills.collect_polylines(threads);
+            for (const ExtrusionEntityCollection &pass : region->sublayer_perimeters)
+                pass.collect_polylines(threads);
+        }
+        for (const Polyline &thread : threads)
+            for (const Point &p : thread.points)
+                nearest = std::min(nearest, (unscale(p) - centre).norm());
+        if (nearest < std::numeric_limits<double>::max())
+            out[layer->print_z] = nearest;
+    }
+    return out;
+}
 
+TEST_CASE("A cavity closing over is covered the same with sub-layered walls as without", "[WallSublayers]")
+{
+    // bridge_unsupported_wall has a layer refuse the walls it would otherwise draw in mid air and
+    // hands their band to the fill, which bridges it in from the rim. What the layer leaves behind is
+    // then no longer its slice, and every sub-layer judgement that read the slice for material
+    // claimed a band nobody laid: the passes carried the ceiling up as a stair of rings hanging in
+    // mid air, and the layer's own bridge came down on those rings rather than reaching the whole way
+    // in - the crown of a dome left with a ring of bare hole around it that never closed.
+    //
+    // The cavity's wall rises 2mm while its hole closes 14, so the hole loses more than a wall's
+    // width per pass and nothing a pass could draw around it has anything underneath.
+    TriangleMesh block = make_cube(34., 34., 8.);
+    TriangleMesh cone  = make_cone(14., 2.);
+    cone.translate(17., 17., 3.);
+    MeshBoolean::cgal::minus(block, cone);
 
+    double line_width = 0.;
+    auto   reach      = [&block, &line_width](const char *sublayer_height) {
+        Print print; Model model;
+        init_print({block}, print, model, {{"layer_height", "0.3"}, {"initial_layer_print_height", "0.2"},
+            {"wall_loops", "3"}, {"skirt_loops", "0"}, {"wall_generator", "arachne"},
+            {"bridge_unsupported_wall", "1"},
+            {"wall_sublayer_height", sublayer_height}, {"wall_sublayer_loops", "2"}});
+        print.process();
+        line_width = print.objects().front()->layers().front()->regions().front()->flow(frPerimeter).width();
+        return innermost_radius_by_layer(print, 3.4, 5.1);
+    };
+
+    const std::map<double, double> plain      = reach("0");
+    const std::map<double, double> sublayered = reach("0.075");
+    REQUIRE(plain.size() > 4);
+    REQUIRE(sublayered.size() == plain.size());
+    REQUIRE(line_width > 0.);
+
+    // A line width of slack: the two runs lay the same rings but not from the same starting point.
+    for (const auto &[print_z, plain_r] : plain) {
+        const auto it = sublayered.find(print_z);
+        REQUIRE(it != sublayered.end());
+        INFO("z=" << print_z << " reaches " << it->second << "mm from the axis, " << plain_r << "mm without sub-layers");
+        // Never short of the plain run: that is the ceiling left bare.
+        CHECK(it->second < plain_r + line_width);
+        // And never past it either, which is a ring drawn out over the hole with nothing under it.
+        CHECK(it->second > plain_r - line_width);
+    }
+}
