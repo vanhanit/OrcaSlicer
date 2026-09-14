@@ -136,6 +136,12 @@ ExPolygons Layer::merged(float offset_scaled) const
     return out;
 }
 
+// The geometry a sub-layer pass is measured against by the overhang estimator: the sub-layer below it,
+// and for the first pass the layer below. Every pass of a layer is printed onto the pass right below
+// it, the same sub-layer height down, so measured this way they all read alike and none of them picks
+// up a slowdown a full-height wall over the same shape would not get.
+// Not what the pass below actually laid down - the wall generator needs that and tracks it itself,
+// because these layers are perimetered in parallel and none of them may read another's extrusions.
 const ExPolygons* Layer::wall_sublayer_support(size_t pass) const
 {
     if (pass > 0)

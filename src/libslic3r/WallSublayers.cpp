@@ -516,20 +516,44 @@ void wall_sublayer_generate(LayerRegion               &layerm,
     // splitting into two walls with a gap between them.
     const float core_min = float(layerm.flow(frPerimeter, layer->height).scaled_width());
     const ExPolygons core_interior = opening_ex(offset_ex(ctx.core_region, - float(core_strip)), core_min / 2.f);
-    // The footprint of each pass's wall band. The band of pass k+1 is laid on what pass k printed, so
-    // this drives the support fill below.
-    std::vector<ExPolygons> pass_band(num_passes);
+
+    const Flow   support_flow  = sublayer_flow(layerm, frSolidInfill, layer->wall_sub_slices.front().height);
+    const float  support_angle = float(Geometry::deg2rad(region_config.solid_infill_direction.value) + model_rotation_rad);
+    const float  support_width = float(support_flow.scaled_width());
+    const double min_area      = SUBLAYER_MIN_SUPPORT_AREA * double(support_width) * double(support_width);
+    // A concentric fill has no direction, so there is nothing to turn between passes.
+    const float  pass_turn     = region_config.wall_sublayer_fill_pattern.value == ipConcentric ? 0.f : float(M_PI / 2.);
+
+    const float  wall_width = float(sublayer_flow(layerm, frExternalPerimeter, layer->height).scaled_width());
+
+    // What is under a pass, in two readings, both seeded with what the layer below left at its top.
+    //
+    // `support` is everything that exists by the time the pass runs. A pass only ever adds material,
+    // so this grows: a wall coming down on what a pass two below it laid is standing on a step, not
+    // on air. This is what the wall generator classifies overhangs and airborne walls against.
+    //
+    // `ground` is the narrower reading - only what the pass immediately below put down - and only the
+    // anchor test uses it. A wall creeping inward over the ceiling of a closing cavity rests a few
+    // hundredths of its width on the ring below and the rest over the hole; against everything that
+    // has ever been printed it would find an anchor, against the last pass alone it does not.
+    ExPolygons   support = sublayer_ground_below(*layer, float(SUBLAYER_VOID_ANCHOR_REACH * wall_width));
+    ExPolygons   ground  = support;
+
     for (size_t k = 0; k < num_passes; ++ k) {
         const WallSubSlice &sub = layer->wall_sub_slices[k];
-        if (ctx.pass_slices[k].empty())
+        if (ctx.pass_slices[k].empty()) {
+            // A feature that ends part way up the layer holds nothing above it.
+            support.clear();
+            ground.clear();
             continue;
+        }
 
         SurfaceCollection band_slices;
         band_slices.append(offset_ex(ctx.pass_slices[k], ClipperSafetyOffset), stInternal);
 
         // The fill surfaces and the extra perimeters belong to the layer's own pass, which sees the
-        // whole layer. The gap fill is kept and appended after the walls of this same sub-layer; the
-        // no-overlap area is kept because it is the area left inside this pass's wall band.
+        // whole layer, so the generator writes those into sinks this run drops. Only the gap fill is
+        // kept, and appended after the walls of this same sub-layer.
         ExtrusionEntityCollection band_gap_fill;
         SurfaceCollection         band_fill_surfaces;
         ExPolygons                band_fill_no_overlap;
@@ -539,7 +563,13 @@ void wall_sublayer_generate(LayerRegion               &layerm,
             &region_config, &object_config, &print_config, spiral_mode, model_rotation_rad,
             &layerm.sublayer_perimeters[k], &band_gap_fill, &band_fill_surfaces, &band_fill_no_overlap);
 
-        bg.lower_slices = layer->wall_sublayer_support(k);
+        // Against what the pass below actually laid down, and never the model re-sliced at its
+        // height. Over the ceiling of a cavity closing over, the two differ by the whole ceiling: no
+        // pass covers it, the layer's own run does at print_z after every pass has gone. Judged
+        // against the model a wall out over that ceiling reads as carried, so neither the overhang
+        // classifier nor bridge_unsupported_wall touches it, and it is drawn in mid air with an
+        // ordinary wall's role, flow and speed.
+        bg.lower_slices = &support;
         if (layer->upper_layer != nullptr) {
             bg.upper_slices             = &layer->upper_layer->lslices;
             bg.upper_slices_same_region = &layer->upper_layer->get_region(region_id)->slices;
@@ -564,48 +594,27 @@ void wall_sublayer_generate(LayerRegion               &layerm,
 
         layerm.sublayer_perimeters[k].append(std::move(band_gap_fill.entities));
 
-        pass_band[k] = diff_ex(ctx.pass_slices[k], union_ex(band_fill_no_overlap));
-    }
+        // Whatever the generator left standing that still has nothing under it: everything it has
+        // ever been given to stand on is in `support`, and a wall may overhang all of it. Judged per
+        // wall rather than per island, so the loop around a closing hole goes without its supported
+        // neighbour on the contour beside it.
+        const ExPolygons dropped = drop_airborne_islands(layerm.sublayer_perimeters[k], ground,
+                                                         float(SUBLAYER_ANCHOR_REACH * wall_width),
+                                                         float(SUBLAYER_VOID_ANCHOR_REACH * wall_width));
 
-    // Everything the passes own but their walls do not cover, the pass fills itself: the layer's own
-    // pass is confined to the columns solid for the whole layer, so nothing else reaches this ground,
-    // and it is what the wall band of every pass above comes down on. wall_sublayer_prepare() has
-    // already handed anything a pass would have to fill over air back to the layer's own pass, so
-    // what is left here stands on material by construction.
-    const Flow   support_flow  = sublayer_flow(layerm, frSolidInfill, layer->wall_sub_slices.front().height);
-    const float  support_angle = float(Geometry::deg2rad(region_config.solid_infill_direction.value) + model_rotation_rad);
-    const float  support_width = float(support_flow.scaled_width());
-    const double min_area      = SUBLAYER_MIN_SUPPORT_AREA * double(support_width) * double(support_width);
-    // A concentric fill has no direction, so there is nothing to turn between passes.
-    const float  pass_turn     = region_config.wall_sublayer_fill_pattern.value == ipConcentric ? 0.f : float(M_PI / 2.);
-
-    const float       wall_width = float(sublayer_flow(layerm, frExternalPerimeter, layer->height).scaled_width());
-    ExPolygons        ground     = sublayer_ground_below(*layer, float(SUBLAYER_VOID_ANCHOR_REACH * wall_width));
-    for (size_t k = 0; k < num_passes; ++ k) {
-        if (ctx.pass_slices[k].empty()) {
-            ground.clear();
-            continue;
-        }
-        // Measured against what the pass below actually laid down - ground, which the end of this loop
-        // sets to the footprint that pass printed - and not against the model re-sliced at its height.
-        // The two differ by everything the model has there that nothing has printed yet, which over the
-        // ceiling of a closing cavity is the whole ceiling: the layer's own walls and fill cover it, but
-        // only at print_z, after every pass has run. Taking the slice for material carried the ceiling
-        // up as a stair of rings, each one hanging behind the one before it.
-        const ExPolygons  dropped    = drop_airborne_islands(layerm.sublayer_perimeters[k], ground,
-                                                             float(SUBLAYER_ANCHOR_REACH * wall_width),
-                                                             float(SUBLAYER_VOID_ANCHOR_REACH * wall_width));
-        // A dropped wall is not ground. Left in, the pass above would fill the ceiling of a closing
-        // cavity pass by pass on the strength of a band that was never laid down.
-        if (! dropped.empty())
-            pass_band[k] = diff_ex(pass_band[k], dropped);
+        // The footprint of this pass's wall band, measured on the extrusions themselves. Taken from
+        // the sub-slice instead it claims the strip of every wall that was never printed - one the
+        // generator refused as airborne, one a too-thin feature never produced - and the pass above
+        // then comes down half a millimetre inside material that does not exist.
+        const ExPolygons pass_band = intersection_ex(union_ex(layerm.sublayer_perimeters[k].polygons_covered_by_width(10.f)),
+                                                     ctx.pass_slices[k]);
 
         // Everything this pass owes and has not covered: solid at this pass, short of the walls the
         // layer keeps for itself, not already under this pass's own walls, and standing on what the
         // pass below put down.
         // Where a wall was refused, nothing else is laid either: filling behind an airborne wall only
         // moves the problem from the wall to the fill.
-        ExPolygons bare = intersection_ex(diff_ex(diff_ex(ctx.pass_slices[k], core_interior), pass_band[k]), ground);
+        ExPolygons bare = intersection_ex(diff_ex(diff_ex(ctx.pass_slices[k], core_interior), pass_band), ground);
         if (! dropped.empty())
             bare = diff_ex(bare, dropped);
 
@@ -623,10 +632,12 @@ void wall_sublayer_generate(LayerRegion               &layerm,
         // Ground for the pass above is the whole tread, before the quality filter below drops the
         // dabs, so that dropping one does not punch a hole and fragment every pass above it, and only
         // the band that is actually carried - the span of a lintel dropped above holds nothing up.
-        ExPolygons printed = pass_band[k];
+        ExPolygons printed = pass_band;
         append(printed, tread);
         append(printed, join);
         ground = union_ex(printed);
+        append(support, ground);
+        support = union_ex(support);
 
         ExPolygons fill = opening_ex(union_ex(tread), support_width / 2.f);
         fill.erase(std::remove_if(fill.begin(), fill.end(),

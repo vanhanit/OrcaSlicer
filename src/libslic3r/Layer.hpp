@@ -144,8 +144,10 @@ struct WallSubSlice
     coordf_t                height;
     // Indexed by PrintRegion::print_object_region_id(), like Layer::m_regions.
     std::vector<ExPolygons> region_slices;
-    // Union over the regions. Serves as the lower slices for the sub-layer above it, so overhangs
-    // and bridges are classified against what this sub-layer actually printed.
+    // Union over the regions of the model re-sliced at slice_z. What the pass is generated from, and
+    // the geometry the overhang estimator measures the pass against - see Layer::wall_sublayer_support.
+    // It is not what the pass printed: a pass lays only its wall band, and refuses anything with
+    // nothing under it, so the generator tracks the real footprint itself as it goes.
     ExPolygons              merged;
 };
 
