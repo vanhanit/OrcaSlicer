@@ -54,7 +54,8 @@ void FillConcentric::_fill_surface_single(
     // well; where the two families meet - and in a strip narrower than twice the spacing they never do
     // - the loop against the open middle is the width of the strip away from the last loop that has
     // anything under it, and is laid in mid air.
-    if (params.extrusion_role == erBridgeInfill || params.extrusion_role == erInternalBridgeInfill) {
+    if ((params.extrusion_role == erBridgeInfill || params.extrusion_role == erInternalBridgeInfill) &&
+        params.config != nullptr && params.config->bridge_unsupported_wall) {
         ExPolygons rim;
         for (const ExPolygon &region : contracted)
             rim.emplace_back(region.contour);

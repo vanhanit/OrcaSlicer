@@ -1477,7 +1477,7 @@ void Layer::make_fills(const FillAdaptive::RegionOctrees* fill_octrees, FillLigh
         // would be laid first, in mid air. The classic generator walks the loops outside in.
         params.use_arachne       = (surface_fill.params.pattern == ipConcentric || surface_fill.params.pattern == ipSpiralInset ||
                                     surface_fill.params.pattern == ipConcentricInternal)
-                                   && ! surface_fill.params.bridge;
+                                   && ! (surface_fill.params.bridge && layerm->region().config().bridge_unsupported_wall);
         params.layer_height      = layerm->layer()->height;
         params.lateral_lattice_angle_1   = surface_fill.params.lateral_lattice_angle_1;
         params.lateral_lattice_angle_2   = surface_fill.params.lateral_lattice_angle_2;

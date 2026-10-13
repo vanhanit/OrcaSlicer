@@ -1207,6 +1207,6 @@ TEST_CASE("A wall with nothing under it is bridged instead of drawn in mid air",
         if (print_off.objects().front()->layers()[i]->print_z > 3.)
             break;
         INFO("layer " << i);
-        CHECK(off.perimeters[i] == Catch::Approx(on.perimeters[i]));
+        CHECK_THAT(off.perimeters[i], Catch::Matchers::WithinRel(on.perimeters[i]));
     }
 }
