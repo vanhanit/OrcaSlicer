@@ -82,6 +82,11 @@ DynamicPrintConfig multifilament_config(unsigned int filaments,
 // Call after setting nozzle_diameter to more than one nozzle.
 void size_flush_to_nozzles(DynamicPrintConfig &config);
 
+// Two physical filaments plus one mixed slot (filament 3) blending them by `ratios`, with every region
+// role assigned to the mixed slot. `sublayer_on` splits each layer into sub-layers per component
+// (enable_mixed_color_sublayer); otherwise the slot alternates whole layers between them.
+DynamicPrintConfig mixed_filament_config(bool sublayer_on, const char *ratios = "0.6,0.4");
+
 // Apply `meshes` and config to `print`/`model`, each object with `instances` copies; optional per-object overrides,
 // auto-arranged unless `arrange` is false.
 void init_print(std::vector<TriangleMesh> &&meshes, Slic3r::Print &print, Slic3r::Model &model, const DynamicPrintConfig &config_in,

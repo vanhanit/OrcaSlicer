@@ -22,32 +22,6 @@ using namespace Slic3r::Test;
 
 namespace {
 
-// Two physical filaments plus one mixed slot (config index 2, 1-based id 3) blending them 60/40.
-// The mixed arrays are parallel to filament_colour and must be sized to the filament count.
-// Note ConfigOptionBools deserializes on ',' while ConfigOptionStrings uses ';'.
-DynamicPrintConfig mixed_config(bool sublayer_on, const char *ratios = "0.6,0.4")
-{
-    DynamicPrintConfig config = multifilament_config(3);
-    config.set_deserialize_strict({
-        {"filament_is_mixed",               "0,0,1"},
-        {"filament_mixed_components",       ";;1,2"},
-        {"filament_mixed_sublayer_ratios",  std::string(";;") + ratios},
-        {"filament_mixed_gradient",         "0,0,0"},
-        {"filament_mixed_gradient_range",   ";;"},
-        {"filament_mixed_gradient_curve",   ";;"},
-        {"filament_mixed_gradient_per_part","0,0,0"},
-        {"enable_mixed_color_sublayer",     sublayer_on ? "1" : "0"},
-        // Assign every region role to the mixed slot so it actually participates in slicing.
-        {"outer_wall_filament_id",          "3"},
-        {"inner_wall_filament_id",          "3"},
-        {"sparse_infill_filament_id",       "3"},
-        {"internal_solid_filament_id",      "3"},
-        {"top_surface_filament_id",         "3"},
-        {"bottom_surface_filament_id",      "3"},
-    });
-    return config;
-}
-
 // Total sub-layer groups and per-layer mixed-filament resolutions across the whole tool ordering.
 void count_mixed(ToolOrdering &to, size_t &groups, size_t &resolutions)
 {
@@ -64,7 +38,7 @@ TEST_CASE("enable_mixed_color_sublayer reaches the Print config", "[MixedFilamen
 {
     Print print;
     Model model;
-    init_print({cube(20)}, print, model, mixed_config(true));
+    init_print({cube(20)}, print, model, mixed_filament_config(true));
 
     // The option lives in PrintConfig; if it did not survive Print::apply the slicer would
     // silently fall back to the whole-layer path.
@@ -79,7 +53,7 @@ TEST_CASE("Mixed filament splits layers into sub-layers when the option is on", 
 {
     Print print;
     Model model;
-    init_print({cube(20)}, print, model, mixed_config(true));
+    init_print({cube(20)}, print, model, mixed_filament_config(true));
     print.process();
 
     ToolOrdering &to = const_cast<ToolOrdering &>(print.tool_ordering());
@@ -96,7 +70,7 @@ TEST_CASE("Mixed filament alternates whole layers when the option is off", "[Mix
 {
     Print print;
     Model model;
-    init_print({cube(20)}, print, model, mixed_config(false));
+    init_print({cube(20)}, print, model, mixed_filament_config(false));
     print.process();
 
     ToolOrdering &to = const_cast<ToolOrdering &>(print.tool_ordering());
@@ -116,7 +90,7 @@ TEST_CASE("Sub-layer splitting emits the scaled sub-heights into G-code", "[Mixe
 {
     // layer_height 0.2 split 60/40 gives sub-layers of 0.12 and 0.08. The emitter reports the
     // sub-height (not the nominal layer height) in the HEIGHT tag and scales flow to match.
-    DynamicPrintConfig config = mixed_config(true);
+    DynamicPrintConfig config = mixed_filament_config(true);
     config.set_deserialize_strict({{"layer_height", "0.2"}, {"initial_layer_print_height", "0.2"}});
 
     Print print;
@@ -133,7 +107,7 @@ TEST_CASE("Sub-layer splitting emits the scaled sub-heights into G-code", "[Mixe
 
 TEST_CASE("Whole-layer mixing emits only the nominal layer height", "[MixedFilament]")
 {
-    DynamicPrintConfig config = mixed_config(false);
+    DynamicPrintConfig config = mixed_filament_config(false);
     config.set_deserialize_strict({{"layer_height", "0.2"}, {"initial_layer_print_height", "0.2"}});
 
     Print print;
@@ -173,7 +147,7 @@ TEST_CASE("By-layer prints record a mixed slot's components and the slot itself"
     // a used mixed filament. By-object prints must report exactly the same.
     Print print;
     Model model;
-    init_print({cube(20)}, print, model, mixed_config(false));
+    init_print({cube(20)}, print, model, mixed_filament_config(false));
     print.process();
 
     CHECK(print.get_slice_used_filaments(false) == std::vector<unsigned int>{0, 1});
@@ -186,7 +160,7 @@ TEST_CASE("By-object prints expand a mixed slot to its components in the slice b
     // still carry the virtual slot (config index 2). The slice-used sets and the published
     // grouping result must see the physical components 0 and 1 instead, and the slot itself
     // must still be reported as a used mixed filament — exactly what the by-layer path yields.
-    DynamicPrintConfig config = mixed_config(false);
+    DynamicPrintConfig config = mixed_filament_config(false);
     config.set_deserialize_strict({{"print_sequence", "by object"}});
 
     Print print;
@@ -207,7 +181,7 @@ TEST_CASE("By-object prints expand a mixed slot to its components in the slice b
 
 TEST_CASE("By-object G-code lists a mixed slot's components in the filament header", "[MixedFilament]")
 {
-    DynamicPrintConfig config = mixed_config(false);
+    DynamicPrintConfig config = mixed_filament_config(false);
     config.set_deserialize_strict({{"print_sequence", "by object"}});
 
     Print print;
@@ -226,8 +200,8 @@ TEST_CASE("Print::validate rejects a mixed filament as the wipe tower filament",
 {
     // The validate backstop refuses a mixed (virtual) slot as the wipe tower filament; the GUI hides
     // the slot from that option. Two cubes on physical filaments 1 and 2 make the tower real, and the
-    // region roles mixed_config() points at the slot are reset so only the tower uses it.
-    DynamicPrintConfig config = mixed_config(false);
+    // region roles mixed_filament_config() points at the slot are reset so only the tower uses it.
+    DynamicPrintConfig config = mixed_filament_config(false);
     config.set_deserialize_strict({
         {"enable_prime_tower",         "1"},
         {"wipe_tower_x",               "50"}, // inside the 200x200 test bed
@@ -271,7 +245,7 @@ TEST_CASE("Print::validate warns when a gradient mixed filament is used without 
     // it ToolOrdering prints one whole component per layer and the gradient is dropped silently,
     // so validate() warns whenever the slot actually takes part in the print. The layer-change
     // reset avoids an unrelated relative-extrusion warning, as in the wipe tower test above.
-    DynamicPrintConfig config = mixed_config(false);
+    DynamicPrintConfig config = mixed_filament_config(false);
     config.set_deserialize_strict({
         {"filament_mixed_gradient", "0,0,1"},
         {"layer_change_gcode",       "G92 E0\n"},

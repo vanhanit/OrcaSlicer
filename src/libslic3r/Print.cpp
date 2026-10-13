@@ -58,6 +58,7 @@
 #include "IMEXHelpers.hpp"
 #include "IMEXZones.hpp"
 #include "Print.hpp"
+#include "WallSublayers.hpp"
 #include "BoundingBox.hpp"
 #include "Brim.hpp"
 #include "ClipperUtils.hpp"
@@ -2206,17 +2207,24 @@ StringObjectException Print::validate(std::vector<StringObjectException> *warnin
     // per-object and per-modifier overrides.
     for (const PrintObject *object : m_objects) {
         const auto regions = object->all_regions();
-        bool sublayered = false, overhangs_made_printable = false, zaa = false;
+        bool sublayered = false, overhangs_made_printable = false, zaa = false, mixed_color_sublayers = false;
         std::set<int> sublayer_filaments;
         for (const PrintRegion &region : regions) {
             const PrintRegionConfig &config = region.config();
             if (config.wall_sublayer_height.value <= 0. || config.wall_loops <= 0)
                 continue;
+            if (wall_in_mixed_color_sublayers(config, m_config)) {
+                mixed_color_sublayers = true;
+                continue;
+            }
             sublayered               = true;
             overhangs_made_printable |= config.make_overhang_printable.value;
             zaa                      |= config.zaa_enabled.value;
             sublayer_filaments.insert(config.outer_wall_filament_id.value);
         }
+        if (mixed_color_sublayers)
+            warn(L("Outer walls printed with a mixed filament are split into its color sub-layers, so they are not "
+                   "sub-layered as well."), "wall_sublayer_height", object);
         if (! sublayered)
             continue;
         if (m_config.spiral_mode)

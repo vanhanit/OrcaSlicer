@@ -60,9 +60,16 @@ static Flow sublayer_flow(const LayerRegion &layerm, FlowRole role, coordf_t hei
     return width > 0. ? base.with_width(float(width)) : base;
 }
 
-int wall_sublayer_count(const PrintRegionConfig &config, coordf_t layer_height)
+bool wall_in_mixed_color_sublayers(const PrintRegionConfig &config, const PrintConfig &print_config)
 {
-    if (config.wall_loops <= 0 || layer_height <= 0.)
+    const int filament = config.outer_wall_filament_id.value - 1;
+    return print_config.enable_mixed_color_sublayer.value && filament >= 0 &&
+           size_t(filament) < print_config.filament_is_mixed.values.size() && print_config.filament_is_mixed.get_at(filament);
+}
+
+int wall_sublayer_count(const PrintRegionConfig &config, const PrintConfig &print_config, coordf_t layer_height)
+{
+    if (config.wall_loops <= 0 || layer_height <= 0. || wall_in_mixed_color_sublayers(config, print_config))
         return 1;
     const double target = config.wall_sublayer_height.get_abs_value(layer_height);
     if (target <= 0.)
@@ -370,7 +377,7 @@ WallSublayerContext wall_sublayer_prepare(const LayerRegion &layerm, const Layer
         return ctx;
     // The layer is split as soon as any region of the object asks for it. A region that does not ask -
     // the object around a modifier that does - keeps its walls at the full layer height.
-    if (wall_sublayer_count(region_config, layer->height) < 2)
+    if (wall_sublayer_count(region_config, layer->object()->print()->config(), layer->height) < 2)
         return ctx;
     ctx.band_walls = std::clamp(region_config.wall_sublayer_loops.value, 0, region_config.wall_loops.value);
     // The passes print with the outer wall filament. With a separate inner wall filament only the outer

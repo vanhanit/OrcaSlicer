@@ -8,6 +8,7 @@
 namespace Slic3r {
 
 class LayerRegion;
+class PrintConfig;
 class PrintRegionConfig;
 using LayerRegionPtrs = std::vector<LayerRegion*>;
 
@@ -20,7 +21,10 @@ static constexpr coordf_t MIN_WALL_SUBLAYER_HEIGHT = 0.02;
 // How many sub-layers a layer of the given height is split into for this region, 1 meaning the walls
 // print at the full layer height as usual. wall_sublayer_height is resolved against the real layer
 // height rather than the layer_height setting, so adaptive and per-range heights are honored.
-int wall_sublayer_count(const PrintRegionConfig &config, coordf_t layer_height);
+// Walls in a mixed filament that enable_mixed_color_sublayer splits into color sub-layers are never
+// sub-layered: that split already divides their layer in Z, once per component filament.
+int wall_sublayer_count(const PrintRegionConfig &config, const PrintConfig &print_config, coordf_t layer_height);
+bool wall_in_mixed_color_sublayers(const PrintRegionConfig &config, const PrintConfig &print_config);
 
 // The areas a layer's sub-layered walls are generated from, and the column left to the layer's own
 // full-height pass. band_walls == 0 means the feature is off for this region and the rest is empty.

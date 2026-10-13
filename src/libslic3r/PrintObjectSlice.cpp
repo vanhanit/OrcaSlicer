@@ -1728,7 +1728,7 @@ void PrintObject::slice_wall_sublayers()
         for (const LayerRegion *layerm : layer->regions()) {
             if (layerm->slices.empty())
                 continue;
-            const int region_count = wall_sublayer_count(layerm->region().config(), layer->height);
+            const int region_count = wall_sublayer_count(layerm->region().config(), this->print()->config(), layer->height);
             counts_differ |= region_count > 1 && count > 1 && region_count != count;
             count = std::max(count, region_count);
         }
