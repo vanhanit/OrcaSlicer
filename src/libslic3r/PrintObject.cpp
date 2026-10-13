@@ -1484,7 +1484,8 @@ bool PrintObject::invalidate_state_by_config_options(
             || opt_key == "wall_sublayer_height"
             || opt_key == "wall_sublayer_loops"
             || opt_key == "wall_sublayer_line_width"
-            || opt_key == "wall_sublayer_fill_pattern") {
+            || opt_key == "wall_sublayer_fill_pattern"
+            || opt_key == "bridge_unsupported_wall") {
             steps.emplace_back(posPerimeters);
             steps.emplace_back(posSupportMaterial);
         } else if (opt_key == "bridge_flow" || opt_key == "internal_bridge_flow") {

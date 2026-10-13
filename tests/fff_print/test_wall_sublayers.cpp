@@ -71,7 +71,6 @@ std::map<double, double> min_x_by_z(const std::string &gcode)
     return min_x;
 }
 
-
 // Distinct Z heights at which something is extruded under the given ;TYPE: tag.
 std::set<double> zs_of_type(const std::string &gcode, const std::string &type)
 {
