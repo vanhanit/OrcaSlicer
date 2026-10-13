@@ -1500,13 +1500,6 @@ TEST_CASE("Every object keeps printing when another is on the plate", "[WallSubl
     print.process();
 
     REQUIRE(print.objects().size() == 2);
-    {
-        const std::string g = Slic3r::Test::gcode(print);
-        FILE *f = fopen("/tmp/claude-1000/-workspaces-OrcaSlicer/a6c5ba7a-7a76-4bb8-b5a1-87b848e045f6/scratchpad/user.gcode", "wb");
-        fwrite(g.data(), 1, g.size(), f);
-        fclose(f);
-        printf("GCODE %zu bytes\n", g.size());
-    }
     for (const PrintObject *obj : print.objects()) {
         int silent = 0;
         for (const Layer *layer : obj->layers()) {
