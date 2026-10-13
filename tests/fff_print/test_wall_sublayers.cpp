@@ -2194,3 +2194,87 @@ TEST_CASE("Sub-layered walls work when objects print one after another", "[WallS
     CHECK(whole == 2);
     CHECK(other == 0);
 }
+
+// Full Spectrum mixed filaments: a virtual filament blending two physical ones, either by alternating
+// whole layers or by splitting each layer into a sub-layer per component.
+
+namespace {
+
+// Every region role on the mixed slot blending filaments 1 and 2 60/40, with 0.2mm layers split by
+// 0.05mm into 4 wall passes.
+DynamicPrintConfig mixed_sublayered_config(bool mixed_color_sublayers)
+{
+    DynamicPrintConfig config = mixed_config(mixed_color_sublayers);
+    config.set_deserialize_strict({{"layer_height", "0.2"},
+                                   {"initial_layer_print_height", "0.2"},
+                                   {"wall_loops", "3"},
+                                   {"z_hop", "0"},
+                                   {"skirt_loops", "0"},
+                                   {"wall_sublayer_height", "0.05"}});
+    return config;
+}
+
+// Z never drops within a layer, and every layer prints an outer wall.
+void check_layers_rise_and_keep_their_outer_wall(const std::string &gcode)
+{
+    const auto layers = extruding_zs_per_layer(gcode);
+    REQUIRE(layers.size() > 4);
+    for (size_t i = 0; i < layers.size(); ++ i)
+        for (size_t k = 1; k < layers[i].size(); ++ k) {
+            INFO("layer " << i << " step " << k << ": " << layers[i][k - 1] << " -> " << layers[i][k]);
+            REQUIRE(layers[i][k] >= layers[i][k - 1] - EPSILON);
+        }
+    std::vector<size_t> outer_wall_moves;
+    for_each_move_of_type(gcode, "Outer wall", [&](const GCodeReader &, int) {
+        if (! outer_wall_moves.empty())
+            ++ outer_wall_moves.back();
+    }, [&]() { outer_wall_moves.emplace_back(0); });
+    for (size_t i = 0; i < outer_wall_moves.size(); ++ i) {
+        INFO("layer " << i);
+        CHECK(outer_wall_moves[i] > 0);
+    }
+}
+
+} // namespace
+
+TEST_CASE("Sub-layered walls work with a mixed filament alternating whole layers", "[WallSublayers]")
+{
+    // Each layer prints with one of the mixed slot's two components, outer wall passes included, so
+    // across the print both components print passes - each layer above the first in 4 of them.
+    const std::string gcode = slice({cube(20)}, mixed_sublayered_config(false));
+    REQUIRE(! gcode.empty());
+    check_layers_rise_and_keep_their_outer_wall(gcode);
+
+    const auto layers = extruding_zs_per_layer(gcode);
+    for (size_t i = 1; i < layers.size(); ++ i) {
+        INFO("layer " << i);
+        CHECK(distinct_sorted(layers[i]).size() == 4);
+    }
+    std::set<int> pass_tools;
+    for_each_move_of_type(gcode, "Outer wall", [&](const GCodeReader &self, int tool) {
+        if (! on_layer_top(self.z(), 0.2))
+            pass_tools.insert(tool);
+    });
+    CHECK(pass_tools == std::set<int>{0, 1});
+}
+
+TEST_CASE("Sub-layered walls and mixed color sub-layers print a sound layer together", "[WallSublayers]")
+{
+    // Mixed color sub-layers print the mixed region once per component, each at a sub-height of its
+    // own - a split of the layer in Z just like the wall passes. Whatever the two make of it, a layer
+    // still never moves the nozzle down and still has its outer wall.
+    const std::string gcode = slice({cube(20)}, mixed_sublayered_config(true));
+    REQUIRE(! gcode.empty());
+    check_layers_rise_and_keep_their_outer_wall(gcode);
+
+    // The color sub-layers already split the layer, so the outer wall is not split again - and the user
+    // is told why their sub-layer setting has no effect there.
+    Print print;
+    Model model;
+    init_print({cube(20)}, print, model, mixed_sublayered_config(true));
+    std::vector<StringObjectException> warnings;
+    print.validate(&warnings);
+    CHECK(std::any_of(warnings.begin(), warnings.end(), [](const StringObjectException &w) {
+        return w.opt_key == "wall_sublayer_height" && w.string.find("mixed") != std::string::npos;
+    }));
+}

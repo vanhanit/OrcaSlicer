@@ -28,32 +28,6 @@ using namespace Slic3r::Test;
 
 namespace {
 
-// Two physical filaments plus one mixed slot (config index 2, 1-based id 3) blending them 60/40.
-// The mixed arrays are parallel to filament_colour and must be sized to the filament count.
-// Note ConfigOptionBools deserializes on ',' while ConfigOptionStrings uses ';'.
-DynamicPrintConfig mixed_config(bool sublayer_on, const char *ratios = "0.6,0.4")
-{
-    DynamicPrintConfig config = multifilament_config(3);
-    config.set_deserialize_strict({
-        {"filament_is_mixed",               "0,0,1"},
-        {"filament_mixed_components",       ";;1,2"},
-        {"filament_mixed_sublayer_ratios",  std::string(";;") + ratios},
-        {"filament_mixed_gradient",         "0,0,0"},
-        {"filament_mixed_gradient_range",   ";;"},
-        {"filament_mixed_gradient_curve",   ";;"},
-        {"filament_mixed_gradient_per_part","0,0,0"},
-        {"enable_mixed_color_sublayer",     sublayer_on ? "1" : "0"},
-        // Assign every region role to the mixed slot so it actually participates in slicing.
-        {"outer_wall_filament_id",          "3"},
-        {"inner_wall_filament_id",          "3"},
-        {"sparse_infill_filament_id",       "3"},
-        {"internal_solid_filament_id",      "3"},
-        {"top_surface_filament_id",         "3"},
-        {"bottom_surface_filament_id",      "3"},
-    });
-    return config;
-}
-
 // Total sub-layer groups and per-layer mixed-filament resolutions across the whole tool ordering.
 void count_mixed(ToolOrdering &to, size_t &groups, size_t &resolutions)
 {
