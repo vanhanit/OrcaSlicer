@@ -1713,9 +1713,13 @@ void PrintObject::slice_wall_sublayers()
 
     // The first layer is bonded to the bed or the raft and its height is dictated by adhesion, so it
     // is never subdivided. Raft layers are support layers and never appear in m_layers.
+    // Nor are the layers elephant foot compensation shrinks: slice_volumes() applies it to the layer
+    // slices only, so sub-slices taken straight from the model would print the outer wall outside them.
+    const bool   elephant_foot  = m_config.raft_layers == 0 && m_config.elefant_foot_compensation.value > 0.;
+    const size_t first_layer    = std::max<size_t>(1, elephant_foot ? size_t(std::max(0, m_config.elefant_foot_compensation_layers.value)) : 0);
     std::vector<int> sublayer_counts(m_layers.size(), 1);
     bool             any_subdivided = false;
-    for (size_t layer_idx = 1; layer_idx < m_layers.size(); ++ layer_idx) {
+    for (size_t layer_idx = first_layer; layer_idx < m_layers.size(); ++ layer_idx) {
         const Layer *layer = m_layers[layer_idx];
         int          count = 1;
         for (const LayerRegion *layerm : layer->regions())
@@ -1765,8 +1769,8 @@ void PrintObject::slice_wall_sublayers()
                           std::move(volume_slices), PrintObject::clip_multipart_objects, throw_on_cancel);
     m_print->throw_if_canceled();
 
-    // Same XY compensation the layer slices get. Only the negative part is applied here, matching
-    // slice_volumes(); the positive part is already baked into the slicing offsets.
+    // Same XY hole and contour compensation the layer slices get in slice_volumes(), growing then
+    // shrinking.
     const size_t num_extruders     = print->config().filament_diameter.size();
     const auto   xy_hole_scaled    = (num_extruders > 1 && this->is_mm_painted()) ? 0. : (double) scaled<float>(m_config.xy_hole_compensation.value);
     const auto   xy_contour_scaled = (num_extruders > 1 && this->is_mm_painted()) ? 0. : (double) scaled<float>(m_config.xy_contour_compensation.value);

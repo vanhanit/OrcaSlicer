@@ -218,7 +218,8 @@ bool Layer::is_perimeter_compatible(const Print& print, const PrintRegion& a, co
         && config.opt_serialize("wall_sublayer_height") == other_config.opt_serialize("wall_sublayer_height")
         && config.wall_sublayer_loops     == other_config.wall_sublayer_loops
         && config.opt_serialize("wall_sublayer_line_width") == other_config.opt_serialize("wall_sublayer_line_width")
-        && config.wall_sublayer_fill_pattern == other_config.wall_sublayer_fill_pattern;
+        && config.wall_sublayer_fill_pattern == other_config.wall_sublayer_fill_pattern
+        && config.wall_sublayer_speed     == other_config.wall_sublayer_speed;
 }
 
 // Here the perimeters are created cummulatively for all layer regions sharing the same parameters influencing the perimeters.
