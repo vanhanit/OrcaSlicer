@@ -368,7 +368,15 @@ WallSublayerContext wall_sublayer_prepare(const LayerRegion &layerm, const Layer
 
     if (num_passes == 0 || spiral_mode)
         return ctx;
+    // The layer is split as soon as any region of the object asks for it. A region that does not ask -
+    // the object around a modifier that does - keeps its walls at the full layer height.
+    if (wall_sublayer_count(region_config, layer->height) < 2)
+        return ctx;
     ctx.band_walls = std::clamp(region_config.wall_sublayer_loops.value, 0, region_config.wall_loops.value);
+    // The passes print with the outer wall filament. With a separate inner wall filament only the outer
+    // wall goes to them, and the inner walls stay in the layer's own run with their own filament.
+    if (region_config.inner_wall_filament_id.value != region_config.outer_wall_filament_id.value)
+        ctx.band_walls = std::min(ctx.band_walls, 1);
     if (ctx.band_walls == 0)
         return ctx;
     // The layer's own run drops band_walls of its own loops at the region's full width, so the band has

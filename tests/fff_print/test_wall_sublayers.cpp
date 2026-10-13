@@ -7,15 +7,18 @@
 #include "libslic3r/MeshBoolean.hpp"
 #include "libslic3r/Layer.hpp"
 #include "libslic3r/Print.hpp"
+#include "libslic3r/TriangleSelector.hpp"
 #include "libslic3r/GCode/GCodeProcessor.hpp"
 
 #include "test_helpers.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <functional>
 #include <map>
 #include <set>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -73,14 +76,19 @@ std::map<double, double> min_x_by_z(const std::string &gcode)
 
 
 // Calls `visit` with the reader positioned at the start of every extruding XY move printed under the
-// given ;TYPE: tag, and `on_layer`, when given, at every layer change tag.
+// given ;TYPE: tag, and with the tool printing it, and `on_layer`, when given, at every layer change tag.
 void for_each_move_of_type(const std::string &gcode, const std::string &type,
-                           const std::function<void(const GCodeReader &)> &visit,
+                           const std::function<void(const GCodeReader &, int)> &visit,
                            const std::function<void()> &on_layer = {})
 {
     std::string current;
+    int         tool = 0;
     GCodeReader reader;
     reader.parse_buffer(gcode, [&](GCodeReader &self, const GCodeReader::GCodeLine &line) {
+        if (const std::string_view cmd = line.cmd(); cmd.size() > 1 && cmd[0] == 'T' && std::isdigit(static_cast<unsigned char>(cmd[1]))) {
+            tool = std::stoi(std::string(cmd.substr(1)));
+            return;
+        }
         const std::string_view comment = line.comment();
         if (on_layer && comment.find("LAYER_CHANGE") != std::string_view::npos) {
             on_layer();
@@ -91,7 +99,7 @@ void for_each_move_of_type(const std::string &gcode, const std::string &type,
             return;
         }
         if (current == type && line.extruding(self) && line.dist_XY(self) > 0)
-            visit(self);
+            visit(self, tool);
     });
 }
 
@@ -99,7 +107,7 @@ void for_each_move_of_type(const std::string &gcode, const std::string &type,
 std::set<double> zs_of_type(const std::string &gcode, const std::string &type)
 {
     std::set<double> zs;
-    for_each_move_of_type(gcode, type, [&zs](const GCodeReader &self) { zs.insert(self.z()); });
+    for_each_move_of_type(gcode, type, [&zs](const GCodeReader &self, int) { zs.insert(self.z()); });
     return zs;
 }
 
@@ -110,7 +118,7 @@ std::vector<std::map<double, double>> slowest_feedrate_of_type_per_layer_z(const
     std::vector<std::map<double, double>> layers;
     for_each_move_of_type(
         gcode, type,
-        [&layers](const GCodeReader &self) {
+        [&layers](const GCodeReader &self, int) {
             if (layers.empty())
                 return;
             auto [it, inserted] = layers.back().emplace(self.z(), self.f());
@@ -125,7 +133,7 @@ std::vector<std::map<double, double>> slowest_feedrate_of_type_per_layer_z(const
 std::map<double, BoundingBoxf> bbox_of_type_by_z(const std::string &gcode, const std::string &type)
 {
     std::map<double, BoundingBoxf> boxes;
-    for_each_move_of_type(gcode, type, [&boxes](const GCodeReader &self) { boxes[self.z()].merge(Vec2d(self.x(), self.y())); });
+    for_each_move_of_type(gcode, type, [&boxes](const GCodeReader &self, int) { boxes[self.z()].merge(Vec2d(self.x(), self.y())); });
     return boxes;
 }
 
@@ -1788,3 +1796,401 @@ TEST_CASE("A sub-layered pass does not ring a cavity that is closing over", "[Wa
 
 
 
+// -----------------------------------------------------------------------------------------------
+// Sub-layered walls together with other features: modifiers, layer ranges, negative volumes,
+// painting, wall filaments, seams, z-hop and sequential printing.
+
+namespace {
+
+struct ExtraVolume
+{
+    TriangleMesh                                mesh;
+    ModelVolumeType                             type;
+    std::vector<ConfigBase::SetDeserializeItem> config;
+};
+
+// One object made of `base` plus further volumes with settings of their own. `prepare` runs on the
+// object before it is applied, to paint it or to give it layer ranges.
+void init_object(Print &print, Model &model, const DynamicPrintConfig &config, TriangleMesh base,
+                 std::vector<ExtraVolume> extra = {}, const std::function<void(ModelObject &)> &prepare = {})
+{
+    DynamicPrintConfig full = DynamicPrintConfig::full_print_config();
+    full.apply(config);
+    full.set_key_value("gcode_comments", new ConfigOptionBool(true));
+    ModelObject *object = model.add_object();
+    object->name = "object.stl";
+    object->add_volume(std::move(base));
+    for (ExtraVolume &v : extra) {
+        ModelVolume       *volume = object->add_volume(std::move(v.mesh), v.type);
+        DynamicPrintConfig overrides;
+        for (const ConfigBase::SetDeserializeItem &item : v.config)
+            overrides.set_deserialize_strict(item.opt_key, item.opt_value);
+        volume->config.apply(overrides);
+    }
+    object->add_instance();
+    if (prepare)
+        prepare(*object);
+    object->ensure_on_bed();
+    print.auto_assign_extruders(object);
+    print.apply(model, full);
+    print.set_status_silent();
+}
+
+// 0.2mm layers with z_hop and the skirt off, so a recorded Z is always a printing Z.
+DynamicPrintConfig plain_config(std::initializer_list<ConfigBase::SetDeserializeItem> extra = {})
+{
+    DynamicPrintConfig config;
+    config.set_deserialize_strict({{"layer_height", "0.2"},
+                                   {"initial_layer_print_height", "0.2"},
+                                   {"wall_loops", "3"},
+                                   {"z_hop", "0"},
+                                   {"skirt_loops", "0"}});
+    config.set_deserialize_strict(extra);
+    return config;
+}
+
+// Whether z is the print_z of a layer of the given height, rather than a pass below it.
+bool on_layer_top(double z, double layer_height)
+{
+    const double steps = z / layer_height;
+    return std::abs(steps - std::round(steps)) < 1e-3;
+}
+
+// Paint the facets of the volume's mesh lying in its +X face with `state`, or every facet with
+// `whole` set.
+void paint(ModelVolume &volume, FacetsAnnotation &annotation, EnforcerBlockerType state, bool whole)
+{
+    const indexed_triangle_set &its   = volume.mesh().its;
+    const float                 max_x = volume.mesh().bounding_box().max.x();
+    TriangleSelector            selector(volume.mesh());
+    for (int i = 0; i < int(its.indices.size()); ++ i) {
+        bool on_face = true;
+        for (int k = 0; k < 3; ++ k)
+            on_face = on_face && its.vertices[its.indices[i][k]].x() > max_x - 1e-3f;
+        if (whole || on_face)
+            selector.set_facet(i, state);
+    }
+    annotation.set(selector);
+}
+
+} // namespace
+
+TEST_CASE("A modifier that sub-layers part of an object leaves the rest of the object alone", "[WallSublayers]")
+{
+    // The object asks for no sub-layers. A modifier over its left 4mm splits its 0.2mm layers by 0.05mm
+    // into 4 passes there. Only walls inside the modifier may print at a pass height.
+    TriangleMesh modifier = make_cube(6., 24., 6.);
+    modifier.translate(-2., -2., -1.);
+    Print print;
+    Model model;
+    init_object(print, model, plain_config(), make_cube(20., 20., 4.),
+                {{std::move(modifier), ModelVolumeType::PARAMETER_MODIFIER, {{"wall_sublayer_height", "0.05"}}}});
+    const std::string gcode = Slic3r::Test::gcode(print);
+    REQUIRE(! gcode.empty());
+
+    BoundingBoxf object_box;
+    double       pass_max_x = -1e10;
+    size_t       pass_moves = 0;
+    for_each_move_of_type(gcode, "Outer wall", [&](const GCodeReader &self, int) {
+        object_box.merge(Vec2d(self.x(), self.y()));
+        if (! on_layer_top(self.z(), 0.2)) {
+            pass_max_x = std::max(pass_max_x, double(self.x()));
+            ++ pass_moves;
+        }
+    });
+    // The modifier's own walls are sub-layered.
+    REQUIRE(pass_moves > 0);
+    INFO("object spans x " << object_box.min.x() << " .. " << object_box.max.x() << ", passes reach x " << pass_max_x);
+    CHECK(pass_max_x < object_box.min.x() + 4. + 1.);
+}
+
+TEST_CASE("A region asking for coarser sub-layers than another on the same layer is warned", "[WallSublayers]")
+{
+    // A layer carries one set of passes. Where the object splits its 0.2mm layers by 0.05mm into 4 and a
+    // modifier over its left 4mm asks for 0.1mm, so 2, the modifier is printed in 4 as well - and the
+    // user has to be told, not left to find out from the preview.
+    const auto slice_warnings = [](const char *modifier_height) {
+        TriangleMesh modifier = make_cube(6., 24., 6.);
+        modifier.translate(-2., -2., -1.);
+        Print print;
+        Model model;
+        init_object(print, model, plain_config({{"wall_sublayer_height", "0.05"}}), make_cube(20., 20., 4.),
+                    {{std::move(modifier), ModelVolumeType::PARAMETER_MODIFIER, {{"wall_sublayer_height", modifier_height}}}});
+        print.process();
+        std::vector<std::string> messages;
+        for (const PrintStateBase::Warning &warning : print.objects().front()->step_state_with_warnings(posPerimeters).warnings)
+            messages.emplace_back(warning.message);
+        return messages;
+    };
+    const auto mentions_sublayers = [](const std::vector<std::string> &messages) {
+        return std::any_of(messages.begin(), messages.end(), [](const std::string &m) { return m.find("sub-layer") != std::string::npos; });
+    };
+    // 0.025mm splits the layer into 8: finer than the object's 4, and still not what the object asks.
+    CHECK(mentions_sublayers(slice_warnings("0.1")));
+    CHECK(mentions_sublayers(slice_warnings("0.025")));
+    // Asking for the same split as the object is no conflict.
+    CHECK(! mentions_sublayers(slice_warnings("0.05")));
+}
+
+TEST_CASE("Sub-layered walls follow a layer range whose boundary falls inside a layer", "[WallSublayers]")
+{
+    // Two layer ranges differing only in infill density, split at 2.1mm - the middle of the 2.0 .. 2.2
+    // layer. Every pass of every layer above the first still prints the whole 20mm outline.
+    const DynamicPrintConfig config = plain_config({{"wall_sublayer_height", "0.05"}});
+    Print print;
+    Model model;
+    init_object(print, model, config, make_cube(20., 20., 4.), {}, [](ModelObject &object) {
+        for (const auto &[range, density] : {std::pair{t_layer_height_range{0., 2.1}, "15%"}, std::pair{t_layer_height_range{2.1, 4.}, "40%"}}) {
+            DynamicPrintConfig range_config;
+            range_config.set_deserialize_strict({{"layer_height", "0.2"}, {"sparse_infill_density", density}});
+            object.layer_config_ranges[range].assign_config(std::move(range_config));
+        }
+    });
+    const std::string gcode = Slic3r::Test::gcode(print);
+    REQUIRE(! gcode.empty());
+
+    const auto layers = extruding_zs_per_layer(gcode);
+    REQUIRE(layers.size() > 10);
+    for (size_t i = 1; i < layers.size(); ++ i) {
+        std::ostringstream zs;
+        for (const double z : distinct_sorted(layers[i]))
+            zs << z << " ";
+        INFO("layer " << i << " prints at z " << zs.str());
+        CHECK(distinct_sorted(layers[i]).size() == 4);
+    }
+    for (const auto &[z, box] : bbox_of_type_by_z(gcode, "Outer wall")) {
+        INFO("outer wall at z " << z);
+        CHECK(box.size().x() > 19.);
+    }
+}
+
+TEST_CASE("Sub-layered walls do not print inside a negative volume", "[WallSublayers]")
+{
+    // A 6mm square shaft cut through the middle of the 20mm block by a negative volume.
+    TriangleMesh shaft = make_cube(6., 6., 6.);
+    shaft.translate(7., 7., -1.);
+    Print print;
+    Model model;
+    init_object(print, model, plain_config({{"wall_sublayer_height", "0.05"}}), make_cube(20., 20., 4.),
+                {{std::move(shaft), ModelVolumeType::NEGATIVE_VOLUME, {}}});
+    const std::string gcode = Slic3r::Test::gcode(print);
+    REQUIRE(! gcode.empty());
+
+    BoundingBoxf object_box;
+    for_each_move_of_type(gcode, "Outer wall", [&](const GCodeReader &self, int) { object_box.merge(Vec2d(self.x(), self.y())); });
+    // The shaft, 1mm in from its sides: no line of any kind runs there.
+    const BoundingBoxf inside(object_box.min + Vec2d(8., 8.), object_box.min + Vec2d(12., 12.));
+    size_t pass_moves = 0, inside_moves = 0;
+    for (const char *type : {"Outer wall", "Inner wall", "Gap infill", "Internal solid infill", "Sparse infill"})
+        for_each_move_of_type(gcode, type, [&](const GCodeReader &self, int) {
+            if (! on_layer_top(self.z(), 0.2))
+                ++ pass_moves;
+            if (inside.contains(Vec2d(self.x(), self.y())))
+                ++ inside_moves;
+        });
+    REQUIRE(pass_moves > 0);
+    CHECK(inside_moves == 0);
+}
+
+TEST_CASE("Painted fuzzy skin reaches the sub-layered outer wall", "[WallSublayers]")
+{
+    // The +X face of the block is painted fuzzy. Fuzzy skin breaks that face's outer wall into a line
+    // per fuzzy_skin_point_distance, so painted, a pass's outer wall takes many more moves.
+    const auto pass_moves = [](const char *sublayer_height, bool painted, bool at_pass_heights) {
+        Print print;
+        Model model;
+        // fuzzy_skin none is "Painted only"; the default disables painting as well.
+        init_object(print, model, plain_config({{"wall_sublayer_height", sublayer_height}, {"fuzzy_skin", "none"}}), make_cube(20., 20., 4.), {},
+                    [painted](ModelObject &object) {
+                        if (painted)
+                            paint(*object.volumes.front(), object.volumes.front()->fuzzy_skin_facets, EnforcerBlockerType::FUZZY_SKIN, false);
+                    });
+        size_t moves = 0;
+        for_each_move_of_type(Slic3r::Test::gcode(print), "Outer wall", [&](const GCodeReader &self, int) {
+            if (self.z() > 0.2 + EPSILON && on_layer_top(self.z(), 0.2) != at_pass_heights)
+                ++ moves;
+        });
+        return moves;
+    };
+    // The painting itself works: without sub-layers it multiplies the outer wall's moves.
+    const size_t plain_off = pass_moves("0", false, false), painted_off = pass_moves("0", true, false);
+    INFO("full-height outer wall moves: " << plain_off << " plain, " << painted_off << " painted");
+    REQUIRE(painted_off > 2 * plain_off);
+
+    const size_t plain_on = pass_moves("0.05", false, true), painted_on = pass_moves("0.05", true, true);
+    INFO("pass outer wall moves: " << plain_on << " plain, " << painted_on << " painted");
+    REQUIRE(plain_on > 0);
+    CHECK(painted_on > 2 * plain_on);
+}
+
+TEST_CASE("Colour painting does not block sub-layered walls on a single-filament printer", "[WallSublayers]")
+{
+    // With one filament the colour painting is never applied - slicing skips the segmentation - so
+    // there is nothing for sub-layered walls to conflict with.
+    Print print;
+    Model model;
+    init_object(print, model, plain_config({{"wall_sublayer_height", "0.05"}, {"layer_change_gcode", "G92 E0"}}), make_cube(20., 20., 4.), {},
+                [](ModelObject &object) {
+                    paint(*object.volumes.front(), object.volumes.front()->mmu_segmentation_facets, EnforcerBlockerType::Extruder2, true);
+                });
+    REQUIRE(print.config().filament_diameter.size() == 1);
+    REQUIRE(model.objects.front()->is_mm_painted());
+    const StringObjectException error = print.validate();
+    INFO("validate: " << error.string);
+    CHECK(error.string.empty());
+}
+
+TEST_CASE("Colour painting is rejected with sub-layered walls on a multi-filament printer", "[WallSublayers]")
+{
+    // The sub-slices bypass the colour segmentation, so the painted colours would be lost.
+    Print print;
+    Model model;
+    init_object(print, model, multifilament_config(2, {{"layer_height", "0.2"}, {"layer_change_gcode", "G92 E0"}, {"wall_sublayer_height", "0.05"}}),
+                make_cube(20., 20., 4.), {}, [](ModelObject &object) {
+                    paint(*object.volumes.front(), object.volumes.front()->mmu_segmentation_facets, EnforcerBlockerType::Extruder2, true);
+                });
+    const StringObjectException error = print.validate();
+    INFO("validate: " << error.string);
+    CHECK(error.string.find("multi-material painting") != std::string::npos);
+}
+
+TEST_CASE("Sub-layered walls keep Z rising within a layer when the walls use two filaments", "[WallSublayers]")
+{
+    // Outer walls with filament 2, everything else with filament 1. Whichever filament prints first in a
+    // layer, nothing printed after it may come down below the layer's print_z it already reached.
+    const auto loops = GENERATE("1", "2");
+    const std::string gcode = slice({cube(20)}, multifilament_config(2, {{"layer_height", "0.2"},
+                                                                          {"initial_layer_print_height", "0.2"},
+                                                                          {"wall_loops", "3"},
+                                                                          {"z_hop", "0"},
+                                                                          {"skirt_loops", "0"},
+                                                                          {"enable_prime_tower", "0"},
+                                                                          {"outer_wall_filament_id", "2"},
+                                                                          {"inner_wall_filament_id", "1"},
+                                                                          {"sparse_infill_filament_id", "1"},
+                                                                          {"solid_infill_filament_id", "1"},
+                                                                          {"wall_sublayer_height", "0.05"},
+                                                                          {"wall_sublayer_loops", loops}}));
+    REQUIRE(! gcode.empty());
+
+    const auto layers = extruding_zs_per_layer(gcode);
+    REQUIRE(layers.size() > 2);
+    for (size_t i = 0; i < layers.size(); ++ i)
+        for (size_t k = 1; k < layers[i].size(); ++ k) {
+            INFO("wall_sublayer_loops " << loops << ", layer " << i << " step " << k << ": " << layers[i][k - 1] << " -> " << layers[i][k]);
+            REQUIRE(layers[i][k] >= layers[i][k - 1] - EPSILON);
+        }
+}
+
+TEST_CASE("Inner walls keep the inner wall filament when the outer walls are sub-layered", "[WallSublayers]")
+{
+    // wall_sublayer_loops 2 asks the passes to take the first inner wall too. The passes print with the
+    // outer wall filament (tool 1), so with a separate inner wall filament (tool 0) that inner wall has
+    // to stay out of them: every inner wall prints with tool 0, every pass's outer wall with tool 1.
+    const std::string gcode = slice({cube(20)}, multifilament_config(2, {{"layer_height", "0.2"},
+                                                                          {"initial_layer_print_height", "0.2"},
+                                                                          {"wall_loops", "3"},
+                                                                          {"z_hop", "0"},
+                                                                          {"skirt_loops", "0"},
+                                                                          {"enable_prime_tower", "0"},
+                                                                          {"outer_wall_filament_id", "2"},
+                                                                          {"inner_wall_filament_id", "1"},
+                                                                          {"sparse_infill_filament_id", "1"},
+                                                                          {"solid_infill_filament_id", "1"},
+                                                                          {"wall_sublayer_height", "0.05"},
+                                                                          {"wall_sublayer_loops", "2"}}));
+    REQUIRE(! gcode.empty());
+
+    std::set<int> inner_tools, pass_outer_tools;
+    for_each_move_of_type(gcode, "Inner wall", [&](const GCodeReader &, int tool) { inner_tools.insert(tool); });
+    for_each_move_of_type(gcode, "Outer wall", [&](const GCodeReader &self, int tool) {
+        if (! on_layer_top(self.z(), 0.2))
+            pass_outer_tools.insert(tool);
+    });
+    REQUIRE(! pass_outer_tools.empty());
+    CHECK(pass_outer_tools == std::set<int>{1});
+    CHECK(inner_tools == std::set<int>{0});
+}
+
+TEST_CASE("One object's sub-layered walls in two filaments are rejected", "[WallSublayers]")
+{
+    // Two touching parts of one object, their outer walls in filaments 1 and 2, both sub-layered.
+    // Whichever filament goes second would bring its passes down beside the first part's walls, already
+    // printed a full layer high, so this cannot be printed safely.
+    TriangleMesh second = make_cube(20., 20., 4.);
+    second.translate(20., 0., 0.);
+    Print print;
+    Model model;
+    init_object(print, model, multifilament_config(2, {{"layer_height", "0.2"}, {"layer_change_gcode", "G92 E0"}, {"wall_sublayer_height", "0.05"}}),
+                make_cube(20., 20., 4.), {{std::move(second), ModelVolumeType::MODEL_PART, {{"outer_wall_filament_id", "2"}}}});
+    REQUIRE(model.objects.front()->volumes.size() == 2);
+    const StringObjectException error = print.validate();
+    INFO("validate: " << error.string);
+    CHECK(error.string.find("Sub-layered") != std::string::npos);
+}
+
+TEST_CASE("Every sub-layered pass puts its seam where seam_position asks", "[WallSublayers]")
+{
+    // seam_position back: every outer wall loop, pass or not, starts on the back (+Y) face of the block.
+    const std::string gcode = slice({cube(20)}, plain_config({{"wall_sublayer_height", "0.05"}, {"seam_position", "back"}}));
+    REQUIRE(! gcode.empty());
+
+    const std::map<double, BoundingBoxf> boxes = bbox_of_type_by_z(gcode, "Outer wall");
+    std::vector<std::pair<double, double>> starts; // (z, y) where an outer wall run begins
+    bool                                   in_outer = false;
+    GCodeReader                            reader;
+    reader.parse_buffer(gcode, [&](GCodeReader &self, const GCodeReader::GCodeLine &line) {
+        if (const size_t tag = line.comment().find("TYPE:"); tag != std::string_view::npos) {
+            in_outer = line.comment().substr(tag + 5) == "Outer wall";
+            if (in_outer)
+                starts.emplace_back(-1., 0.);
+            return;
+        }
+        if (in_outer && line.extruding(self) && line.dist_XY(self) > 0 && ! starts.empty() && starts.back().first < 0.)
+            starts.back() = {self.z(), self.y()};
+    });
+    size_t pass_starts = 0;
+    for (const auto &[z, y] : starts) {
+        if (z <= 0.2 + EPSILON || on_layer_top(z, 0.2))
+            continue;
+        ++ pass_starts;
+        INFO("outer wall pass at z " << z << " starts at y " << y << ", back face at y " << boxes.at(z).max.y());
+        CHECK(y > boxes.at(z).max.y() - 1.);
+    }
+    REQUIRE(pass_starts > 0);
+}
+
+TEST_CASE("Sub-layered walls extrude only at their pass heights with z-hop on", "[WallSublayers]")
+{
+    // z_hop lifts the nozzle for travel; every extrusion still lands at a pass height, 4 of them in a
+    // 0.2mm layer split by 0.05mm.
+    const std::string gcode = slice({cube(20)}, plain_config({{"wall_sublayer_height", "0.05"}, {"z_hop", "0.4"}}));
+    REQUIRE(! gcode.empty());
+    const auto layers = extruding_zs_per_layer(gcode);
+    REQUIRE(layers.size() > 2);
+    const std::vector<double> zs = distinct_sorted(layers[1]);
+    REQUIRE(zs.size() == 4);
+    for (int k = 0; k < 4; ++ k)
+        CHECK_THAT(zs[k], Catch::Matchers::WithinAbs(0.2 + 0.05 * (k + 1), 1e-6));
+}
+
+TEST_CASE("Sub-layered walls work when objects print one after another", "[WallSublayers]")
+{
+    // print_sequence by object: each 20mm cube prints all its 100 layers of 0.2mm before the other
+    // starts, and every layer but each object's first splits into 4 passes.
+    const std::string gcode = slice_two_cubes_apart(80., {{"layer_height", "0.2"},
+                                                          {"initial_layer_print_height", "0.2"},
+                                                          {"z_hop", "0"},
+                                                          {"skirt_loops", "0"},
+                                                          {"print_sequence", "by object"},
+                                                          {"wall_sublayer_height", "0.05"}});
+    REQUIRE(! gcode.empty());
+    size_t split = 0, whole = 0, other = 0;
+    for (const auto &layer : extruding_zs_per_layer(gcode)) {
+        const size_t n = distinct_sorted(layer).size();
+        (n == 4 ? split : n == 1 ? whole : other) += 1;
+    }
+    CHECK(split == 2 * 99);
+    CHECK(whole == 2);
+    CHECK(other == 0);
+}

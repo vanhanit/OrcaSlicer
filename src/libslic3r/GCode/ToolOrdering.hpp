@@ -237,6 +237,9 @@ public:
         std::map<VolumeKey, VolumeGradient> per_volume_gradient;
     };
     std::vector<MixedSubLayerGroup> mixed_sub_layer_groups;
+    // Orca: regions printing sub-layered walls on this layer. Their wall filament is put first in the
+    // layer, see ToolOrdering::put_sublayer_wall_extruders_first().
+    std::vector<const PrintRegion*> sublayer_wall_regions;
 
     const MixedSubLayerGroup* mixed_group_by_slot(unsigned int slot_id) const {
         for (const auto &g : mixed_sub_layer_groups)
@@ -381,6 +384,7 @@ private:
     void                reorder_extruders_for_minimum_flush_volume(bool reorder_first_layer);
     void                resolve_mixed_filaments(const PrintConfig &config);
     void                enforce_mixed_component_order();
+    void                put_sublayer_wall_extruders_first();
 
     // BBS
     std::vector<unsigned int> generate_first_layer_tool_order(const Print& print);

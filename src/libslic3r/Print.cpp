@@ -2207,6 +2207,7 @@ StringObjectException Print::validate(std::vector<StringObjectException> *warnin
     for (const PrintObject *object : m_objects) {
         const auto regions = object->all_regions();
         bool sublayered = false, overhangs_made_printable = false, zaa = false;
+        std::set<int> sublayer_filaments;
         for (const PrintRegion &region : regions) {
             const PrintRegionConfig &config = region.config();
             if (config.wall_sublayer_height.value <= 0. || config.wall_loops <= 0)
@@ -2214,15 +2215,23 @@ StringObjectException Print::validate(std::vector<StringObjectException> *warnin
             sublayered               = true;
             overhangs_made_printable |= config.make_overhang_printable.value;
             zaa                      |= config.zaa_enabled.value;
+            sublayer_filaments.insert(config.outer_wall_filament_id.value);
         }
         if (! sublayered)
             continue;
         if (m_config.spiral_mode)
             return {L("Sub-layered outer walls are not compatible with spiral vase mode."), object, "wall_sublayer_height"};
-        if (object->model_object()->is_mm_painted())
+        if (m_config.filament_diameter.size() > 1 && object->model_object()->is_mm_painted())
             // The sub-slices come straight from the model volumes, bypassing the multi-material
-            // segmentation the layer slices go through, so the painted colors would be lost.
+            // segmentation the layer slices go through, so the painted colors would be lost. With a
+            // single filament the slicer skips that segmentation too, and the painting has no effect.
             return {L("Sub-layered outer walls are not compatible with multi-material painting."), object, "wall_sublayer_height"};
+        if (sublayer_filaments.size() > 1)
+            // The passes of a layer go first, before anything is printed at its print_z (see
+            // ToolOrdering::put_sublayer_wall_extruders_first()). Only one filament can go first: the
+            // passes of a second one would come down beside walls the first has already printed a
+            // full layer high.
+            return {L("Sub-layered outer walls of one object have to be printed with a single filament."), object, "wall_sublayer_height"};
         if (overhangs_made_printable)
             warn(L("Sub-layered outer walls are sliced from the original model, so they do not follow the "
                    "shape produced by making overhangs printable."), "wall_sublayer_height", object);
