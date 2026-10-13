@@ -72,20 +72,34 @@ std::map<double, double> min_x_by_z(const std::string &gcode)
 }
 
 
+// Calls `visit` with the reader positioned at the start of every extruding XY move printed under the
+// given ;TYPE: tag, and `on_layer`, when given, at every layer change tag.
+void for_each_move_of_type(const std::string &gcode, const std::string &type,
+                           const std::function<void(const GCodeReader &)> &visit,
+                           const std::function<void()> &on_layer = {})
+{
+    std::string current;
+    GCodeReader reader;
+    reader.parse_buffer(gcode, [&](GCodeReader &self, const GCodeReader::GCodeLine &line) {
+        const std::string_view comment = line.comment();
+        if (on_layer && comment.find("LAYER_CHANGE") != std::string_view::npos) {
+            on_layer();
+            return;
+        }
+        if (const size_t tag = comment.find("TYPE:"); tag != std::string_view::npos) {
+            current = std::string(comment.substr(tag + 5));
+            return;
+        }
+        if (current == type && line.extruding(self) && line.dist_XY(self) > 0)
+            visit(self);
+    });
+}
+
 // Distinct Z heights at which something is extruded under the given ;TYPE: tag.
 std::set<double> zs_of_type(const std::string &gcode, const std::string &type)
 {
     std::set<double> zs;
-    std::string      current;
-    GCodeReader      reader;
-    reader.parse_buffer(gcode, [&](GCodeReader &self, const GCodeReader::GCodeLine &line) {
-        const std::string_view comment = line.comment();
-        const size_t           tag = comment.find("TYPE:");
-        if (tag != std::string_view::npos)
-            current = std::string(comment.substr(tag + 5));
-        else if (current == type && line.extruding(self) && line.dist_XY(self) > 0)
-            zs.insert(self.z());
-    });
+    for_each_move_of_type(gcode, type, [&zs](const GCodeReader &self) { zs.insert(self.z()); });
     return zs;
 }
 
@@ -94,25 +108,16 @@ std::set<double> zs_of_type(const std::string &gcode, const std::string &type)
 std::vector<std::map<double, double>> slowest_feedrate_of_type_per_layer_z(const std::string &gcode, const std::string &type)
 {
     std::vector<std::map<double, double>> layers;
-    std::string                           current;
-    GCodeReader                           reader;
-    reader.parse_buffer(gcode, [&](GCodeReader &self, const GCodeReader::GCodeLine &line) {
-        const std::string_view comment = line.comment();
-        if (comment.find("LAYER_CHANGE") != std::string_view::npos) {
-            layers.emplace_back();
-            return;
-        }
-        const size_t tag = comment.find("TYPE:");
-        if (tag != std::string_view::npos) {
-            current = std::string(comment.substr(tag + 5));
-            return;
-        }
-        if (layers.empty() || current != type || ! line.extruding(self) || line.dist_XY(self) <= 0)
-            return;
-        auto [it, inserted] = layers.back().emplace(self.z(), self.f());
-        if (! inserted)
-            it->second = std::min(it->second, double(self.f()));
-    });
+    for_each_move_of_type(
+        gcode, type,
+        [&layers](const GCodeReader &self) {
+            if (layers.empty())
+                return;
+            auto [it, inserted] = layers.back().emplace(self.z(), self.f());
+            if (! inserted)
+                it->second = std::min(it->second, double(self.f()));
+        },
+        [&layers]() { layers.emplace_back(); });
     return layers;
 }
 
@@ -120,19 +125,7 @@ std::vector<std::map<double, double>> slowest_feedrate_of_type_per_layer_z(const
 std::map<double, BoundingBoxf> bbox_of_type_by_z(const std::string &gcode, const std::string &type)
 {
     std::map<double, BoundingBoxf> boxes;
-    std::string                    current;
-    GCodeReader                    reader;
-    reader.parse_buffer(gcode, [&](GCodeReader &self, const GCodeReader::GCodeLine &line) {
-        const std::string_view comment = line.comment();
-        const size_t           tag = comment.find("TYPE:");
-        if (tag != std::string_view::npos) {
-            current = std::string(comment.substr(tag + 5));
-            return;
-        }
-        if (current != type || ! line.extruding(self) || line.dist_XY(self) <= 0)
-            return;
-        boxes[self.z()].merge(Vec2d(self.x(), self.y()));
-    });
+    for_each_move_of_type(gcode, type, [&boxes](const GCodeReader &self) { boxes[self.z()].merge(Vec2d(self.x(), self.y())); });
     return boxes;
 }
 
@@ -213,6 +206,27 @@ TEST_CASE("Sub-layered walls print each layer at several ascending Z heights", "
     // The topmost pass lands exactly on the layer's own print_z, so the walls finish flush with the
     // inner walls and the infill printed there.
     REQUIRE_THAT(zs.back(), Catch::Matchers::WithinAbs(0.4, 1e-6));
+}
+
+TEST_CASE("Sub-layered walls leave the layers elephant foot compensation shrinks whole", "[WallSublayers]")
+{
+    // Elephant foot compensation shrinks the slices of the first elefant_foot_compensation_layers
+    // layers, and sub-slices taken from the model would not follow it. With 3 compensated layers those
+    // print at one Z each, and the fourth 0.2mm layer is split by 0.05mm into 4 passes.
+    DynamicPrintConfig config = base_config("0.05", "arachne");
+    config.set_deserialize_strict({{"raft_layers", "0"},
+                                   {"elefant_foot_compensation", "0.2"},
+                                   {"elefant_foot_compensation_layers", "3"}});
+    const std::string gcode = slice({cube(20)}, config);
+    REQUIRE(! gcode.empty());
+
+    const auto layers = extruding_zs_per_layer(gcode);
+    REQUIRE(layers.size() > 4);
+    for (size_t i = 0; i < 3; ++ i) {
+        INFO("layer " << i);
+        CHECK(distinct_sorted(layers[i]).size() == 1);
+    }
+    CHECK(distinct_sorted(layers[3]).size() == 4);
 }
 
 TEST_CASE("Sub-layered walls never move the nozzle back down within a layer", "[WallSublayers]")

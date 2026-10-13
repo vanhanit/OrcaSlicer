@@ -60,7 +60,6 @@ static Flow sublayer_flow(const LayerRegion &layerm, FlowRole role, coordf_t hei
     return width > 0. ? base.with_width(float(width)) : base;
 }
 
-
 int wall_sublayer_count(const PrintRegionConfig &config, coordf_t layer_height)
 {
     if (config.wall_loops <= 0 || layer_height <= 0.)
@@ -566,9 +565,8 @@ void wall_sublayer_generate(LayerRegion               &layerm,
         // Against what the pass below actually laid down, and never the model re-sliced at its
         // height. Over the ceiling of a cavity closing over, the two differ by the whole ceiling: no
         // pass covers it, the layer's own run does at print_z after every pass has gone. Judged
-        // against the model a wall out over that ceiling reads as carried, so neither the overhang
-        // classifier nor bridge_unsupported_wall touches it, and it is drawn in mid air with an
-        // ordinary wall's role, flow and speed.
+        // against the model a wall out over that ceiling reads as carried, so the overhang classifier
+        // never touches it, and it is drawn in mid air with an ordinary wall's role, flow and speed.
         bg.lower_slices = &support;
         if (layer->upper_layer != nullptr) {
             bg.upper_slices             = &layer->upper_layer->lslices;
