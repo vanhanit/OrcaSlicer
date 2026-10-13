@@ -448,6 +448,7 @@ void ToolOrdering::sort_and_build_data(const Print& print, unsigned int first_ex
     this->resolve_mixed_filaments(print.config());
     reorder_extruders_for_minimum_flush_volume(reorder_first_layer);
     this->enforce_mixed_component_order();
+    this->put_sublayer_wall_extruders_first();
     m_sorted = true;
 
     double max_layer_height = 0.;
@@ -470,6 +471,7 @@ void ToolOrdering::sort_and_build_data(const Print& print, unsigned int first_ex
         // Orca reorders a second time here (BBS has no such path); re-enforce so the
         // mixed sub-layer component order survives the extra pass.
         this->enforce_mixed_component_order();
+        this->put_sublayer_wall_extruders_first();
         this->fill_wipe_tower_partitions(print.config(), object_bottom_z, max_layer_height);
     }
 
@@ -484,6 +486,7 @@ void ToolOrdering::sort_and_build_data(const PrintObject& object , unsigned int 
     this->resolve_mixed_filaments(object.print()->config());
     reorder_extruders_for_minimum_flush_volume(reorder_first_layer);
     this->enforce_mixed_component_order();
+    this->put_sublayer_wall_extruders_first();
     m_sorted = true;
 
     double max_layer_height = calc_max_layer_height(object.print()->config(), object.config().layer_height);
@@ -494,6 +497,7 @@ void ToolOrdering::sort_and_build_data(const PrintObject& object , unsigned int 
         // Orca reorders a second time here (BBS has no such path); re-enforce so the
         // mixed sub-layer component order survives the extra pass.
         this->enforce_mixed_component_order();
+        this->put_sublayer_wall_extruders_first();
         this->fill_wipe_tower_partitions(object.print()->config(), object.layers().front()->print_z - object.layers().front()->height, max_layer_height);
     }
 
@@ -858,6 +862,8 @@ void ToolOrdering::collect_extruders(const PrintObject &object, const std::vecto
                     if (has_sublayer_walls)
                         something_nonoverriddable = true;
                 }
+                if (has_sublayer_walls)
+                    layer_tools.sublayer_wall_regions.emplace_back(&region);
 
                 if (something_nonoverriddable){
                		layer_tools.extruders.emplace_back((extruder_override == 0) ? region.config().outer_wall_filament_id.value : extruder_override);
@@ -2862,6 +2868,25 @@ std::vector<unsigned int> parse_cyclic_order(const std::string& str, unsigned in
         }
     }
     return order;
+}
+
+// Orca: sub-layered walls print below the layer's print_z. Whatever else the layer prints with another
+// filament stands a full layer high once it is down, so a filament coming after it would bring its passes
+// down right beside it. The filaments printing sub-layered walls therefore go first in their layers;
+// Print::validate() makes sure an object has only one of them. Mixed filament component order, where a
+// layer has it, takes precedence.
+void ToolOrdering::put_sublayer_wall_extruders_first()
+{
+    for (LayerTools &lt : m_layer_tools) {
+        if (lt.sublayer_wall_regions.empty() || ! lt.mixed_sub_layer_groups.empty())
+            continue;
+        std::vector<unsigned int> first;
+        for (const PrintRegion *region : lt.sublayer_wall_regions)
+            first.emplace_back(lt.wall_extruder_id(*region));
+        std::stable_partition(lt.extruders.begin(), lt.extruders.end(), [&first](unsigned int extruder) {
+            return std::find(first.begin(), first.end(), extruder) != first.end();
+        });
+    }
 }
 
 void ToolOrdering::reorder_extruders_for_minimum_flush_volume(bool reorder_first_layer)

@@ -308,7 +308,9 @@ static std::vector<std::vector<ExPolygons>> slices_to_regions(
     const PrintConfig                                        &print_config,
     const PrintObject                                        &print_object,
     ModelVolumePtrs                                           model_volumes,
-    const PrintObjectRegions                                 &print_object_regions,
+    // PrintObjectRegions::all_regions.size(), and the layer ranges to distribute the slices over.
+    const size_t                                              num_regions,
+    const std::vector<PrintObjectRegions::LayerRangeRegions> &layer_ranges,
     const std::vector<float>                                 &zs,
     std::vector<VolumeSlices>                               &&volume_slices,
     // If clipping is disabled, then ExPolygons produced by different volumes will never be merged, thus they will be allowed to overlap.
@@ -318,13 +320,13 @@ static std::vector<std::vector<ExPolygons>> slices_to_regions(
 {
     model_volumes_sort_by_id(model_volumes);
 
-    std::vector<std::vector<ExPolygons>> slices_by_region(print_object_regions.all_regions.size(), std::vector<ExPolygons>(zs.size(), ExPolygons()));
+    std::vector<std::vector<ExPolygons>> slices_by_region(num_regions, std::vector<ExPolygons>(zs.size(), ExPolygons()));
 
     // First shuffle slices into regions if there is no overlap with another region possible, collect zs of the complex cases.
     std::vector<std::pair<size_t, float>> zs_complex;
     {
         size_t z_idx = 0;
-        for (const PrintObjectRegions::LayerRangeRegions &layer_range : print_object_regions.layer_ranges) {
+        for (const PrintObjectRegions::LayerRangeRegions &layer_range : layer_ranges) {
             for (; z_idx < zs.size() && zs[z_idx] < layer_range.layer_height_range.first; ++ z_idx) ;
             if (layer_range.volume_regions.empty()) {
             } else if (layer_range.volume_regions.size() == 1) {
@@ -406,19 +408,19 @@ static std::vector<std::vector<ExPolygons>> slices_to_regions(
 
     // Second perform region clipping and assignment in parallel.
     if (! zs_complex.empty()) {
-        std::vector<std::vector<VolumeSlices*>> layer_ranges_regions_to_slices(print_object_regions.layer_ranges.size(), std::vector<VolumeSlices*>());
-        for (const PrintObjectRegions::LayerRangeRegions &layer_range : print_object_regions.layer_ranges) {
-            std::vector<VolumeSlices*> &layer_range_regions_to_slices = layer_ranges_regions_to_slices[&layer_range - print_object_regions.layer_ranges.data()];
+        std::vector<std::vector<VolumeSlices*>> layer_ranges_regions_to_slices(layer_ranges.size(), std::vector<VolumeSlices*>());
+        for (const PrintObjectRegions::LayerRangeRegions &layer_range : layer_ranges) {
+            std::vector<VolumeSlices*> &layer_range_regions_to_slices = layer_ranges_regions_to_slices[&layer_range - layer_ranges.data()];
             layer_range_regions_to_slices.reserve(layer_range.volume_regions.size());
             for (const PrintObjectRegions::VolumeRegion &region : layer_range.volume_regions)
                 layer_range_regions_to_slices.push_back(&volume_slices_find_by_id(volume_slices, region.model_volume->id()));
         }
         tbb::parallel_for(
             tbb::blocked_range<size_t>(0, zs_complex.size()),
-            [&slices_by_region, &print_object_regions, &zs_complex, &layer_ranges_regions_to_slices, clip_multipart_objects, &throw_on_cancel_callback]
+            [&slices_by_region, &layer_ranges, &zs_complex, &layer_ranges_regions_to_slices, clip_multipart_objects, &throw_on_cancel_callback]
                 (const tbb::blocked_range<size_t> &range) {
                 float z              = zs_complex[range.begin()].second;
-                auto  it_layer_range = layer_range_first(print_object_regions.layer_ranges, z);
+                auto  it_layer_range = layer_range_first(layer_ranges, z);
                 // Per volume_regions slices at this Z height.
                 struct RegionSlice {
                     ExPolygons  expolygons;
@@ -465,10 +467,10 @@ static std::vector<std::vector<ExPolygons>> slices_to_regions(
                 std::vector<RegionSlice> temp_slices;
                 for (size_t zs_complex_idx = range.begin(); zs_complex_idx < range.end(); ++ zs_complex_idx) {
                     auto [z_idx, z] = zs_complex[zs_complex_idx];
-                    it_layer_range = layer_range_next(print_object_regions.layer_ranges, it_layer_range, z);
+                    it_layer_range = layer_range_next(layer_ranges, it_layer_range, z);
                     const PrintObjectRegions::LayerRangeRegions &layer_range = *it_layer_range;
                     {
-                        std::vector<VolumeSlices*> &layer_range_regions_to_slices = layer_ranges_regions_to_slices[it_layer_range - print_object_regions.layer_ranges.begin()];
+                        std::vector<VolumeSlices*> &layer_range_regions_to_slices = layer_ranges_regions_to_slices[it_layer_range - layer_ranges.begin()];
                         // Per volume_regions slices at thiz Z height.
                         temp_slices.clear();
                         temp_slices.reserve(layer_range.volume_regions.size());
@@ -1375,7 +1377,7 @@ void PrintObject::slice_volumes()
     firstLayerObjSliceByVolume = objSliceByVolume;
 
     std::vector<std::vector<ExPolygons>> region_slices =
-        slices_to_regions(print->config(), *this, this->model_object()->volumes, *m_shared_regions, slice_zs,
+        slices_to_regions(print->config(), *this, this->model_object()->volumes, m_shared_regions->all_regions.size(), m_shared_regions->layer_ranges, slice_zs,
                           std::move(objSliceByVolume), PrintObject::clip_multipart_objects, throw_on_cancel_callback);
 
     for (size_t region_id = 0; region_id < region_slices.size(); ++ region_id) {
@@ -1719,16 +1721,29 @@ void PrintObject::slice_wall_sublayers()
     const size_t first_layer    = std::max<size_t>(1, elephant_foot ? size_t(std::max(0, m_config.elefant_foot_compensation_layers.value)) : 0);
     std::vector<int> sublayer_counts(m_layers.size(), 1);
     bool             any_subdivided = false;
+    bool             counts_differ  = false;
     for (size_t layer_idx = first_layer; layer_idx < m_layers.size(); ++ layer_idx) {
         const Layer *layer = m_layers[layer_idx];
         int          count = 1;
-        for (const LayerRegion *layerm : layer->regions())
-            count = std::max(count, wall_sublayer_count(layerm->region().config(), layer->height));
+        for (const LayerRegion *layerm : layer->regions()) {
+            if (layerm->slices.empty())
+                continue;
+            const int region_count = wall_sublayer_count(layerm->region().config(), layer->height);
+            counts_differ |= region_count > 1 && count > 1 && region_count != count;
+            count = std::max(count, region_count);
+        }
         sublayer_counts[layer_idx] = count;
         any_subdivided |= count > 1;
     }
     if (! any_subdivided)
         return;
+    // A layer carries one set of passes, so every sub-layered region on it gets the finest split any of
+    // them asks for.
+    if (counts_differ)
+        this->active_step_add_warning(PrintStateBase::WarningLevel::NON_CRITICAL,
+            L("Parts or modifiers of this object ask for different outer wall sub-layer heights on the same layer. "
+              "Their walls are all printed with the most passes any of them asks for.") + std::string("\n") +
+            L("Object name") + std::string(": ") + this->model_object()->name);
 
     const Print *print               = this->print();
     auto         throw_on_cancel     = [print]() { print->throw_if_canceled(); };
@@ -1760,13 +1775,41 @@ void PrintObject::slice_wall_sublayers()
         return;
 
     BOOST_LOG_TRIVIAL(debug) << "Slicing sub-layers for sub-layered walls - begin";
-    std::vector<VolumeSlices> volume_slices = slice_volumes_inner(
-        print->config(), this->config(), this->trafo_centered(),
-        this->model_object()->volumes, m_shared_regions->layer_ranges, slice_zs, throw_on_cancel);
-
-    std::vector<std::vector<ExPolygons>> region_slices =
-        slices_to_regions(print->config(), *this, this->model_object()->volumes, *m_shared_regions, slice_zs,
-                          std::move(volume_slices), PrintObject::clip_multipart_objects, throw_on_cancel);
+    // Each layer's planes are handed to the regions of the layer range its own slice_z is in. A range
+    // boundary inside a layer would otherwise give the planes beyond it to the next range's regions,
+    // which this layer does not have, and those passes would come out empty. So the planes are sliced
+    // at their own height, one range at a time, but distributed with their height clamped into that
+    // range - the volumes' extents are clipped to it, and a plane past it would match none of them.
+    const auto  &layer_ranges = m_shared_regions->layer_ranges;
+    const size_t num_regions  = m_shared_regions->all_regions.size();
+    std::vector<std::vector<size_t>> planes_by_range(layer_ranges.size());
+    for (size_t layer_idx = 0; layer_idx < m_layers.size(); ++ layer_idx)
+        if (const size_t count = m_layers[layer_idx]->wall_sub_slices.size(); count > 0) {
+            const size_t range_idx = layer_range_first(layer_ranges, m_layers[layer_idx]->slice_z) - layer_ranges.begin();
+            for (size_t k = 0; k < count; ++ k)
+                planes_by_range[range_idx].emplace_back(zs_begin[layer_idx] + k);
+        }
+    std::vector<std::vector<ExPolygons>> region_slices(num_regions, std::vector<ExPolygons>(slice_zs.size()));
+    for (size_t range_idx = 0; range_idx < layer_ranges.size(); ++ range_idx) {
+        const std::vector<size_t> &planes = planes_by_range[range_idx];
+        if (planes.empty())
+            continue;
+        const std::vector<PrintObjectRegions::LayerRangeRegions> range { layer_ranges[range_idx] };
+        const t_layer_height_range &bounds = range.front().layer_height_range;
+        std::vector<float> zs, zs_in_range;
+        for (const size_t plane : planes) {
+            zs.emplace_back(slice_zs[plane]);
+            zs_in_range.emplace_back(float(std::clamp<double>(slice_zs[plane], bounds.first, bounds.second - EPSILON)));
+        }
+        std::vector<VolumeSlices> volume_slices = slice_volumes_inner(
+            print->config(), this->config(), this->trafo_centered(), this->model_object()->volumes, range, zs, throw_on_cancel);
+        std::vector<std::vector<ExPolygons>> range_slices =
+            slices_to_regions(print->config(), *this, this->model_object()->volumes, num_regions, range, zs_in_range,
+                              std::move(volume_slices), PrintObject::clip_multipart_objects, throw_on_cancel);
+        for (size_t region_id = 0; region_id < num_regions; ++ region_id)
+            for (size_t i = 0; i < planes.size(); ++ i)
+                region_slices[region_id][planes[i]] = std::move(range_slices[region_id][i]);
+    }
     m_print->throw_if_canceled();
 
     // Same XY hole and contour compensation the layer slices get in slice_volumes(), growing then
