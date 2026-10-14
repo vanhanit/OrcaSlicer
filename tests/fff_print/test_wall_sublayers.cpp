@@ -2599,3 +2599,70 @@ TEST_CASE("Sub-layered walls follow the beams interlocking two parts", "[WallSub
     }
     REQUIRE(passes > 0);
 }
+
+TEST_CASE("Sub-layered walls split every layer of a variable layer height by its own height", "[WallSublayers]")
+{
+    // Layer ranges of 0.1mm up to 2mm and 0.3mm above, split by 0.05mm: 2 passes in a thin layer, 6 in
+    // a thick one, and either way the passes tile the layer from its bottom to its print_z.
+    Print print;
+    Model model;
+    init_object(print, model, plain_config({{"wall_sublayer_height", "0.05"}}), make_cube(20., 20., 4.), {}, [](ModelObject &object) {
+        for (const auto &[range, height] : {std::pair{t_layer_height_range{0., 2.}, "0.1"}, std::pair{t_layer_height_range{2., 4.}, "0.3"}}) {
+            DynamicPrintConfig range_config;
+            range_config.set_deserialize_strict({{"layer_height", height}});
+            object.layer_config_ranges[range].assign_config(std::move(range_config));
+        }
+    });
+    print.process();
+
+    std::set<size_t> pass_counts;
+    for (const Layer *layer : print.objects().front()->layers()) {
+        if (layer->id() == 0)
+            continue;
+        INFO("layer " << layer->id() << " at z " << layer->print_z << ", " << layer->height << "mm");
+        const std::vector<WallSubSlice> &subs = layer->wall_sub_slices();
+        REQUIRE(subs.size() == size_t(std::lround(layer->height / 0.05)));
+        double bottom = layer->bottom_z();
+        for (const WallSubSlice &sub : subs) {
+            CHECK_THAT(sub.print_z - sub.height, Catch::Matchers::WithinAbs(bottom, 1e-9));
+            CHECK_THAT(sub.height, Catch::Matchers::WithinAbs(0.05, 1e-9));
+            bottom = sub.print_z;
+        }
+        CHECK_THAT(bottom, Catch::Matchers::WithinAbs(layer->print_z, 1e-9));
+        pass_counts.insert(subs.size());
+    }
+    CHECK(pass_counts == std::set<size_t>{2, 6});
+}
+
+TEST_CASE("Sub-layered walls leave the first object layer on a raft whole", "[WallSublayers]")
+{
+    // 2 raft layers, then the object. Like the first layer on the bed, the first object layer is laid
+    // onto the raft at one height; the 0.2mm layers above it are split by 0.05mm into 4 passes.
+    Print print;
+    Model model;
+    init_object(print, model, plain_config({{"wall_sublayer_height", "0.05"}, {"raft_layers", "2"}}), make_cube(20., 20., 2.));
+    const std::string gcode = Slic3r::Test::gcode(print);
+    REQUIRE(! gcode.empty());
+
+    const auto layers = extruding_zs_per_layer(gcode);
+    REQUIRE(layers.size() > 4);
+    for (size_t i = 0; i < 3; ++ i) {
+        INFO("printed layer " << i << " (raft, raft, first object layer)");
+        CHECK(distinct_sorted(layers[i]).size() == 1);
+    }
+    CHECK(distinct_sorted(layers[3]).size() == 4);
+}
+
+TEST_CASE("Sub-layered walls are lifted by the Z offset with the rest of the layer", "[WallSublayers]")
+{
+    // z_offset 0.3: every pass of the second 0.2mm layer lands 0.3mm above where it would without it.
+    const std::string gcode = slice({cube(20)}, plain_config({{"wall_sublayer_height", "0.05"}, {"z_offset", "0.3"}}));
+    REQUIRE(! gcode.empty());
+
+    const auto layers = extruding_zs_per_layer(gcode);
+    REQUIRE(layers.size() > 2);
+    const std::vector<double> zs = distinct_sorted(layers[1]);
+    REQUIRE(zs.size() == 4);
+    for (int k = 0; k < 4; ++ k)
+        CHECK_THAT(zs[k], Catch::Matchers::WithinAbs(0.3 + 0.2 + 0.05 * (k + 1), 1e-6));
+}
