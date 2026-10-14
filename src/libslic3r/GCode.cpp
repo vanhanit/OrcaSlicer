@@ -1578,6 +1578,9 @@ static std::vector<Vec2d> get_path_of_change_filament(const Print& print)
             gcode += gcodegen.retract(false, false, auto_lift_type, true);
         }
 
+        // The tower now stands as high as the nozzle; sub-layer passes cross over it.
+        gcodegen.m_last_printed_z = gcodegen.writer().get_position().z() - gcodegen.writer().get_zhop();
+        gcodegen.m_top_printed_z  = std::max(gcodegen.m_top_printed_z, gcodegen.m_last_printed_z);
         // Let the planner know we are traveling between objects.
         gcodegen.m_avoid_crossing_perimeters.use_external_mp_once();
         return gcode;
@@ -1873,6 +1876,9 @@ static std::vector<Vec2d> get_path_of_change_filament(const Print& print)
                 gcodegen.m_wipe.path.points.emplace_back(wipe_tower_point_to_object_point(gcodegen, transform_wt2_pt(wipe_pt) + plate_origin_2d));
         }
 
+        // The tower now stands as high as the nozzle; sub-layer passes cross over it.
+        gcodegen.m_last_printed_z = gcodegen.writer().get_position().z() - gcodegen.writer().get_zhop();
+        gcodegen.m_top_printed_z  = std::max(gcodegen.m_top_printed_z, gcodegen.m_last_printed_z);
         // Let the planner know we are traveling between objects.
         gcodegen.m_avoid_crossing_perimeters.use_external_mp_once();
         return gcode;
@@ -3322,6 +3328,9 @@ void GCode::_do_export(Print& print, GCodeOutputStream &file, ThumbnailsGenerato
     m_last_height  = 0.f;
     m_last_layer_z = 0.f;
     m_max_layer_z  = 0.f;
+    m_top_printed_z       = 0.;
+    m_top_printed_z_below = 0.;
+    m_last_printed_z      = 0.;
     m_last_width = 0.f;
     m_last_layer_accumulated_mass = 0.0;
     m_is_role_based_fan_on.fill(false);
@@ -8235,6 +8244,9 @@ std::string GCode::change_layer(coordf_t print_z)
 
     m_nominal_z = z;
     m_writer.get_position().z() = z;
+    if (m_top_printed_z > 0.)
+        m_top_printed_z_below = m_top_printed_z;
+    m_top_printed_z = 0.;
 
     // forget last wiping path as wiping after raising Z is pointless
     // BBS. Dont forget wiping path to reduce stringing.
@@ -8749,6 +8761,7 @@ std::string GCode::extrude_sublayer_walls(const Print &print, const std::vector<
 
     std::string gcode;
     m_in_sublayer_wall_pass = true;
+    m_sublayer_clearance_z  = std::max(m_top_printed_z, m_top_printed_z_below);
     // The pass of which split each object's overhang estimator measures against right now.
     std::map<const PrintObject*, std::pair<size_t, size_t>> measured_against;
     // Each pass height is a layer of its own in the preview, so it is marked as one - but only once it is
@@ -8801,8 +8814,10 @@ std::string GCode::extrude_sublayer_walls(const Print &print, const std::vector<
             gcode += this->object_start_labels(print, instance_to_print, inst);
             // Starting on another object copy, plan the first travel with the external motion planner.
             const std::pair<const PrintObject*, Point> this_object_copy(&instance_to_print.print_object, inst.shift);
-            if (m_last_obj_copy != this_object_copy)
+            if (m_last_obj_copy != this_object_copy) {
                 m_avoid_crossing_perimeters.use_external_mp_once();
+                m_sublayer_cross_over = true;
+            }
             m_last_obj_copy = this_object_copy;
             this->set_origin(unscale(inst.shift));
 
@@ -8843,6 +8858,7 @@ std::string GCode::extrude_sublayer_walls(const Print &print, const std::vector<
         any_pass_printed = any_pass_printed || this_pass_printed;
     }
     m_in_sublayer_wall_pass = false;
+    m_sublayer_cross_over   = false;
     // The rest of the layer prints at print_z over the whole layer below again.
     m_extrusion_quality_estimator.restore_prev_layer_boundaries();
 
@@ -10166,6 +10182,8 @@ std::string GCode::_extrude(const ExtrusionPath &path, const std::string &path_d
     if (path.role() != ExtrusionRole::erGapFill) {
       m_last_notgapfill_extrusion_role = path.role();
     }
+    m_last_printed_z = m_writer.get_position().z();
+    m_top_printed_z  = std::max({m_top_printed_z, m_nominal_z, m_last_printed_z});
 
     this->set_last_pos(path.last_point());
     return gcode;
@@ -10388,6 +10406,21 @@ std::string GCode::travel_to(const Point& point, ExtrusionRole role, std::string
     // if needed, write the gcode_label_objects_end then gcode_label_objects_start
     m_writer.add_object_change_labels(gcode);
 
+    // A sub-layer pass can be lower than what is already printed: another object's layer, or the prime
+    // tower, stands higher than this layer's passes. Moving to another object at a pass height, or
+    // sloping down to one, would cut into that, so the nozzle crosses over at the clearance height and
+    // comes down only over the pass.
+    const double travel_z  = z == DBL_MAX ? m_nominal_z : z;
+    // What stands under the nozzle where the travel starts.
+    double       start_z   = m_last_printed_z;
+    if (m_sublayer_cross_over && m_writer.get_position().z() - m_writer.get_zhop() < m_sublayer_clearance_z - EPSILON) {
+        gcode += m_writer.travel_to_z(m_sublayer_clearance_z, "lift to cross over the print");
+        start_z = m_sublayer_clearance_z;
+    }
+    m_sublayer_cross_over = false;
+    const double current_z          = m_writer.get_position().z() - m_writer.get_zhop();
+    const bool   descend_at_the_end = m_in_sublayer_wall_pass && travel_z < start_z - EPSILON;
+
     // use G1 because we rely on paths being straight (G0 may make round paths)
     if (travel.size() >= 2) {
         // Orca: use `travel_to_xyz` to ensure we start at the correct z, in case we moved z in custom/filament change gcode
@@ -10400,7 +10433,7 @@ std::string GCode::travel_to(const Point& point, ExtrusionRole role, std::string
             if (travel.size() == 2) {
                 // No extra movements emitted by avoid_crossing_perimeters, simply move to the end point with z change
                 const auto& dest2d = this->point_to_gcode(travel.points.back());
-                Vec3d dest3d(dest2d(0), dest2d(1), z == DBL_MAX ? m_nominal_z : z);
+                Vec3d dest3d(dest2d(0), dest2d(1), descend_at_the_end ? current_z : travel_z);
                 gcode += m_writer.travel_to_xyz(dest3d, comment, m_need_change_layer_lift_z);
                 m_need_change_layer_lift_z = false;
             } else {
@@ -10410,10 +10443,10 @@ std::string GCode::travel_to(const Point& point, ExtrusionRole role, std::string
                     if (i == 1) {
                         // Lift to normal z at beginning
                         Vec2d dest2d = this->point_to_gcode(travel.points[i]);
-                        Vec3d dest3d(dest2d(0), dest2d(1), m_nominal_z);
+                        Vec3d dest3d(dest2d(0), dest2d(1), descend_at_the_end ? current_z : m_nominal_z);
                         gcode += m_writer.travel_to_xyz(dest3d, comment, m_need_change_layer_lift_z);
                         m_need_change_layer_lift_z = false;
-                    } else if (z != DBL_MAX && i == travel.size() - 1) {
+                    } else if (z != DBL_MAX && ! descend_at_the_end && i == travel.size() - 1) {
                         // Apply z_ratio for the very last point
                         Vec2d dest2d = this->point_to_gcode(travel.points[i]);
                         Vec3d dest3d(dest2d(0), dest2d(1), z);
@@ -10424,6 +10457,9 @@ std::string GCode::travel_to(const Point& point, ExtrusionRole role, std::string
                     }
                 }
             }
+            if (descend_at_the_end)
+                // Over the pass now, the nozzle comes down to it, ending any lift on the way.
+                gcode += m_writer.travel_to_z(travel_z, comment);
         }
         this->set_last_pos(travel.points.back());
     }

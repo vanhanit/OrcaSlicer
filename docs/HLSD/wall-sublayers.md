@@ -86,6 +86,15 @@ still see one layer. The overhang estimator measures a pass against the
 sub-slice below it (`Layer::wall_sublayer_support()`), and the cooling buffer
 asks for the minimum layer time once per pass of the most finely split region.
 
+A pass can still be lower than something printed before it: the prime tower,
+printed at `print_z` on the tool change that brings in the pass filament, or
+another object in a different layer height whose layer ended between this
+layer's bottom and the pass. `GCode` keeps the highest Z printed at in this
+layer and in the last one, and the Z of the last thing printed. Moving to
+another object, a pass below that height lifts to it first; a travel to a pass
+lower than what the nozzle starts over moves in XY first and comes down only
+over the pass, never sloping down across the print.
+
 ## Filaments
 
 Everything printed at a layer's `print_z` stands a full layer high once it is

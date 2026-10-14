@@ -2324,31 +2324,81 @@ TEST_CASE("Every sub-layered pass puts its seam on a painted seam enforcer", "[W
     REQUIRE(pass_starts > 0);
 }
 
+// The first move that takes the nozzle tip below material already printed under it, as a message, or
+// empty. Every G0/G1 move, travel or not, is followed in 0.1mm steps over a 0.2mm grid of the highest
+// top printed so far.
+std::string first_dip_into_print(const std::string &gcode)
+{
+    const double                   cell = 0.2;
+    std::map<std::pair<int, int>, double> top;
+    const auto key = [cell](double x, double y) { return std::make_pair(int(std::floor(x / cell)), int(std::floor(y / cell))); };
+    std::string found;
+    size_t      line_no = 0;
+    GCodeReader reader;
+    reader.parse_buffer(gcode, [&](GCodeReader &self, const GCodeReader::GCodeLine &line) {
+        ++ line_no;
+        if (! found.empty() || ! (line.cmd_is("G0") || line.cmd_is("G1")))
+            return;
+        const Vec3d  from(self.x(), self.y(), self.z());
+        const Vec3d  to(line.new_X(self), line.new_Y(self), line.new_Z(self));
+        const bool   extruding = line.extruding(self);
+        const int    steps     = std::max(1, int(std::ceil((to - from).head<2>().norm() / 0.1)));
+        for (int i = 0; i <= steps && found.empty(); ++ i) {
+            const Vec3d p = from + (to - from) * (double(i) / steps);
+            if (const auto it = top.find(key(p.x(), p.y())); it != top.end() && p.z() < it->second - 1e-4) {
+                std::ostringstream s;
+                s << "line " << line_no << " '" << line.raw() << "' reaches z " << p.z() << " at (" << p.x() << ", " << p.y()
+                  << ") where the print stands at " << it->second;
+                found = s.str();
+            }
+        }
+        if (extruding)
+            for (int i = 0; i <= steps; ++ i) {
+                const Vec3d p = from + (to - from) * (double(i) / steps);
+                double     &t = top.try_emplace(key(p.x(), p.y()), 0.).first->second;
+                t = std::max(t, p.z());
+            }
+    });
+    return found;
+}
+
 TEST_CASE("A prime tower does not bring the nozzle down onto the object within a layer", "[WallSublayers]")
 {
     // Two filaments, outer walls in filament 2, with a prime tower. The tower prints at the layer's
     // print_z on a tool change, away from the object, and the passes come down to their heights only
-    // over the object - where, within a layer, Z still never drops.
+    // over the object - where, within a layer, Z still never drops. With the seam on the side away
+    // from the tower and wall crossings avoided, the way from the tower to a pass goes around the
+    // object in several moves.
+    const auto avoid_walls = GENERATE("0", "1");
+    INFO("reduce_crossing_wall=" << avoid_walls);
     DynamicPrintConfig config = multifilament_config(2, {{"layer_height", "0.2"},
+                                                         {"reduce_crossing_wall", avoid_walls},
+                                                         {"seam_position", "back"},
                                                          {"initial_layer_print_height", "0.2"},
                                                          {"wall_loops", "3"},
                                                          {"z_hop", "0"},
                                                          {"skirt_loops", "0"},
                                                          {"enable_prime_tower", "1"},
-                                                         {"wipe_tower_x", "120"}, // inside the 200x200 test bed
-                                                         {"wipe_tower_y", "120"},
+                                                         {"wipe_tower_x", "95"}, // in front of the object
+                                                         {"wipe_tower_y", "20"},
                                                          {"outer_wall_filament_id", "2"},
                                                          {"inner_wall_filament_id", "1"},
                                                          {"sparse_infill_filament_id", "1"},
                                                          {"internal_solid_filament_id", "1"},
                                                          {"wall_sublayer_height", "0.05"}});
     config.set_key_value("gcode_comments", new ConfigOptionBool(true));
-    Print print;
-    Model model;
-    init_print({cube(20)}, print, model, config);
+    Print        print;
+    Model        model;
+    ModelObject *object = model.add_object();
+    object->name        = "object.stl";
+    object->add_volume(cube(20));
+    object->add_instance()->set_offset(Vec3d(100., 100., 0.));
+    object->ensure_on_bed();
+    print.auto_assign_extruders(object);
     // The first apply counts the filaments in use before it has built the regions that carry the
     // per-feature filaments, sees one, and turns the tower off. Applying again, as the GUI does on
     // the next change, counts both.
+    print.apply(model, config);
     print.apply(model, config);
     const std::string gcode = Slic3r::Test::gcode(print);
     // The passes are on: the outer wall lands at the 4 pass heights of each 0.2mm layer above the first.
@@ -2361,6 +2411,10 @@ TEST_CASE("A prime tower does not bring the nozzle down onto the object within a
         INFO("prime tower at z " << z);
         CHECK_THAT(z - 0.2 * std::round(z / 0.2), Catch::Matchers::WithinAbs(0., 1e-4));
     }
+    // Leaving the tower for a pass below its top, the nozzle does not cut into the tower on its way.
+    const std::string dip = first_dip_into_print(gcode);
+    INFO(dip);
+    CHECK(dip.empty());
 
     BoundingBoxf object_box;
     for_each_move_of_type(gcode, "Outer wall", [&](const GCodeReader &self, int) { object_box.merge(Vec2d(self.x(), self.y())); });
@@ -2665,4 +2719,60 @@ TEST_CASE("Sub-layered walls are lifted by the Z offset with the rest of the lay
     REQUIRE(zs.size() == 4);
     for (int k = 0; k < 4; ++ k)
         CHECK_THAT(zs[k], Catch::Matchers::WithinAbs(0.3 + 0.2 + 0.05 * (k + 1), 1e-6));
+}
+
+TEST_CASE("A sub-layer pass under another object's top is reached without cutting into that object", "[WallSublayers]")
+{
+    // Three cubes in a row, 20mm apart, all split by 0.05mm; the middle one is in 0.3mm layers and the
+    // outer two in 0.2mm layers. The middle cube's layer from 0.2 to 0.5 prints after the others'
+    // layer at 0.4 with its first pass at 0.25, and the outer cubes' layer from 0.4 to 0.6 after it
+    // with theirs at 0.45 - so the nozzle keeps leaving one cube's top for a height below it. Avoiding
+    // wall crossings sends it from one end of the row to the other in several moves.
+    const auto z_hop       = GENERATE("0", "0.4");
+    const auto avoid_walls = GENERATE("0", "1");
+    INFO("z_hop=" << z_hop << " reduce_crossing_wall=" << avoid_walls);
+    DynamicPrintConfig config = DynamicPrintConfig::full_print_config();
+    config.apply(plain_config({{"wall_sublayer_height", "0.05"}, {"z_hop", z_hop}, {"reduce_crossing_wall", avoid_walls}}));
+    config.set_key_value("gcode_comments", new ConfigOptionBool(true));
+    Print print;
+    Model model;
+    for (const auto &[x, layer_height] : {std::pair{40., "0.2"}, std::pair{80., "0.3"}, std::pair{120., "0.2"}}) {
+        ModelObject *object = model.add_object();
+        object->name        = "object.stl";
+        object->add_volume(cube(20));
+        object->add_instance()->set_offset(Vec3d(x, 80., 0.));
+        DynamicPrintConfig object_config;
+        object_config.set_deserialize_strict({{"layer_height", layer_height}});
+        object->config.apply(object_config);
+        object->ensure_on_bed();
+        print.auto_assign_extruders(object);
+    }
+    print.apply(model, config);
+    const std::string gcode = Slic3r::Test::gcode(print);
+    REQUIRE(! gcode.empty());
+
+    // The case under test is there: passes land below a top another cube has reached.
+    const std::set<double> wall_zs = zs_of_type(gcode, "Outer wall");
+    for (const double pass_z : {0.25, 0.45}) {
+        INFO("pass at z " << pass_z);
+        REQUIRE(std::any_of(wall_zs.begin(), wall_zs.end(), [pass_z](double z) { return std::abs(z - pass_z) < 1e-4; }));
+    }
+    const std::string dip = first_dip_into_print(gcode);
+    INFO(dip);
+    CHECK(dip.empty());
+}
+
+TEST_CASE("Sub-layered walls never take the nozzle into what is already printed", "[WallSublayers]")
+{
+    // Every move, travel or not, stays above what has been printed under it, whatever order the walls
+    // go down in - on a block, and on the shallow cone whose passes each step well inside the one below.
+    const auto wall_sequence = GENERATE("inner wall/outer wall", "outer wall/inner wall", "inner-outer-inner wall");
+    const bool cone          = GENERATE(false, true);
+    INFO("wall_sequence=" << wall_sequence << (cone ? " on the cone" : " on the block"));
+    const DynamicPrintConfig config = plain_config({{"wall_sublayer_height", "0.05"}, {"wall_sequence", wall_sequence}});
+    const std::string gcode = cone ? slice({shallow_cone()}, config) : slice({cube(20)}, config);
+    REQUIRE(! gcode.empty());
+    const std::string dip = first_dip_into_print(gcode);
+    INFO(dip);
+    CHECK(dip.empty());
 }

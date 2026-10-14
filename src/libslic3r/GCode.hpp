@@ -923,6 +923,16 @@ protected:
     // and flow already, so only Z is driven from here; the flag suppresses the features that assume
     // a wall spans the whole layer or that the rest of the layer is already printed.
     bool     m_in_sublayer_wall_pass = false;
+    // The highest the print stood when the passes began. Moving to another object, a pass below it
+    // crosses over at this height; set until that travel is made.
+    double   m_sublayer_clearance_z  = 0.;
+    bool     m_sublayer_cross_over   = false;
+    // The highest Z printed at in this layer and in the last layer that printed anything. Printing by
+    // layer, nothing printed before stands higher.
+    double   m_top_printed_z         = 0.;
+    double   m_top_printed_z_below   = 0.;
+    // The Z of the last thing printed, which is what a travel starts over.
+    double   m_last_printed_z        = 0.;
     bool m_need_change_layer_lift_z = false;
     int m_start_gcode_filament = -1;
     std::string m_filament_instances_code;
