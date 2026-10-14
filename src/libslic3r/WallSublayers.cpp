@@ -1,22 +1,33 @@
 // Orca: sub-layered outer walls. The outermost wall loops of a layer are printed as a stack of
 // thinner passes at ascending Z, generated from the mesh re-sliced at each sub-layer height (see
-// Layer::wall_sub_slices), while the layer's inner walls and infill still print once at the full
+// Layer::wall_sublayer_splits), while the layer's inner walls and infill still print once at the full
 // layer height. This file owns everything between those sub-slices and the emitted extrusions.
 
 #include "WallSublayers.hpp"
 
 #include "ClipperUtils.hpp"
+#include "ExtrusionEntity.hpp"
 #include "Fill/FillBase.hpp"
+#include "Flow.hpp"
 #include "Geometry.hpp"
 #include "Layer.hpp"
 #include "PerimeterGenerator.hpp"
+#include "Point.hpp"
+#include "Polygon.hpp"
+#include "Polyline.hpp"
 #include "Print.hpp"
+#include "PrintConfig.hpp"
 #include "Surface.hpp"
 #include "VariableWidth.hpp"
+#include "libslic3r.h"
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
+#include <math.h>
 #include <memory>
+#include <utility>
+#include <vector>
 
 namespace Slic3r {
 
@@ -67,9 +78,22 @@ bool wall_in_mixed_color_sublayers(const PrintRegionConfig &config, const PrintC
            size_t(filament) < print_config.filament_is_mixed.values.size() && print_config.filament_is_mixed.get_at(filament);
 }
 
-int wall_sublayer_count(const PrintRegionConfig &config, const PrintConfig &print_config, coordf_t layer_height)
+bool wall_painted_in_other_filament(const PrintObject &object, const PrintRegion &region)
 {
-    if (config.wall_loops <= 0 || layer_height <= 0. || wall_in_mixed_color_sublayers(config, print_config))
+    if (const PrintObjectRegions *regions = object.shared_regions(); regions != nullptr)
+        for (const PrintObjectRegions::LayerRangeRegions &range : regions->layer_ranges)
+            for (const PrintObjectRegions::PaintedRegion &painted : range.painted_regions)
+                if (painted.region == &region)
+                    return region.config().outer_wall_filament_id.value !=
+                           range.volume_regions[painted.parent].region->config().outer_wall_filament_id.value;
+    return false;
+}
+
+int wall_sublayer_count(const PrintObject &object, const PrintRegion &region, coordf_t layer_height)
+{
+    const PrintRegionConfig &config = region.config();
+    if (config.wall_loops <= 0 || layer_height <= 0. || wall_in_mixed_color_sublayers(config, object.print()->config()) ||
+        wall_painted_in_other_filament(object, region))
         return 1;
     const double target = config.wall_sublayer_height.get_abs_value(layer_height);
     if (target <= 0.)
@@ -311,7 +335,7 @@ static ExPolygons layer_top_footprint(const Layer &below, float void_reach)
 {
     ExPolygons core;
     bool       core_set = false;
-    for (const WallSubSlice &sub : below.wall_sub_slices) {
+    for (const WallSubSlice &sub : below.wall_sub_slices()) {
         if (sub.merged.empty())
             continue;
         core     = core_set ? intersection_ex(core, sub.merged) : sub.merged;
@@ -321,7 +345,7 @@ static ExPolygons layer_top_footprint(const Layer &below, float void_reach)
         return below.lslices;
 
     ExPolygons ground = core, kept;
-    for (const WallSubSlice &sub : below.wall_sub_slices) {
+    for (const WallSubSlice &sub : below.wall_sub_slices()) {
         if (sub.merged.empty())
             continue;
         const ExPolygons voids = diff_ex(enclosed_voids(ground), ground);
@@ -371,14 +395,17 @@ WallSublayerContext wall_sublayer_prepare(const LayerRegion &layerm, const Layer
     WallSublayerContext      ctx;
     const Layer             *layer         = layerm.layer();
     const PrintRegionConfig &region_config = layerm.region().config();
-    const size_t             num_passes    = layer->wall_sub_slices.size();
 
-    if (num_passes == 0 || spiral_mode)
+    if (spiral_mode)
         return ctx;
-    // The layer is split as soon as any region of the object asks for it. A region that does not ask -
-    // the object around a modifier that does - keeps its walls at the full layer height.
-    if (wall_sublayer_count(region_config, layer->object()->print()->config(), layer->height) < 2)
+    // The layer is split as soon as any region of the object asks for it, in as many ways as its regions
+    // ask for. A region that does not ask - the object around a modifier that does - keeps its walls at
+    // the full layer height, and one that does gets the split of its own pass count.
+    const int count = wall_sublayer_count(*layer->object(), layerm.region(), layer->height);
+    ctx.passes      = count > 1 ? layer->wall_sublayer_split(size_t(count)) : nullptr;
+    if (ctx.passes == nullptr)
         return ctx;
+    const size_t num_passes = ctx.passes->size();
     ctx.band_walls = std::clamp(region_config.wall_sublayer_loops.value, 0, region_config.wall_loops.value);
     // The passes print with the outer wall filament. With a separate inner wall filament only the outer
     // wall goes to them, and the inner walls stay in the layer's own run with their own filament.
@@ -398,8 +425,8 @@ WallSublayerContext wall_sublayer_prepare(const LayerRegion &layerm, const Layer
         ExPolygons expolygons;
         for (const LayerRegion *other : compatible_regions) {
             const int region_id = other->region().print_object_region_id();
-            if (region_id >= 0 && size_t(region_id) < layer->wall_sub_slices[k].region_slices.size())
-                append(expolygons, layer->wall_sub_slices[k].region_slices[region_id]);
+            if (region_id >= 0 && size_t(region_id) < (*ctx.passes)[k].region_slices.size())
+                append(expolygons, (*ctx.passes)[k].region_slices[region_id]);
         }
         ctx.pass_slices[k] = union_ex(expolygons);
     }
@@ -513,7 +540,8 @@ void wall_sublayer_generate(LayerRegion               &layerm,
     const PrintObjectConfig &object_config = layer->object()->config();
     const PrintConfig       &print_config  = layer->object()->print()->config();
     const int                region_id     = layerm.region().print_object_region_id();
-    const size_t             num_passes    = layer->wall_sub_slices.size();
+    const std::vector<WallSubSlice> &passes = *ctx.passes;
+    const size_t             num_passes    = passes.size();
 
     // One wall generator run per sub-layer, each fed the mesh re-sliced at that sub-layer's height.
     // Overhangs and bridges are classified against the sub-layer below, so a wall supported by the
@@ -531,7 +559,7 @@ void wall_sublayer_generate(LayerRegion               &layerm,
     const float core_min = float(layerm.flow(frPerimeter, layer->height).scaled_width());
     const ExPolygons core_interior = opening_ex(offset_ex(ctx.core_region, - float(core_strip)), core_min / 2.f);
 
-    const Flow   support_flow  = sublayer_flow(layerm, frSolidInfill, layer->wall_sub_slices.front().height);
+    const Flow   support_flow  = sublayer_flow(layerm, frSolidInfill, passes.front().height);
     const float  support_angle = float(Geometry::deg2rad(region_config.solid_infill_direction.value) + model_rotation_rad);
     const float  support_width = float(support_flow.scaled_width());
     const double min_area      = SUBLAYER_MIN_SUPPORT_AREA * double(support_width) * double(support_width);
@@ -554,7 +582,7 @@ void wall_sublayer_generate(LayerRegion               &layerm,
     ExPolygons   ground  = support;
 
     for (size_t k = 0; k < num_passes; ++ k) {
-        const WallSubSlice &sub = layer->wall_sub_slices[k];
+        const WallSubSlice &sub = passes[k];
         if (ctx.pass_slices[k].empty()) {
             // A feature that ends part way up the layer holds nothing above it.
             support.clear();

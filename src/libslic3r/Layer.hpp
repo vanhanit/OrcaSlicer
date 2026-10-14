@@ -85,9 +85,10 @@ public:
     // (this collection contains only ExtrusionEntityCollection objects)
     ExtrusionEntityCollection   perimeters;
 
-    // Orca: sub-layered outer walls. One entry per sub-layer of Layer::wall_sub_slices, lowest
-    // first, holding the outermost walls generated from that sub-slice. Empty unless
-    // wall_sublayer_height is set. The loops these replace are absent from `perimeters`.
+    // Orca: sub-layered outer walls. One entry per pass of this region's split of the layer - see
+    // Layer::wall_sublayer_split() - lowest first, holding the outermost walls generated from that
+    // sub-slice. Empty unless the region asks for sub-layers. The loops these replace are absent from
+    // `perimeters`.
     std::vector<ExtrusionEntityCollection> sublayer_perimeters;
 
     // ordered collection of extrusion paths to fill surfaces
@@ -209,15 +210,22 @@ public:
     ExPolygons              loverhangs;
     BoundingBox             loverhangs_bbox;
 
-    // Orca: sub-layers this layer's outermost walls are split into, lowest first. Empty unless
+    // Orca: the splits of this layer the regions' sub-layered walls are printed in, one per pass count
+    // a region on the layer asks for, finest first; each lists its sub-layers lowest first. Empty unless
     // wall_sublayer_height is set for one of the regions, and always empty on the first layer.
-    std::vector<WallSubSlice> wall_sub_slices;
+    std::vector<std::vector<WallSubSlice>> wall_sublayer_splits;
 
-    // Orca: the material a sub-layered wall pass is printed onto - the pass below it, or the topmost
-    // sub-layer of the layer below. Both the wall generator and the G-code overhang estimator have to
+    // Orca: the finest split, the model inside the layer at the best vertical resolution any region
+    // asks for. Empty if the layer is not split.
+    const std::vector<WallSubSlice>& wall_sub_slices() const;
+    // Orca: the split into `passes` sub-layers, null if no region on the layer asks for it.
+    const std::vector<WallSubSlice>* wall_sublayer_split(size_t passes) const;
+
+    // Orca: the material pass `pass` of the split into `passes` is printed onto - the pass below it, or
+    // the top of the layer below. Both the wall generator and the G-code overhang estimator have to
     // classify a pass against this rather than against the whole layer below, or a pass that is fully
     // supported by the one beneath it reads as an overhang.
-    const ExPolygons*       wall_sublayer_support(size_t pass) const;
+    const ExPolygons*       wall_sublayer_support(size_t passes, size_t pass) const;
 
     size_t                  region_count() const { return m_regions.size(); }
     const LayerRegion*      get_region(int idx) const { return m_regions[idx]; }

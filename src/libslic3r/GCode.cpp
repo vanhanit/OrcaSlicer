@@ -8698,47 +8698,56 @@ void GCode::object_end_labels(const Print &print, const InstanceToPrint &instanc
 
 // Orca: sub-layered walls. Print the outermost walls as a stack of passes at ascending sub-layer
 // heights, the topmost of which ends exactly at the layer's print_z, before anything else of the
-// layer is printed. Every instance is taken through pass k before any instance starts pass k+1, so
-// Z only ever rises within the layer and the nozzle never crosses material printed above it.
+// layer is printed. Every instance is taken through one pass height before any instance moves up to
+// the next, and regions split into different numbers of passes interleave by height, so Z only ever
+// rises within the layer and the nozzle never crosses material printed above it.
 std::string GCode::extrude_sublayer_walls(const Print &print, const std::vector<LayerToPrint> &layers,
                                           const std::vector<InstanceToPrint> &instances_to_print,
                                           const std::vector<InstanceVisit> &instance_visits,
                                           const LayerTools &layer_tools, unsigned int extruder_id, coordf_t print_z)
 {
-    // Sub-layer counts are per object layer, and an object is only subdivided in as many passes as
-    // its own layer height asked for.
-    size_t num_passes = 0;
-    for (const InstanceVisit &visit : instance_visits) {
-        const Layer *layer = layers[instances_to_print[visit.instance_idx].layer_id].object_layer;
-        if (layer != nullptr)
+    // A region's passes come from the split of the layer into its own pass count.
+    const auto region_split = [](const Layer &layer, const LayerRegion &layerm) {
+        return layerm.sublayer_perimeters.empty() ? nullptr : layer.wall_sublayer_split(layerm.sublayer_perimeters.size());
+    };
+
+    // Every height a pass of this filament ends at, ascending.
+    std::vector<coordf_t> heights;
+    for (const InstanceVisit &visit : instance_visits)
+        if (const Layer *layer = layers[instances_to_print[visit.instance_idx].layer_id].object_layer; layer != nullptr)
             for (const LayerRegion *layerm : layer->regions())
-                num_passes = std::max(num_passes, layerm->sublayer_perimeters.size());
-    }
-    if (num_passes == 0)
+                if (const std::vector<WallSubSlice> *split = region_split(*layer, *layerm);
+                    split != nullptr && layer_tools.wall_extruder_id(layerm->region()) == extruder_id)
+                    for (const WallSubSlice &sub : *split)
+                        heights.emplace_back(sub.print_z);
+    if (heights.empty())
         return {};
+    std::sort(heights.begin(), heights.end());
+    heights.erase(std::unique(heights.begin(), heights.end(), [](coordf_t l, coordf_t r) { return r - l < EPSILON; }), heights.end());
 
     std::string gcode;
     m_in_sublayer_wall_pass = true;
-    // Each pass is a layer of its own in the preview, so it is marked as one - but only once it is
+    // The pass of which split each object's overhang estimator measures against right now.
+    std::map<const PrintObject*, std::pair<size_t, size_t>> measured_against;
+    // Each pass height is a layer of its own in the preview, so it is marked as one - but only once it is
     // known to print something, otherwise the preview would be left with an empty layer.
     bool any_pass_printed = false;
-    for (size_t pass = 0; pass < num_passes; ++ pass) {
+    for (const coordf_t height : heights) {
         bool this_pass_printed = false;
-        // The material under a pass is a property of the object layer, so it is built once per
-        // object rather than once per instance of it.
-        std::set<const PrintObject*> supports_set_this_pass;
         for (const InstanceVisit &visit : instance_visits) {
             const InstanceToPrint &instance_to_print = instances_to_print[visit.instance_idx];
             const Layer           *layer             = layers[instance_to_print.layer_id].object_layer;
-            if (layer == nullptr || pass >= layer->wall_sub_slices.size())
+            if (layer == nullptr)
                 continue;
 
-            // Which regions of this instance have walls to print in this pass with this filament.
-            std::vector<const LayerRegion*> regions;
+            // Which regions of this instance have a pass ending at this height to print with this filament.
+            std::vector<std::pair<const LayerRegion*, size_t>> regions;
             for (const LayerRegion *layerm : layer->regions())
-                if (pass < layerm->sublayer_perimeters.size() && ! layerm->sublayer_perimeters[pass].empty() &&
-                    layer_tools.wall_extruder_id(layerm->region()) == extruder_id)
-                    regions.emplace_back(layerm);
+                if (const std::vector<WallSubSlice> *split = region_split(*layer, *layerm);
+                    split != nullptr && layer_tools.wall_extruder_id(layerm->region()) == extruder_id)
+                    for (size_t pass = 0; pass < split->size(); ++ pass)
+                        if (std::abs((*split)[pass].print_z - height) < EPSILON && ! layerm->sublayer_perimeters[pass].empty())
+                            regions.emplace_back(layerm, pass);
             if (regions.empty())
                 continue;
 
@@ -8762,15 +8771,9 @@ std::string GCode::extrude_sublayer_walls(const Print &print, const std::vector<
             // Keys the overhang estimator's per-object layer boundaries; without it these walls would
             // be measured against whichever object was emitted last.
             m_extrusion_quality_estimator.set_current_object(&instance_to_print.print_object);
-            // These walls sit on the pass below them, not on the layer below, so that is what the
-            // overhang estimator has to measure them against - otherwise a wall a full-height pass
-            // would print at full speed is slowed down and gets the part cooling fan.
-            if (supports_set_this_pass.insert(&instance_to_print.print_object).second)
-                if (const ExPolygons *support = layer->wall_sublayer_support(pass); support != nullptr)
-                    m_extrusion_quality_estimator.override_prev_layer_boundary(&instance_to_print.print_object, *support);
 
             // The pass ends at its own height, which the writer reaches lazily on the next travel.
-            m_nominal_z = layer->wall_sub_slices[pass].print_z + m_config.z_offset.value;
+            m_nominal_z = height + m_config.z_offset.value;
             m_need_change_layer_lift_z = true;
 
             gcode += this->object_start_labels(print, instance_to_print, inst);
@@ -8781,8 +8784,18 @@ std::string GCode::extrude_sublayer_walls(const Print &print, const std::vector<
             m_last_obj_copy = this_object_copy;
             this->set_origin(unscale(inst.shift));
 
-            for (const LayerRegion *layerm : regions) {
+            for (const auto &[layerm, pass] : regions) {
                 m_config.apply(layerm->region().config());
+                // These walls sit on the pass below them, not on the layer below, so that is what the
+                // overhang estimator has to measure them against - otherwise a wall a full-height pass
+                // would print at full speed is slowed down and gets the part cooling fan. The material
+                // under a pass is a property of the object layer, so it is set once per object and pass.
+                const std::pair<size_t, size_t> split_pass(layerm->sublayer_perimeters.size(), pass);
+                if (auto [it, inserted] = measured_against.try_emplace(&instance_to_print.print_object, split_pass); inserted || it->second != split_pass) {
+                    it->second = split_pass;
+                    if (const ExPolygons *support = layer->wall_sublayer_support(split_pass.first, pass); support != nullptr)
+                        m_extrusion_quality_estimator.override_prev_layer_boundary(&instance_to_print.print_object, *support);
+                }
                 // The pass holds one collection per island, whose loops are already in the order
                 // wall_sequence asked for, plus this pass's gap fill as bare paths at the end.
                 for (const ExtrusionEntity *entity : layerm->sublayer_perimeters[pass].entities) {

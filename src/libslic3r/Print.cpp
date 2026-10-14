@@ -2207,7 +2207,7 @@ StringObjectException Print::validate(std::vector<StringObjectException> *warnin
     // per-object and per-modifier overrides.
     for (const PrintObject *object : m_objects) {
         const auto regions = object->all_regions();
-        bool sublayered = false, overhangs_made_printable = false, zaa = false, mixed_color_sublayers = false;
+        bool sublayered = false, overhangs_made_printable = false, zaa = false, mixed_color_sublayers = false, painted = false;
         std::set<int> sublayer_filaments;
         for (const PrintRegion &region : regions) {
             const PrintRegionConfig &config = region.config();
@@ -2215,6 +2215,10 @@ StringObjectException Print::validate(std::vector<StringObjectException> *warnin
                 continue;
             if (wall_in_mixed_color_sublayers(config, m_config)) {
                 mixed_color_sublayers = true;
+                continue;
+            }
+            if (wall_painted_in_other_filament(*object, region)) {
+                painted = true;
                 continue;
             }
             sublayered               = true;
@@ -2229,11 +2233,9 @@ StringObjectException Print::validate(std::vector<StringObjectException> *warnin
             continue;
         if (m_config.spiral_mode)
             return {L("Sub-layered outer walls are not compatible with spiral vase mode."), object, "wall_sublayer_height"};
-        if (m_config.filament_diameter.size() > 1 && object->model_object()->is_mm_painted())
-            // The sub-slices come straight from the model volumes, bypassing the multi-material
-            // segmentation the layer slices go through, so the painted colors would be lost. With a
-            // single filament the slicer skips that segmentation too, and the painting has no effect.
-            return {L("Sub-layered outer walls are not compatible with multi-material painting."), object, "wall_sublayer_height"};
+        if (painted)
+            warn(L("Outer walls painted in a filament other than their part's are printed at the full layer "
+                   "height, after the sub-layered walls of the part's own filament."), "wall_sublayer_height", object);
         if (sublayer_filaments.size() > 1)
             // The passes of a layer go first, before anything is printed at its print_z (see
             // ToolOrdering::put_sublayer_wall_extruders_first()). Only one filament can go first: the

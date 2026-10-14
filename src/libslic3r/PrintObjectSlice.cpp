@@ -7,6 +7,7 @@
 #include <cassert>
 #include <cstdlib>
 #include <memory>
+#include <set>
 #include <math.h>
 #include <cmath>
 #include <iterator>
@@ -42,6 +43,7 @@
 #include "Surface.hpp"
 #include "Utils.hpp"
 #include "WallSublayers.hpp"
+#include "Algorithm/RegionExpansion.hpp"
 #include "libslic3r/Feature/Interlocking/InterlockingGenerator.hpp"
 #include "Config.hpp"
 #include "SurfaceCollection.hpp"
@@ -1711,95 +1713,83 @@ void PrintObject::apply_conical_overhang() {
 void PrintObject::slice_wall_sublayers()
 {
     for (Layer *layer : m_layers)
-        layer->wall_sub_slices.clear();
+        layer->wall_sublayer_splits.clear();
 
     // The first layer is bonded to the bed or the raft and its height is dictated by adhesion, so it
     // is never subdivided. Raft layers are support layers and never appear in m_layers.
     // Nor are the layers elephant foot compensation shrinks: slice_volumes() applies it to the layer
     // slices only, so sub-slices taken straight from the model would print the outer wall outside them.
-    const bool   elephant_foot  = m_config.raft_layers == 0 && m_config.elefant_foot_compensation.value > 0.;
-    const size_t first_layer    = std::max<size_t>(1, elephant_foot ? size_t(std::max(0, m_config.elefant_foot_compensation_layers.value)) : 0);
-    std::vector<int> sublayer_counts(m_layers.size(), 1);
-    bool             any_subdivided = false;
-    bool             counts_differ  = false;
+    const bool   elephant_foot = m_config.raft_layers == 0 && m_config.elefant_foot_compensation.value > 0.;
+    const size_t first_layer   = std::max<size_t>(1, elephant_foot ? size_t(std::max(0, m_config.elefant_foot_compensation_layers.value)) : 0);
+    const Print *print         = this->print();
+    const size_t num_regions   = m_shared_regions->all_regions.size();
+
+    // Every split a layer's regions ask for, finest first: a region printed in 2 passes and another in 4
+    // on the same layer each get their own planes. All the planes of the object go into one list, with
+    // where each lands, so the mesh is sliced once.
+    struct Plane
+    {
+        float  slice_z;
+        size_t layer_idx;
+        size_t split;
+        size_t pass;
+    };
+    std::vector<Plane> planes;
     for (size_t layer_idx = first_layer; layer_idx < m_layers.size(); ++ layer_idx) {
-        const Layer *layer = m_layers[layer_idx];
-        int          count = 1;
-        for (const LayerRegion *layerm : layer->regions()) {
-            if (layerm->slices.empty())
-                continue;
-            const int region_count = wall_sublayer_count(layerm->region().config(), this->print()->config(), layer->height);
-            counts_differ |= region_count > 1 && count > 1 && region_count != count;
-            count = std::max(count, region_count);
-        }
-        sublayer_counts[layer_idx] = count;
-        any_subdivided |= count > 1;
-    }
-    if (! any_subdivided)
-        return;
-    // A layer carries one set of passes, so every sub-layered region on it gets the finest split any of
-    // them asks for.
-    if (counts_differ)
-        this->active_step_add_warning(PrintStateBase::WarningLevel::NON_CRITICAL,
-            L("Parts or modifiers of this object ask for different outer wall sub-layer heights on the same layer. "
-              "Their walls are all printed with the most passes any of them asks for.") + std::string("\n") +
-            L("Object name") + std::string(": ") + this->model_object()->name);
-
-    const Print *print               = this->print();
-    auto         throw_on_cancel     = [print]() { print->throw_if_canceled(); };
-
-    // One ascending list of sub-slice planes for the whole object, so the mesh is sliced once.
-    std::vector<float> slice_zs;
-    std::vector<size_t> zs_begin(m_layers.size(), 0);
-    for (size_t layer_idx = 0; layer_idx < m_layers.size(); ++ layer_idx) {
-        Layer    *layer = m_layers[layer_idx];
-        const int count = sublayer_counts[layer_idx];
-        zs_begin[layer_idx] = slice_zs.size();
-        if (count < 2)
-            continue;
-        const coordf_t sub_height = layer->height / count;
-        layer->wall_sub_slices.reserve(count);
-        for (int k = 0; k < count; ++ k) {
-            WallSubSlice sub;
-            sub.height  = sub_height;
-            // The topmost sub-layer ends exactly at the layer's print_z, so the walls finish flush
-            // with the inner walls and the infill that follow them.
-            sub.print_z = (k + 1 == count) ? layer->print_z : layer->bottom_z() + (k + 1) * sub_height;
-            sub.slice_z = layer->bottom_z() + (k + 0.5) * sub_height;
-            sub.region_slices.resize(m_shared_regions->all_regions.size());
-            slice_zs.emplace_back((float) sub.slice_z);
-            layer->wall_sub_slices.emplace_back(std::move(sub));
+        Layer        *layer = m_layers[layer_idx];
+        std::set<int> counts;
+        for (const LayerRegion *layerm : layer->regions())
+            if (! layerm->slices.empty())
+                if (const int count = wall_sublayer_count(*this, layerm->region(), layer->height); count > 1)
+                    counts.insert(count);
+        for (auto it = counts.rbegin(); it != counts.rend(); ++ it) {
+            const int      count      = *it;
+            const coordf_t sub_height = layer->height / count;
+            std::vector<WallSubSlice> &split = layer->wall_sublayer_splits.emplace_back();
+            split.reserve(count);
+            for (int k = 0; k < count; ++ k) {
+                WallSubSlice sub;
+                sub.height  = sub_height;
+                // The topmost sub-layer ends exactly at the layer's print_z, so the walls finish flush
+                // with the inner walls and the infill that follow them.
+                sub.print_z = (k + 1 == count) ? layer->print_z : layer->bottom_z() + (k + 1) * sub_height;
+                // Placed around the layer's own slicing plane rather than its print_z: on a belt printer
+                // print_z is moved after slicing, while the geometry stays where it was sliced.
+                sub.slice_z = layer->slice_z - 0.5 * layer->height + (k + 0.5) * sub_height;
+                sub.region_slices.resize(num_regions);
+                planes.push_back({float(sub.slice_z), layer_idx, layer->wall_sublayer_splits.size() - 1, size_t(k)});
+                split.emplace_back(std::move(sub));
+            }
         }
     }
-    if (slice_zs.empty())
+    if (planes.empty())
         return;
 
+    auto throw_on_cancel = [print]() { print->throw_if_canceled(); };
     BOOST_LOG_TRIVIAL(debug) << "Slicing sub-layers for sub-layered walls - begin";
     // Each layer's planes are handed to the regions of the layer range its own slice_z is in. A range
     // boundary inside a layer would otherwise give the planes beyond it to the next range's regions,
     // which this layer does not have, and those passes would come out empty. So the planes are sliced
     // at their own height, one range at a time, but distributed with their height clamped into that
     // range - the volumes' extents are clipped to it, and a plane past it would match none of them.
-    const auto  &layer_ranges = m_shared_regions->layer_ranges;
-    const size_t num_regions  = m_shared_regions->all_regions.size();
+    const auto &layer_ranges = m_shared_regions->layer_ranges;
     std::vector<std::vector<size_t>> planes_by_range(layer_ranges.size());
-    for (size_t layer_idx = 0; layer_idx < m_layers.size(); ++ layer_idx)
-        if (const size_t count = m_layers[layer_idx]->wall_sub_slices.size(); count > 0) {
-            const size_t range_idx = layer_range_first(layer_ranges, m_layers[layer_idx]->slice_z) - layer_ranges.begin();
-            for (size_t k = 0; k < count; ++ k)
-                planes_by_range[range_idx].emplace_back(zs_begin[layer_idx] + k);
-        }
-    std::vector<std::vector<ExPolygons>> region_slices(num_regions, std::vector<ExPolygons>(slice_zs.size()));
+    for (size_t i = 0; i < planes.size(); ++ i)
+        planes_by_range[layer_range_first(layer_ranges, m_layers[planes[i].layer_idx]->slice_z) - layer_ranges.begin()].emplace_back(i);
+    // Indexed like `planes`.
+    std::vector<std::vector<ExPolygons>> region_slices(num_regions, std::vector<ExPolygons>(planes.size()));
     for (size_t range_idx = 0; range_idx < layer_ranges.size(); ++ range_idx) {
-        const std::vector<size_t> &planes = planes_by_range[range_idx];
-        if (planes.empty())
+        std::vector<size_t> &in_range = planes_by_range[range_idx];
+        if (in_range.empty())
             continue;
+        // The slicer wants its planes ascending; the planes of several splits of one layer interleave.
+        std::stable_sort(in_range.begin(), in_range.end(), [&planes](size_t l, size_t r) { return planes[l].slice_z < planes[r].slice_z; });
         const std::vector<PrintObjectRegions::LayerRangeRegions> range { layer_ranges[range_idx] };
         const t_layer_height_range &bounds = range.front().layer_height_range;
         std::vector<float> zs, zs_in_range;
-        for (const size_t plane : planes) {
-            zs.emplace_back(slice_zs[plane]);
-            zs_in_range.emplace_back(float(std::clamp<double>(slice_zs[plane], bounds.first, bounds.second - EPSILON)));
+        for (const size_t plane : in_range) {
+            zs.emplace_back(planes[plane].slice_z);
+            zs_in_range.emplace_back(float(std::clamp<double>(planes[plane].slice_z, bounds.first, bounds.second - EPSILON)));
         }
         std::vector<VolumeSlices> volume_slices = slice_volumes_inner(
             print->config(), this->config(), this->trafo_centered(), this->model_object()->volumes, range, zs, throw_on_cancel);
@@ -1807,8 +1797,8 @@ void PrintObject::slice_wall_sublayers()
             slices_to_regions(print->config(), *this, this->model_object()->volumes, num_regions, range, zs_in_range,
                               std::move(volume_slices), PrintObject::clip_multipart_objects, throw_on_cancel);
         for (size_t region_id = 0; region_id < num_regions; ++ region_id)
-            for (size_t i = 0; i < planes.size(); ++ i)
-                region_slices[region_id][planes[i]] = std::move(range_slices[region_id][i]);
+            for (size_t i = 0; i < in_range.size(); ++ i)
+                region_slices[region_id][in_range[i]] = std::move(range_slices[region_id][i]);
     }
     m_print->throw_if_canceled();
 
@@ -1819,28 +1809,75 @@ void PrintObject::slice_wall_sublayers()
     const auto   xy_contour_scaled = (num_extruders > 1 && this->is_mm_painted()) ? 0. : (double) scaled<float>(m_config.xy_contour_compensation.value);
 
     tbb::parallel_for(
-        tbb::blocked_range<size_t>(0, m_layers.size()),
-        [this, &region_slices, &zs_begin, xy_hole_scaled, xy_contour_scaled](const tbb::blocked_range<size_t> &range) {
-            for (size_t layer_idx = range.begin(); layer_idx < range.end(); ++ layer_idx) {
+        tbb::blocked_range<size_t>(0, planes.size()),
+        [this, &planes, &region_slices, xy_hole_scaled, xy_contour_scaled](const tbb::blocked_range<size_t> &range) {
+            for (size_t i = range.begin(); i < range.end(); ++ i) {
                 m_print->throw_if_canceled();
-                Layer *layer = m_layers[layer_idx];
-                for (size_t k = 0; k < layer->wall_sub_slices.size(); ++ k) {
-                    WallSubSlice &sub   = layer->wall_sub_slices[k];
-                    const size_t  z_idx = zs_begin[layer_idx] + k;
-                    ExPolygons    merged;
-                    for (size_t region_id = 0; region_id < region_slices.size(); ++ region_id) {
-                        ExPolygons slices = std::move(region_slices[region_id][z_idx]);
-                        if (xy_contour_scaled > 0 || xy_hole_scaled > 0)
-                            slices = this->_shrink_contour_holes(std::max(0., xy_contour_scaled), std::max(0., xy_hole_scaled), slices);
-                        if (xy_contour_scaled < 0 || xy_hole_scaled < 0)
-                            slices = this->_shrink_contour_holes(std::min(0., xy_contour_scaled), std::min(0., xy_hole_scaled), slices);
-                        append(merged, slices);
-                        sub.region_slices[region_id] = std::move(slices);
-                    }
-                    sub.merged = union_ex(merged);
+                const Plane  &plane = planes[i];
+                WallSubSlice &sub   = m_layers[plane.layer_idx]->wall_sublayer_splits[plane.split][plane.pass];
+                ExPolygons    merged;
+                for (size_t region_id = 0; region_id < region_slices.size(); ++ region_id) {
+                    ExPolygons slices = std::move(region_slices[region_id][i]);
+                    if (xy_contour_scaled > 0 || xy_hole_scaled > 0)
+                        slices = this->_shrink_contour_holes(std::max(0., xy_contour_scaled), std::max(0., xy_hole_scaled), slices);
+                    if (xy_contour_scaled < 0 || xy_hole_scaled < 0)
+                        slices = this->_shrink_contour_holes(std::min(0., xy_contour_scaled), std::min(0., xy_hole_scaled), slices);
+                    append(merged, slices);
+                    sub.region_slices[region_id] = std::move(slices);
                 }
+                sub.merged = union_ex(merged);
             }
         });
+    m_print->throw_if_canceled();
+
+    // Some steps split a layer's slices between regions after slicing, in a way the sub-slices, taken
+    // straight from the volumes, cannot reproduce: colour and fuzzy skin painting hand the painted areas
+    // to regions of their own (apply_mm_segmentation(), apply_fuzzy_skin_segmentation()), and interlocking
+    // beams interleave two parts along their interface. The sub-slices are split the same way here:
+    // whatever lies in a region's slice of the layer goes to that region, and whatever lies outside the
+    // layer's slice - where a sloped surface carries a pass past the layer's outline - to the region it is
+    // nearest, or failing that back to the region it was sliced into. Without this a volume's passes would
+    // print its outer wall over the colours painted on it, or across the beams of the part next to it.
+    const bool interlocking = m_config.interlocking_beam && m_config.interlocking_beam_layer_count >= 1 &&
+                              m_config.interlocking_depth >= 1 && m_config.interlocking_beam_width > EPSILON;
+    if ((num_extruders > 1 && this->is_mm_painted()) || this->model_object()->is_fuzzy_skin_painted() || interlocking)
+        tbb::parallel_for(
+            tbb::blocked_range<size_t>(0, planes.size()),
+            [this, &planes, num_regions](const tbb::blocked_range<size_t> &range) {
+                for (size_t i = range.begin(); i < range.end(); ++ i) {
+                    m_print->throw_if_canceled();
+                    const Layer  &layer = *m_layers[planes[i].layer_idx];
+                    WallSubSlice &sub   = m_layers[planes[i].layer_idx]->wall_sublayer_splits[planes[i].split][planes[i].pass];
+                    ExPolygons              seeds;
+                    std::vector<size_t>     seed_owner;
+                    std::vector<ExPolygons> out(num_regions);
+                    for (size_t region_id = 0; region_id < num_regions; ++ region_id) {
+                        const ExPolygons territory = to_expolygons(layer.get_region(int(region_id))->slices.surfaces);
+                        out[region_id] = intersection_ex(sub.merged, territory);
+                        for (const ExPolygon &expoly : territory) {
+                            seeds.emplace_back(expoly);
+                            seed_owner.emplace_back(region_id);
+                        }
+                    }
+                    ExPolygons beyond = diff_ex(sub.merged, seeds);
+                    if (! beyond.empty() && ! seeds.empty()) {
+                        const std::vector<Polygons> grown = Algorithm::expand_expolygons(
+                            seeds, beyond, scaled<float>(10.), scaled<float>(0.2), 50);
+                        Polygons reached;
+                        for (size_t seed = 0; seed < grown.size(); ++ seed) {
+                            append(out[seed_owner[seed]], intersection_ex(grown[seed], beyond));
+                            append(reached, grown[seed]);
+                        }
+                        beyond = diff_ex(beyond, reached);
+                    }
+                    for (size_t region_id = 0; region_id < num_regions; ++ region_id) {
+                        // Out of reach of every region: it stays where it was sliced.
+                        if (! beyond.empty())
+                            append(out[region_id], intersection_ex(beyond, sub.region_slices[region_id]));
+                        sub.region_slices[region_id] = union_ex(out[region_id]);
+                    }
+                }
+            });
     m_print->throw_if_canceled();
     BOOST_LOG_TRIVIAL(debug) << "Slicing sub-layers for sub-layered walls - end";
 }
