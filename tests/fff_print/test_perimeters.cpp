@@ -1167,10 +1167,12 @@ TEST_CASE("A ceiling closing over is bridged with rings, not lines that run into
 TEST_CASE("A wall with nothing under it is bridged instead of drawn in mid air", "[Perimeters]")
 {
     const auto wall_generator = GENERATE("arachne", "classic");
-    INFO("wall_generator=" << wall_generator);
+    // unsupported_wall_last only reorders the walls it would keep: bridged walls are gone either way.
+    const auto unsupported_wall_last = GENERATE("0", "1");
+    INFO("wall_generator=" << wall_generator << " unsupported_wall_last=" << unsupported_wall_last);
 
     DynamicPrintConfig config = base_config(wall_generator);
-    config.set_deserialize_strict({{ "bridge_unsupported_wall", "0" }});
+    config.set_deserialize_strict({{ "bridge_unsupported_wall", "0" }, { "unsupported_wall_last", unsupported_wall_last }});
 
     Print print_off;
     Model model_off;
