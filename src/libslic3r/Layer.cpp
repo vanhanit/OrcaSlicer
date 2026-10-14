@@ -160,14 +160,31 @@ ExPolygons Layer::merged(float offset_scaled) const
 // up a slowdown a full-height wall over the same shape would not get.
 // Not what the pass below actually laid down - the wall generator needs that and tracks it itself,
 // because these layers are perimetered in parallel and none of them may read another's extrusions.
-const ExPolygons* Layer::wall_sublayer_support(size_t pass) const
+const std::vector<WallSubSlice>& Layer::wall_sub_slices() const
 {
-    if (pass > 0)
-        return pass <= this->wall_sub_slices.size() ? &this->wall_sub_slices[pass - 1].merged : nullptr;
+    static const std::vector<WallSubSlice> none;
+    return this->wall_sublayer_splits.empty() ? none : this->wall_sublayer_splits.front();
+}
+
+const std::vector<WallSubSlice>* Layer::wall_sublayer_split(size_t passes) const
+{
+    for (const std::vector<WallSubSlice> &split : this->wall_sublayer_splits)
+        if (split.size() == passes)
+            return &split;
+    return nullptr;
+}
+
+const ExPolygons* Layer::wall_sublayer_support(size_t passes, size_t pass) const
+{
+    if (pass > 0) {
+        const std::vector<WallSubSlice> *split = this->wall_sublayer_split(passes);
+        return split != nullptr && pass <= split->size() ? &(*split)[pass - 1].merged : nullptr;
+    }
     if (this->lower_layer == nullptr)
         return nullptr;
-    return this->lower_layer->wall_sub_slices.empty() ? &this->lower_layer->lslices
-                                                      : &this->lower_layer->wall_sub_slices.back().merged;
+    // The top of the layer below, at the finest resolution it was split in.
+    return this->lower_layer->wall_sub_slices().empty() ? &this->lower_layer->lslices
+                                                        : &this->lower_layer->wall_sub_slices().back().merged;
 }
 
 bool Layer::is_perimeter_compatible(const Print& print, const PrintRegion& a, const PrintRegion& b)

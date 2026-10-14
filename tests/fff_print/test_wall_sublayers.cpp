@@ -1,25 +1,47 @@
-#include <catch2/catch_all.hpp>
 
-#include "libslic3r/libslic3r.h"
+#include <catch2/catch_message.hpp>
+#include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
+#include <catch2/matchers/catch_matchers.hpp>
+#include <catch2/matchers/catch_matchers_floating_point.hpp>
+
 #include "libslic3r/BoundingBox.hpp"
 #include "libslic3r/ClipperUtils.hpp"
-#include "libslic3r/GCodeReader.hpp"
-#include "libslic3r/MeshBoolean.hpp"
-#include "libslic3r/Layer.hpp"
-#include "libslic3r/Print.hpp"
-#include "libslic3r/TriangleSelector.hpp"
+#include "libslic3r/Config.hpp"
+#include "libslic3r/ExPolygon.hpp"
+#include "libslic3r/ExtrusionEntity.hpp"
+#include "libslic3r/ExtrusionEntityCollection.hpp"
+#include "libslic3r/Flow.hpp"
 #include "libslic3r/GCode/GCodeProcessor.hpp"
+#include "libslic3r/GCodeReader.hpp"
+#include "libslic3r/Layer.hpp"
+#include "libslic3r/MeshBoolean.hpp"
+#include "libslic3r/Model.hpp"
+#include "libslic3r/Point.hpp"
+#include "libslic3r/Polygon.hpp"
+#include "libslic3r/Polyline.hpp"
+#include "libslic3r/Print.hpp"
+#include "libslic3r/PrintConfig.hpp"
+#include "libslic3r/Surface.hpp"
+#include "libslic3r/TriangleMesh.hpp"
+#include "libslic3r/TriangleSelector.hpp"
+#include "libslic3r/libslic3r.h"
 
 #include "test_helpers.hpp"
 
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstddef>
+#include <cstdlib>
 #include <functional>
+#include <initializer_list>
+#include <limits>
 #include <map>
 #include <set>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace Slic3r;
@@ -334,7 +356,7 @@ TEST_CASE("Sub-layered walls subdivide as many wall loops as asked for", "[WallS
     print.process();
 
     const Layer *layer = print.objects().front()->layers()[2];
-    REQUIRE(layer->wall_sub_slices.size() == 2);
+    REQUIRE(layer->wall_sub_slices().size() == 2);
 
     const LayerRegion *layerm = layer->regions().front();
     REQUIRE(layerm->sublayer_perimeters.size() == 2);
@@ -365,14 +387,14 @@ TEST_CASE("Sub-layered walls span the layer and end at its print_z", "[WallSubla
     const auto &layers = print.objects().front()->layers();
     REQUIRE(layers.size() > 2);
     // The first layer is excluded from the feature.
-    CHECK(layers.front()->wall_sub_slices.empty());
+    CHECK(layers.front()->wall_sub_slices().empty());
 
     const Layer *layer = layers[2];
-    REQUIRE(layer->wall_sub_slices.size() == 4);
-    REQUIRE_THAT(layer->wall_sub_slices.back().print_z, Catch::Matchers::WithinAbs(layer->print_z, 1e-9));
-    REQUIRE_THAT(layer->wall_sub_slices.front().print_z - layer->wall_sub_slices.front().height,
+    REQUIRE(layer->wall_sub_slices().size() == 4);
+    REQUIRE_THAT(layer->wall_sub_slices().back().print_z, Catch::Matchers::WithinAbs(layer->print_z, 1e-9));
+    REQUIRE_THAT(layer->wall_sub_slices().front().print_z - layer->wall_sub_slices().front().height,
                  Catch::Matchers::WithinAbs(layer->bottom_z(), 1e-9));
-    for (const WallSubSlice &sub : layer->wall_sub_slices) {
+    for (const WallSubSlice &sub : layer->wall_sub_slices()) {
         REQUIRE_THAT(sub.height, Catch::Matchers::WithinAbs(0.05, 1e-9));
         CHECK(! sub.merged.empty());
     }
@@ -767,11 +789,11 @@ TEST_CASE("The layer's full-height phase stays out of what the passes own", "[Wa
 
     double worst_on_band = 0., worst_outside = 0., worst_z = 0.;
     for (const Layer *layer : print.objects().front()->layers()) {
-        if (layer->wall_sub_slices.size() < 2)
+        if (layer->wall_sub_slices().size() < 2)
             continue;
         // The union of the passes' wall bands, and the ground solid for the whole layer height.
-        ExPolygons bands, common = layer->wall_sub_slices.front().merged;
-        for (const WallSubSlice &sub : layer->wall_sub_slices) {
+        ExPolygons bands, common = layer->wall_sub_slices().front().merged;
+        for (const WallSubSlice &sub : layer->wall_sub_slices()) {
             append(bands, diff_ex(sub.merged, offset_ex(sub.merged, - scale_(0.42))));
             common = intersection_ex(common, sub.merged);
         }
@@ -835,7 +857,7 @@ TEST_CASE("Sub-layered wall support fill is not sprayed over overhangs", "[WallS
     double length = 0.;
     int    paths = 0, fragments = 0;
     for (const Layer *layer : print.objects().front()->layers())
-        for (size_t k = 0; k < layer->wall_sub_slices.size(); ++ k) {
+        for (size_t k = 0; k < layer->wall_sub_slices().size(); ++ k) {
             Polylines fill;
             for (const LayerRegion *layerm : layer->regions())
                 if (k < layerm->sublayer_perimeters.size())
@@ -1301,7 +1323,7 @@ TEST_CASE("A concentric sub-layer fill follows the surface it fills", "[WallSubl
 
         int closed = 0, open = 0;
         for (const Layer *layer : print.objects().front()->layers())
-            for (size_t k = 0; k < layer->wall_sub_slices.size(); ++ k) {
+            for (size_t k = 0; k < layer->wall_sub_slices().size(); ++ k) {
                 Polylines fill;
                 for (const LayerRegion *layerm : layer->regions())
                     if (k < layerm->sublayer_perimeters.size())
@@ -1407,7 +1429,7 @@ TEST_CASE("Sub-layered walls stay joined to the walls the layer keeps", "[WallSu
         for (const LayerRegion *lr : layer->regions())
             for (const ExtrusionEntity *ee : lr->perimeters.entities) pts(ee, core);
         if (core.empty()) continue;
-        for (size_t k = 0; k < layer->wall_sub_slices.size(); ++ k) {
+        for (size_t k = 0; k < layer->wall_sub_slices().size(); ++ k) {
             Points band; bool tread = false;
             for (const LayerRegion *lr : layer->regions())
                 if (k < lr->sublayer_perimeters.size()) {
@@ -1463,7 +1485,7 @@ TEST_CASE("A sub-layered thin feature is covered end to end", "[WallSublayers]")
     double worst = 0.;
     int    passes = 0;
     for (const Layer *layer : print.objects().front()->layers()) {
-        if (layer->id() < 3 || layer->wall_sub_slices.empty())
+        if (layer->id() < 3 || layer->wall_sub_slices().empty())
             continue;
         Polygons core;
         for (const LayerRegion *lr : layer->regions()) {
@@ -1471,12 +1493,12 @@ TEST_CASE("A sub-layered thin feature is covered end to end", "[WallSublayers]")
             append(core, lr->fills.polygons_covered_by_width(float(SCALED_EPSILON)));
             append(core, lr->thin_fills.polygons_covered_by_width(float(SCALED_EPSILON)));
         }
-        for (size_t k = 0; k < layer->wall_sub_slices.size(); ++ k) {
+        for (size_t k = 0; k < layer->wall_sub_slices().size(); ++ k) {
             Polygons covered = core;
             for (const LayerRegion *lr : layer->regions())
                 if (k < lr->sublayer_perimeters.size())
                     append(covered, lr->sublayer_perimeters[k].polygons_covered_by_width(float(SCALED_EPSILON)));
-            const ExPolygons slice = layer->wall_sub_slices[k].merged;
+            const ExPolygons slice = layer->wall_sub_slices()[k].merged;
             if (slice.empty())
                 continue;
             double total = 0., bare = 0.;
@@ -1569,7 +1591,7 @@ TEST_CASE("A sub-layered hollow shell keeps its walls all the way up", "[WallSub
     std::vector<double> band;
     for (const Layer *layer : print.objects().front()->layers()) {
         // The sphere's crown and its footprint shrink to nothing, so only the body is measured.
-        if (layer->print_z < 6. || layer->print_z > 34. || layer->wall_sub_slices.empty()) continue;
+        if (layer->print_z < 6. || layer->print_z > 34. || layer->wall_sub_slices().empty()) continue;
         double len = 0.;
         for (const LayerRegion *lr : layer->regions())
             for (const auto &pass : lr->sublayer_perimeters) {
@@ -1597,10 +1619,10 @@ double airborne_pass_wall_length(const Print &print)
 {
     double len = 0.;
     for (const Layer *layer : print.objects().front()->layers()) {
-        if (layer->lower_layer == nullptr || layer->wall_sub_slices.empty())
+        if (layer->lower_layer == nullptr || layer->wall_sub_slices().empty())
             continue;
         Polygons laid = to_polygons(layer->lower_layer->lslices);
-        for (size_t k = 0; k < layer->wall_sub_slices.size(); ++ k) {
+        for (size_t k = 0; k < layer->wall_sub_slices().size(); ++ k) {
             Polygons pass_covered;
             std::function<void(const ExtrusionEntity *)> walk = [&](const ExtrusionEntity *entity) {
                 if (const auto *collection = dynamic_cast<const ExtrusionEntityCollection *>(entity)) {
@@ -1673,10 +1695,10 @@ TEST_CASE("A sub-layered pass does not ring a cavity that is closing over", "[Wa
     double over_model = 0., over_below = 0., total = 0., crept = 0.;
     std::vector<double> reach;
     for (const Layer *layer : print.objects().front()->layers()) {
-        if (layer->print_z < 3.2 || layer->print_z > 5. || layer->wall_sub_slices.empty())
+        if (layer->print_z < 3.2 || layer->print_z > 5. || layer->wall_sub_slices().empty())
             continue;
-        for (size_t k = 0; k < layer->wall_sub_slices.size(); ++ k) {
-            const ExPolygons *support = layer->wall_sublayer_support(k);
+        for (size_t k = 0; k < layer->wall_sub_slices().size(); ++ k) {
+            const ExPolygons *support = layer->wall_sublayer_support(layer->wall_sub_slices().size(), k);
             if (support == nullptr)
                 continue;
             // The voids the model below encloses.
@@ -1704,7 +1726,7 @@ TEST_CASE("A sub-layered pass does not ring a cavity that is closing over", "[Wa
             if (layer->lower_layer != nullptr) {
                 ExPolygons core;
                 bool       core_set = false;
-                for (const WallSubSlice &sub : layer->lower_layer->wall_sub_slices) {
+                for (const WallSubSlice &sub : layer->lower_layer->wall_sub_slices()) {
                     if (sub.merged.empty()) continue;
                     core = core_set ? intersection_ex(core, sub.merged) : sub.merged;
                     core_set = true;
@@ -1740,7 +1762,7 @@ TEST_CASE("A sub-layered pass does not ring a cavity that is closing over", "[Wa
     // ring with a gap around it.
     std::vector<double> edge_gaps;
     for (const Layer *layer : print.objects().front()->layers()) {
-        if (layer->print_z < 3.2 || layer->print_z > 5. || layer->wall_sub_slices.empty())
+        if (layer->print_z < 3.2 || layer->print_z > 5. || layer->wall_sub_slices().empty())
             continue;
         Polylines threads;
         for (const LayerRegion *region : layer->regions()) {
@@ -1755,7 +1777,7 @@ TEST_CASE("A sub-layered pass does not ring a cavity that is closing over", "[Wa
         // slice.
         ExPolygons core;
         bool       core_set = false;
-        for (const WallSubSlice &sub : layer->wall_sub_slices) {
+        for (const WallSubSlice &sub : layer->wall_sub_slices()) {
             if (sub.merged.empty()) continue;
             core = core_set ? intersection_ex(core, sub.merged) : sub.merged;
             core_set = true;
@@ -1904,32 +1926,51 @@ TEST_CASE("A modifier that sub-layers part of an object leaves the rest of the o
     CHECK(pass_max_x < object_box.min.x() + 4. + 1.);
 }
 
-TEST_CASE("A region asking for coarser sub-layers than another on the same layer is warned", "[WallSublayers]")
+TEST_CASE("A region gets the sub-layer height it asks for rather than another region's", "[WallSublayers]")
 {
-    // A layer carries one set of passes. Where the object splits its 0.2mm layers by 0.05mm into 4 and a
-    // modifier over its left 4mm asks for 0.1mm, so 2, the modifier is printed in 4 as well - and the
-    // user has to be told, not left to find out from the preview.
-    const auto slice_warnings = [](const char *modifier_height) {
-        TriangleMesh modifier = make_cube(6., 24., 6.);
-        modifier.translate(-2., -2., -1.);
-        Print print;
-        Model model;
-        init_object(print, model, plain_config({{"wall_sublayer_height", "0.05"}}), make_cube(20., 20., 4.),
-                    {{std::move(modifier), ModelVolumeType::PARAMETER_MODIFIER, {{"wall_sublayer_height", modifier_height}}}});
-        print.process();
-        std::vector<std::string> messages;
-        for (const PrintStateBase::Warning &warning : print.objects().front()->step_state_with_warnings(posPerimeters).warnings)
-            messages.emplace_back(warning.message);
-        return messages;
-    };
-    const auto mentions_sublayers = [](const std::vector<std::string> &messages) {
-        return std::any_of(messages.begin(), messages.end(), [](const std::string &m) { return m.find("sub-layer") != std::string::npos; });
-    };
-    // 0.025mm splits the layer into 8: finer than the object's 4, and still not what the object asks.
-    CHECK(mentions_sublayers(slice_warnings("0.1")));
-    CHECK(mentions_sublayers(slice_warnings("0.025")));
-    // Asking for the same split as the object is no conflict.
-    CHECK(! mentions_sublayers(slice_warnings("0.05")));
+    // The object splits its 0.2mm layers by 0.05mm into 4 passes; a modifier over its left 4mm asks for
+    // 0.1mm, so 2 passes, or for 0.025mm, so 8. Each prints its outer wall at exactly its own pass
+    // heights, and the two interleave without the nozzle ever moving down within a layer.
+    const auto [modifier_height, modifier_step] = GENERATE(std::pair{"0.1", 0.1}, std::pair{"0.025", 0.025});
+    INFO("modifier wall_sublayer_height " << modifier_height);
+    TriangleMesh modifier = make_cube(6., 24., 6.);
+    modifier.translate(-2., -2., -1.);
+    Print print;
+    Model model;
+    init_object(print, model, plain_config({{"wall_sublayer_height", "0.05"}}), make_cube(20., 20., 4.),
+                {{std::move(modifier), ModelVolumeType::PARAMETER_MODIFIER, {{"wall_sublayer_height", modifier_height}}}});
+    const std::string gcode = Slic3r::Test::gcode(print);
+    REQUIRE(! gcode.empty());
+
+    BoundingBoxf object_box;
+    for_each_move_of_type(gcode, "Outer wall", [&](const GCodeReader &self, int) { object_box.merge(Vec2d(self.x(), self.y())); });
+    std::set<double> modifier_zs, object_zs;
+    for_each_move_of_type(gcode, "Outer wall", [&](const GCodeReader &self, int) {
+        if (self.z() < 0.2 + EPSILON)
+            return;
+        if (self.x() < object_box.min.x() + 3.)
+            modifier_zs.insert(self.z());
+        else if (self.x() > object_box.min.x() + 6.)
+            object_zs.insert(self.z());
+    });
+    REQUIRE(! modifier_zs.empty());
+    REQUIRE(! object_zs.empty());
+    for (const double z : modifier_zs) {
+        INFO("outer wall inside the modifier at z " << z);
+        CHECK(on_layer_top(z, modifier_step));
+    }
+    for (const double z : object_zs) {
+        INFO("outer wall outside the modifier at z " << z);
+        CHECK(on_layer_top(z, 0.05));
+    }
+    // Both splits are actually used: more pass heights inside the finer region than the coarser has.
+    CHECK(modifier_zs.size() != object_zs.size());
+
+    for (const auto &layer : extruding_zs_per_layer(gcode))
+        for (size_t k = 1; k < layer.size(); ++ k) {
+            INFO("step " << k << ": " << layer[k - 1] << " -> " << layer[k]);
+            REQUIRE(layer[k] >= layer[k - 1] - EPSILON);
+        }
 }
 
 TEST_CASE("Sub-layered walls follow a layer range whose boundary falls inside a layer", "[WallSublayers]")
@@ -2040,18 +2081,89 @@ TEST_CASE("Colour painting does not block sub-layered walls on a single-filament
     CHECK(error.string.empty());
 }
 
-TEST_CASE("Colour painting is rejected with sub-layered walls on a multi-filament printer", "[WallSublayers]")
+TEST_CASE("Colour painted outer walls in another filament print whole after the passes", "[WallSublayers]")
 {
-    // The sub-slices bypass the colour segmentation, so the painted colours would be lost.
-    Print print;
-    Model model;
-    init_object(print, model, multifilament_config(2, {{"layer_height", "0.2"}, {"layer_change_gcode", "G92 E0"}, {"wall_sublayer_height", "0.05"}}),
-                make_cube(20., 20., 4.), {}, [](ModelObject &object) {
-                    paint(*object.volumes.front(), object.volumes.front()->mmu_segmentation_facets, EnforcerBlockerType::Extruder2, true);
-                });
-    const StringObjectException error = print.validate();
-    INFO("validate: " << error.string);
-    CHECK(error.string.find("multi-material painting") != std::string::npos);
+    // The +X face of the block is painted in filament 2. Only one filament can print below a layer's
+    // print_z without the nozzle coming down beside something already standing a full layer high, so the
+    // object's own filament 1 prints its outer wall in passes, and wherever the painting reaches the
+    // outer wall that wall prints once in filament 2, at the full layer height, after them. Which layers
+    // the painting reaches is the colour segmentation's business, so it is taken from the same print
+    // without sub-layers: per layer, the painted face's outer wall prints in the same filaments.
+    const auto slice_painted = [](const char *sublayer_height, std::vector<StringObjectException> *warnings) {
+        Print print;
+        Model model;
+        init_object(print, model,
+                    multifilament_config(2, {{"layer_height", "0.2"},
+                                             {"initial_layer_print_height", "0.2"},
+                                             {"wall_loops", "3"},
+                                             {"z_hop", "0"},
+                                             {"skirt_loops", "0"},
+                                             {"enable_prime_tower", "0"},
+                                             {"layer_change_gcode", "G92 E0"},
+                                             {"wall_sublayer_height", sublayer_height}}),
+                    make_cube(20., 20., 4.), {}, [](ModelObject &object) {
+                        paint(*object.volumes.front(), object.volumes.front()->mmu_segmentation_facets, EnforcerBlockerType::Extruder2, false);
+                    });
+        const StringObjectException error = print.validate(warnings);
+        INFO("validate: " << error.string);
+        REQUIRE(error.string.empty());
+        return Slic3r::Test::gcode(print);
+    };
+    // The filaments printing the painted face's outer wall, by the top of the layer they belong to.
+    const auto painted_face_tools = [](const std::string &gcode) {
+        BoundingBoxf object_box;
+        for_each_move_of_type(gcode, "Outer wall", [&](const GCodeReader &self, int) { object_box.merge(Vec2d(self.x(), self.y())); });
+        std::map<long, std::set<int>> tools;
+        for_each_move_of_type(gcode, "Outer wall", [&](const GCodeReader &self, int tool) {
+            if (self.x() > object_box.max.x() - 0.3)
+                tools[std::lround(std::ceil(self.z() / 0.2 - 1e-3))].insert(tool);
+        });
+        return tools;
+    };
+
+    const std::string plain = slice_painted("0", nullptr);
+    REQUIRE(! plain.empty());
+    const auto plain_tools = painted_face_tools(plain);
+    // The painting reaches the outer wall on most of the 20 layers of 0.2mm in 4mm.
+    REQUIRE(std::count_if(plain_tools.begin(), plain_tools.end(), [](const auto &l) { return l.second.count(1) > 0; }) > 10);
+
+    std::vector<StringObjectException> warnings;
+    const std::string gcode = slice_painted("0.05", &warnings);
+    REQUIRE(! gcode.empty());
+    CHECK(std::any_of(warnings.begin(), warnings.end(), [](const StringObjectException &w) {
+        return w.opt_key == "wall_sublayer_height" && w.string.find("painted") != std::string::npos;
+    }));
+    const auto tools = painted_face_tools(gcode);
+    for (const auto &[layer, plain_layer_tools] : plain_tools) {
+        INFO("layer " << layer);
+        CHECK(tools.count(layer) == 1);
+        if (tools.count(layer) == 1)
+            CHECK(tools.at(layer) == plain_layer_tools);
+    }
+
+    // The passes are all the object's own filament, and stay off the face wherever it is painted.
+    BoundingBoxf object_box;
+    for_each_move_of_type(gcode, "Outer wall", [&](const GCodeReader &self, int) { object_box.merge(Vec2d(self.x(), self.y())); });
+    std::set<int> pass_tools;
+    for_each_move_of_type(gcode, "Outer wall", [&](const GCodeReader &self, int tool) {
+        if (on_layer_top(self.z(), 0.2))
+            return;
+        pass_tools.insert(tool);
+        if (self.x() > object_box.max.x() - 0.3) {
+            const long layer = std::lround(std::ceil(self.z() / 0.2 - 1e-3));
+            INFO("pass on the painted face at z " << self.z());
+            CHECK(plain_tools.count(layer) == 1);
+            if (plain_tools.count(layer) == 1)
+                CHECK(plain_tools.at(layer).count(1) == 0);
+        }
+    });
+    CHECK(pass_tools == std::set<int>{0});
+
+    for (const auto &layer : extruding_zs_per_layer(gcode))
+        for (size_t k = 1; k < layer.size(); ++ k) {
+            INFO("step " << k << ": " << layer[k - 1] << " -> " << layer[k]);
+            REQUIRE(layer[k] >= layer[k - 1] - EPSILON);
+        }
 }
 
 TEST_CASE("Sub-layered walls keep Z rising within a layer when the walls use two filaments", "[WallSublayers]")
@@ -2277,4 +2389,104 @@ TEST_CASE("Sub-layered walls and mixed color sub-layers print a sound layer toge
     CHECK(std::any_of(warnings.begin(), warnings.end(), [](const StringObjectException &w) {
         return w.opt_key == "wall_sublayer_height" && w.string.find("mixed") != std::string::npos;
     }));
+}
+
+TEST_CASE("Sub-layered walls on a belt printer slice their passes around the layer's own plane", "[WallSublayers][belt]")
+{
+    // A belt printer slices the cube tilted 45 degrees and moves every layer's print_z afterwards, while
+    // its geometry stays where it was sliced. The passes have to be sliced around the layer's slicing
+    // plane: the second and third of 4 passes are 1/8 of the layer below and above it, so where the
+    // tilted cross-section grows or shrinks the layer's own outline lies between theirs.
+    Model model;
+    Print print;
+    init_print({cube(20)}, print, model, {{"belt_printer", 1},
+                                          {"belt_slice_rotation", "x"},
+                                          {"belt_slice_rotation_angle", 45},
+                                          {"layer_height", 0.2},
+                                          {"initial_layer_print_height", 0.2},
+                                          {"skirt_loops", 0},
+                                          {"elefant_foot_compensation", 0},
+                                          {"wall_sublayer_height", "0.05"}});
+    print.process();
+    const PrintObject *object = print.objects().front();
+
+    // The belt moved print_z off the slicing plane, or this would not test anything.
+    bool shifted = false;
+    for (const Layer *layer : object->layers())
+        shifted = shifted || std::abs(layer->print_z - 0.5 * layer->height - layer->slice_z) > 0.01;
+    REQUIRE(shifted);
+
+    const auto area = [](const ExPolygons &expolygons) {
+        double out = 0.;
+        for (const ExPolygon &expolygon : expolygons)
+            out += expolygon.area();
+        return out;
+    };
+    size_t checked = 0;
+    for (const Layer *layer : object->layers()) {
+        const std::vector<WallSubSlice> &passes = layer->wall_sub_slices();
+        if (passes.size() != 4)
+            continue;
+        const double below = area(passes[1].merged), above = area(passes[2].merged), own = area(layer->lslices);
+        // Only where the cross-section changes measurably across the layer.
+        if (std::abs(above - below) < 0.01 * own)
+            continue;
+        ++ checked;
+        INFO("layer at slice_z " << layer->slice_z << ": passes " << below << " / " << above << ", layer " << own);
+        CHECK(own > std::min(below, above) - 0.002 * own);
+        CHECK(own < std::max(below, above) + 0.002 * own);
+    }
+    REQUIRE(checked > 10);
+}
+
+TEST_CASE("Sub-layered walls follow the beams interlocking two parts", "[WallSublayers]")
+{
+    // Two touching blocks in filaments 1 and 2, interlocked by beams along their interface; only the
+    // first is sub-layered. The beams reshape both parts' slices after slicing, so the first part's
+    // passes have to follow its interlocked outline rather than the straight interface of the model,
+    // or they print through the second part's beams.
+    TriangleMesh second = make_cube(20., 20., 4.);
+    second.translate(20., 0., 0.);
+    Print print;
+    Model model;
+    init_object(print, model,
+                multifilament_config(2, {{"layer_height", "0.2"},
+                                         {"initial_layer_print_height", "0.2"},
+                                         {"wall_loops", "2"},
+                                         {"z_hop", "0"},
+                                         {"skirt_loops", "0"},
+                                         {"enable_prime_tower", "0"},
+                                         {"layer_change_gcode", "G92 E0"},
+                                         {"interlocking_beam", "1"},
+                                         {"wall_sublayer_height", "0.05"}}),
+                make_cube(20., 20., 4.),
+                {{std::move(second), ModelVolumeType::MODEL_PART,
+                  {{"outer_wall_filament_id", "2"}, {"inner_wall_filament_id", "2"}, {"sparse_infill_filament_id", "2"},
+                   {"internal_solid_filament_id", "2"}, {"wall_sublayer_height", "0"}}}});
+    const StringObjectException error = print.validate();
+    INFO("validate: " << error.string);
+    REQUIRE(error.string.empty());
+    print.process();
+
+    const PrintObject *object = print.objects().front();
+    int first = -1, second_id = -1;
+    for (const LayerRegion *layerm : object->layers()[2]->regions())
+        if (! layerm->slices.empty())
+            (layerm->region().config().outer_wall_filament_id.value == 1 ? first : second_id) = layerm->region().print_object_region_id();
+    REQUIRE(first >= 0);
+    REQUIRE(second_id >= 0);
+
+    size_t passes = 0;
+    for (const Layer *layer : object->layers()) {
+        const ExPolygons theirs = to_expolygons(layer->get_region(second_id)->slices.surfaces);
+        for (const WallSubSlice &sub : layer->wall_sub_slices()) {
+            ++ passes;
+            double overlap = 0.;
+            for (const ExPolygon &e : intersection_ex(sub.region_slices[first], theirs))
+                overlap += unscaled(unscaled(e.area()));
+            INFO("layer at " << layer->print_z << ", pass at " << sub.print_z);
+            CHECK(overlap < 0.05);
+        }
+    }
+    REQUIRE(passes > 0);
 }

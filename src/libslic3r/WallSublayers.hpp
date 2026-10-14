@@ -8,6 +8,9 @@
 namespace Slic3r {
 
 class LayerRegion;
+class PrintObject;
+class PrintRegion;
+struct WallSubSlice;
 class PrintConfig;
 class PrintRegionConfig;
 using LayerRegionPtrs = std::vector<LayerRegion*>;
@@ -18,13 +21,19 @@ using LayerRegionPtrs = std::vector<LayerRegion*>;
 static constexpr int      MAX_WALL_SUBLAYERS       = 10;
 static constexpr coordf_t MIN_WALL_SUBLAYER_HEIGHT = 0.02;
 
-// How many sub-layers a layer of the given height is split into for this region, 1 meaning the walls
-// print at the full layer height as usual. wall_sublayer_height is resolved against the real layer
-// height rather than the layer_height setting, so adaptive and per-range heights are honored.
-// Walls in a mixed filament that enable_mixed_color_sublayer splits into color sub-layers are never
-// sub-layered: that split already divides their layer in Z, once per component filament.
-int wall_sublayer_count(const PrintRegionConfig &config, const PrintConfig &print_config, coordf_t layer_height);
+// How many sub-layers a layer of the given height is split into for this region of the object, 1
+// meaning the walls print at the full layer height as usual. wall_sublayer_height is resolved against
+// the real layer height rather than the layer_height setting, so adaptive and per-range heights are
+// honored. Two kinds of walls are never sub-layered, see the predicates below.
+int wall_sublayer_count(const PrintObject &object, const PrintRegion &region, coordf_t layer_height);
+// Walls in a mixed filament that enable_mixed_color_sublayer splits into color sub-layers: that split
+// already divides their layer in Z, once per component filament.
 bool wall_in_mixed_color_sublayers(const PrintRegionConfig &config, const PrintConfig &print_config);
+// Walls colour painted in a filament other than their volume's. A layer's passes go first, before
+// anything is printed at its print_z, and only one filament can go first without the nozzle coming down
+// beside something already standing a full layer high - see ToolOrdering::put_sublayer_wall_extruders_first().
+// The object's own filament prints its walls in passes, the painted colours after them at full height.
+bool wall_painted_in_other_filament(const PrintObject &object, const PrintRegion &region);
 
 // The areas a layer's sub-layered walls are generated from, and the column left to the layer's own
 // full-height pass. band_walls == 0 means the feature is off for this region and the rest is empty.
@@ -36,6 +45,8 @@ struct WallSublayerContext
     // How many loops the passes actually print to cover that strip. Equal to band_walls unless
     // wall_sublayer_line_width makes the passes narrower than the loops they replace.
     int                     band_loops = 0;
+    // The split of the layer this region's passes are printed in, see Layer::wall_sublayer_split().
+    const std::vector<WallSubSlice> *passes = nullptr;
     // Per pass, lowest first: this layer re-sliced at that sub-layer's height, over all the regions
     // sharing this perimeter run.
     std::vector<ExPolygons> pass_slices;
