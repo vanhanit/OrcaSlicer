@@ -31,6 +31,7 @@ namespace Slic3r {
 
 class Print;
 class PrintObject;
+class Layer;
 class LayerTools;
 namespace CustomGCode { struct Item; }
 class PrintRegion;
@@ -237,9 +238,9 @@ public:
         std::map<VolumeKey, VolumeGradient> per_volume_gradient;
     };
     std::vector<MixedSubLayerGroup> mixed_sub_layer_groups;
-    // Orca: regions printing sub-layered walls on this layer. Their wall filament is put first in the
-    // layer, see ToolOrdering::put_sublayer_wall_extruders_first().
-    std::vector<const PrintRegion*> sublayer_wall_regions;
+    // Orca: object layers printing sub-layered walls on this layer. Their wall filament is put first in
+    // the layer, see ToolOrdering::put_sublayer_wall_extruders_first().
+    std::vector<const Layer*> sublayer_wall_layers;
 
     const MixedSubLayerGroup* mixed_group_by_slot(unsigned int slot_id) const {
         for (const auto &g : mixed_sub_layer_groups)

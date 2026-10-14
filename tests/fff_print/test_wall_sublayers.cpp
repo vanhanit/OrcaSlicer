@@ -30,6 +30,7 @@
 #include "test_helpers.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cmath>
 #include <cstddef>
@@ -41,6 +42,7 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -2775,4 +2777,99 @@ TEST_CASE("Sub-layered walls never take the nozzle into what is already printed"
     const std::string dip = first_dip_into_print(gcode);
     INFO(dip);
     CHECK(dip.empty());
+}
+
+TEST_CASE("An object's sub-layered walls go down before what it prints in another object's wall filament", "[WallSublayers]")
+{
+    // Two cubes 20mm apart, both sub-layered. One prints everything in filament a; the other has its
+    // outer walls in b and everything else in a. Its passes in b have to come before its inner walls
+    // and infill in a, so b goes first - ahead of the first cube's passes in a. Within a layer the
+    // nozzle then only rises over either cube.
+    const auto filaments = GENERATE(std::pair<const char*, const char*>{"1", "2"}, std::pair<const char*, const char*>{"2", "1"});
+    const char *a = filaments.first;
+    const char *b = filaments.second;
+    INFO("filament a=" << a << " b=" << b);
+    DynamicPrintConfig config = multifilament_config(2, {{"layer_height", "0.2"},
+                                                         {"initial_layer_print_height", "0.2"},
+                                                         {"wall_loops", "3"},
+                                                         {"z_hop", "0"},
+                                                         {"skirt_loops", "0"},
+                                                         {"enable_prime_tower", "0"},
+                                                         {"layer_change_gcode", "G92 E0\n"}, // relative E has validate() ask for it
+                                                         {"wall_sublayer_height", "0.05"}});
+    config.set_key_value("gcode_comments", new ConfigOptionBool(true));
+    Print print;
+    Model model;
+    for (const auto &[x, outer] : {std::pair{60., a}, std::pair{100., b}}) {
+        ModelObject *object = model.add_object();
+        object->name        = "object.stl";
+        object->add_volume(cube(20));
+        object->add_instance()->set_offset(Vec3d(x, 80., 0.));
+        DynamicPrintConfig object_config;
+        object_config.set_deserialize_strict({{"outer_wall_filament_id", outer},
+                                              {"inner_wall_filament_id", a},
+                                              {"sparse_infill_filament_id", a},
+                                              {"internal_solid_filament_id", a},
+                                              {"top_surface_filament_id", a},
+                                              {"bottom_surface_filament_id", a}});
+        object->config.apply(object_config);
+        object->ensure_on_bed();
+    }
+    print.apply(model, config);
+    const StringObjectException error = print.validate();
+    INFO(error.string);
+    CHECK(error.string.empty());
+    const std::string gcode = Slic3r::Test::gcode(print);
+    REQUIRE(! gcode.empty());
+
+    // The extruding Z heights of each layer, over the cube at x 60..80 and over the one at x 100..120.
+    std::vector<std::array<std::vector<double>, 2>> layers;
+    GCodeReader                                     reader;
+    reader.parse_buffer(gcode, [&](GCodeReader &self, const GCodeReader::GCodeLine &line) {
+        if (line.comment().find("LAYER_CHANGE") != std::string_view::npos)
+            layers.emplace_back();
+        else if (! layers.empty() && line.extruding(self) && line.dist_XY(self) > 0)
+            layers.back()[self.x() < 90. ? 0 : 1].emplace_back(self.z());
+    });
+    REQUIRE(layers.size() > 2);
+    for (size_t i = 1; i < layers.size(); ++ i)
+        for (size_t cube = 0; cube < 2; ++ cube) {
+            const std::vector<double> &zs = layers[i][cube];
+            INFO("layer " << i << ", cube " << cube);
+            REQUIRE(zs.size() > 1);
+            for (size_t k = 1; k < zs.size(); ++ k) {
+                INFO("step " << k << ": " << zs[k - 1] << " -> " << zs[k]);
+                REQUIRE(zs[k] >= zs[k - 1] - EPSILON);
+            }
+        }
+}
+
+TEST_CASE("Objects printing in each other's sub-layered wall filaments are rejected", "[WallSublayers]")
+{
+    // One cube's outer walls are in filament 1 and the rest in 2, the other's the other way round. Each
+    // wall filament has to go before the other, which no order does.
+    DynamicPrintConfig config = multifilament_config(2, {{"enable_prime_tower", "0"},
+                                                         {"layer_change_gcode", "G92 E0\n"}, // relative E has validate() ask for it
+                                                         {"wall_sublayer_height", "0.05"}});
+    Print print;
+    Model model;
+    for (const auto &[x, outer, rest] : {std::tuple{60., "1", "2"}, std::tuple{100., "2", "1"}}) {
+        ModelObject *object = model.add_object();
+        object->name        = "object.stl";
+        object->add_volume(cube(20));
+        object->add_instance()->set_offset(Vec3d(x, 80., 0.));
+        DynamicPrintConfig object_config;
+        object_config.set_deserialize_strict({{"outer_wall_filament_id", outer},
+                                              {"inner_wall_filament_id", rest},
+                                              {"sparse_infill_filament_id", rest},
+                                              {"internal_solid_filament_id", rest},
+                                              {"top_surface_filament_id", rest},
+                                              {"bottom_surface_filament_id", rest}});
+        object->config.apply(object_config);
+        object->ensure_on_bed();
+    }
+    print.apply(model, config);
+    const StringObjectException error = print.validate();
+    INFO(error.string);
+    CHECK(error.opt_key == "wall_sublayer_height");
 }

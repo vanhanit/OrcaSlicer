@@ -107,6 +107,11 @@ would bring the nozzle down beside it. Hence:
   precedence where a layer has one.
 - An object whose sub-layered walls would need two filaments is rejected by
   `Print::validate()`: only one can go first.
+- Objects can have their sub-layered walls in different filaments. Each wall
+  filament then goes before every other filament its object prints in on the
+  layer, walls, fill and support alike; otherwise the order among them is kept.
+  When objects print in each other's wall filaments, no order does that, and
+  `Print::validate()` rejects the print.
 - With a separate inner wall filament, the passes take only the outer wall, so
   the inner walls keep their own filament.
 - Walls painted in a filament other than their part's, and walls in a mixed

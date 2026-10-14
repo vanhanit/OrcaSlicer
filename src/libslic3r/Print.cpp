@@ -2205,6 +2205,8 @@ StringObjectException Print::validate(std::vector<StringObjectException> *warnin
 
     // Orca: sub-layered walls. These combinations cannot be caught by the GUI, which never sees the
     // per-object and per-modifier overrides.
+    // Each sub-layered object's wall filament, and the filaments the object prints anything else in.
+    std::vector<std::pair<unsigned int, std::vector<unsigned int>>> sublayer_wall_followers;
     for (const PrintObject *object : m_objects) {
         const auto regions = object->all_regions();
         bool sublayered = false, overhangs_made_printable = false, zaa = false, mixed_color_sublayers = false, painted = false;
@@ -2242,12 +2244,46 @@ StringObjectException Print::validate(std::vector<StringObjectException> *warnin
             // passes of a second one would come down beside walls the first has already printed a
             // full layer high.
             return {L("Sub-layered outer walls of one object have to be printed with a single filament."), object, "wall_sublayer_height"};
+        std::vector<unsigned int> others;
+        for (const PrintRegion &region : regions)
+            region.collect_object_printing_extruders(*this, others);
+        if (object->has_support_material())
+            for (const int filament : {object->config().support_filament.value, object->config().support_interface_filament.value})
+                if (filament > 0)
+                    others.emplace_back(unsigned(filament - 1));
+        sublayer_wall_followers.emplace_back(unsigned(*sublayer_filaments.begin() - 1), std::move(others));
         if (overhangs_made_printable)
             warn(L("Sub-layered outer walls are sliced from the original model, so they do not follow the "
                    "shape produced by making overhangs printable."), "wall_sublayer_height", object);
         if (zaa)
             warn(L("Sub-layered outer walls and Z anti-aliasing both refine the same surfaces; using them together "
                    "gives little extra quality for the added print time."), "wall_sublayer_height", object);
+    }
+    if (m_config.print_sequence == PrintSequence::ByLayer) {
+        // Each wall filament goes before whatever else its object prints in the layer (see
+        // ToolOrdering::put_sublayer_wall_extruders_first()). Peel off the wall filaments that no other
+        // has to go before; if some are left, each of them has to go before another.
+        std::set<unsigned int> walls;
+        for (const auto &[wall, others] : sublayer_wall_followers)
+            walls.insert(wall);
+        for (bool peeled = true; peeled && ! walls.empty();) {
+            peeled = false;
+            for (auto it = walls.begin(); it != walls.end();) {
+                const bool has_to_wait = std::any_of(sublayer_wall_followers.begin(), sublayer_wall_followers.end(), [&](const auto &object) {
+                    return object.first != *it && walls.count(object.first) &&
+                           std::find(object.second.begin(), object.second.end(), *it) != object.second.end();
+                });
+                if (has_to_wait)
+                    ++ it;
+                else {
+                    it     = walls.erase(it);
+                    peeled = true;
+                }
+            }
+        }
+        if (! walls.empty())
+            return {L("Objects print their other features in each other's sub-layered outer wall filaments, so no "
+                      "filament order prints every object's sub-layered walls first."), nullptr, "wall_sublayer_height"};
     }
 
     // Cache of layer height profiles for checking:

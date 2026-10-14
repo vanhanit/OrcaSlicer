@@ -862,8 +862,8 @@ void ToolOrdering::collect_extruders(const PrintObject &object, const std::vecto
                     if (has_sublayer_walls)
                         something_nonoverriddable = true;
                 }
-                if (has_sublayer_walls)
-                    layer_tools.sublayer_wall_regions.emplace_back(&region);
+                if (has_sublayer_walls && (layer_tools.sublayer_wall_layers.empty() || layer_tools.sublayer_wall_layers.back() != layer))
+                    layer_tools.sublayer_wall_layers.emplace_back(layer);
 
                 if (something_nonoverriddable){
                		layer_tools.extruders.emplace_back((extruder_override == 0) ? region.config().outer_wall_filament_id.value : extruder_override);
@@ -2871,14 +2871,58 @@ std::vector<unsigned int> parse_cyclic_order(const std::string& str, unsigned in
 void ToolOrdering::put_sublayer_wall_extruders_first()
 {
     for (LayerTools &lt : m_layer_tools) {
-        if (lt.sublayer_wall_regions.empty() || ! lt.mixed_sub_layer_groups.empty())
+        if (lt.sublayer_wall_layers.empty() || ! lt.mixed_sub_layer_groups.empty())
             continue;
-        std::vector<unsigned int> first;
-        for (const PrintRegion *region : lt.sublayer_wall_regions)
-            first.emplace_back(lt.wall_extruder_id(*region));
+        // The filament of an object's sub-layered walls goes before everything else the object prints in
+        // the layer: that stands a full layer high once it is down, and the passes would come down
+        // beside it. With objects in different wall filaments, each wall filament goes before the others
+        // its object prints in.
+        std::vector<unsigned int>                          first;
+        std::vector<std::pair<unsigned int, unsigned int>> before;
+        for (const Layer *layer : lt.sublayer_wall_layers) {
+            std::vector<unsigned int> walls, rest;
+            for (const LayerRegion *layerm : layer->regions()) {
+                const PrintRegion &region = layerm->region();
+                if (layerm->has_sublayer_walls())
+                    walls.emplace_back(lt.wall_extruder_id(region));
+                if (! layerm->perimeters.entities.empty()) {
+                    rest.emplace_back(lt.wall_extruder_id(region));
+                    const int inner = lt.extruder_override == 0 ? region.config().inner_wall_filament_id.value : int(lt.extruder_override);
+                    rest.emplace_back(lt.resolve_mixed(unsigned(std::max(inner, 1) - 1)));
+                }
+                for (const ExtrusionEntity *fill : layerm->fills.entities)
+                    rest.emplace_back(lt.extruder(static_cast<const ExtrusionEntityCollection&>(*fill), region));
+            }
+            const PrintObject &object = *layer->object();
+            for (const SupportLayer *support : object.support_layers())
+                if (std::abs(support->print_z - layer->print_z) < EPSILON && ! support->support_fills.empty())
+                    for (const int filament : {object.config().support_filament.value, object.config().support_interface_filament.value})
+                        if (filament > 0)
+                            rest.emplace_back(lt.resolve_mixed(unsigned(filament - 1)));
+            for (const unsigned int wall : walls) {
+                first.emplace_back(wall);
+                for (const unsigned int other : rest)
+                    if (other != wall)
+                        before.emplace_back(wall, other);
+            }
+        }
         std::stable_partition(lt.extruders.begin(), lt.extruders.end(), [&first](unsigned int extruder) {
             return std::find(first.begin(), first.end(), extruder) != first.end();
         });
+        // Among themselves the wall filaments keep their order wherever nothing asks for another. If
+        // each has to go before another, no order works and Print::validate() has refused the print.
+        const auto pending_end = std::find_if(lt.extruders.begin(), lt.extruders.end(), [&first](unsigned int extruder) {
+            return std::find(first.begin(), first.end(), extruder) == first.end();
+        });
+        for (auto next = lt.extruders.begin(); next != pending_end; ++ next) {
+            const auto is_free = [&](unsigned int extruder) {
+                return std::none_of(before.begin(), before.end(), [&](const std::pair<unsigned int, unsigned int> &rule) {
+                    return rule.second == extruder && std::find(next, pending_end, rule.first) != pending_end;
+                });
+            };
+            if (const auto free = std::find_if(next, pending_end, is_free); free != pending_end)
+                std::rotate(next, free, free + 1);
+        }
     }
 }
 
