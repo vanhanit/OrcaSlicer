@@ -2241,6 +2241,36 @@ TEST_CASE("One object's sub-layered walls in two filaments are rejected", "[Wall
     CHECK(error.string.find("Sub-layered") != std::string::npos);
 }
 
+namespace {
+
+// Where an outer wall run starts - its seam.
+struct SeamPoint
+{
+    double z, x, y;
+};
+
+// Every outer wall run's seam, in printing order.
+std::vector<SeamPoint> outer_wall_starts(const std::string &gcode)
+{
+    std::vector<SeamPoint> starts;
+    bool               in_outer = false, started = false;
+    GCodeReader        reader;
+    reader.parse_buffer(gcode, [&](GCodeReader &self, const GCodeReader::GCodeLine &line) {
+        if (const size_t tag = line.comment().find("TYPE:"); tag != std::string_view::npos) {
+            in_outer = line.comment().substr(tag + 5) == "Outer wall";
+            started  = false;
+            return;
+        }
+        if (in_outer && ! started && line.extruding(self) && line.dist_XY(self) > 0) {
+            starts.push_back({self.z(), self.x(), self.y()});
+            started = true;
+        }
+    });
+    return starts;
+}
+
+} // namespace
+
 TEST_CASE("Every sub-layered pass puts its seam where seam_position asks", "[WallSublayers]")
 {
     // seam_position back: every outer wall loop, pass or not, starts on the back (+Y) face of the block.
@@ -2248,28 +2278,107 @@ TEST_CASE("Every sub-layered pass puts its seam where seam_position asks", "[Wal
     REQUIRE(! gcode.empty());
 
     const std::map<double, BoundingBoxf> boxes = bbox_of_type_by_z(gcode, "Outer wall");
-    std::vector<std::pair<double, double>> starts; // (z, y) where an outer wall run begins
-    bool                                   in_outer = false;
-    GCodeReader                            reader;
-    reader.parse_buffer(gcode, [&](GCodeReader &self, const GCodeReader::GCodeLine &line) {
-        if (const size_t tag = line.comment().find("TYPE:"); tag != std::string_view::npos) {
-            in_outer = line.comment().substr(tag + 5) == "Outer wall";
-            if (in_outer)
-                starts.emplace_back(-1., 0.);
-            return;
-        }
-        if (in_outer && line.extruding(self) && line.dist_XY(self) > 0 && ! starts.empty() && starts.back().first < 0.)
-            starts.back() = {self.z(), self.y()};
-    });
     size_t pass_starts = 0;
-    for (const auto &[z, y] : starts) {
-        if (z <= 0.2 + EPSILON || on_layer_top(z, 0.2))
+    for (const SeamPoint &start : outer_wall_starts(gcode)) {
+        if (start.z <= 0.2 + EPSILON || on_layer_top(start.z, 0.2))
             continue;
         ++ pass_starts;
-        INFO("outer wall pass at z " << z << " starts at y " << y << ", back face at y " << boxes.at(z).max.y());
-        CHECK(y > boxes.at(z).max.y() - 1.);
+        INFO("outer wall pass at z " << start.z << " starts at y " << start.y << ", back face at y " << boxes.at(start.z).max.y());
+        CHECK(start.y > boxes.at(start.z).max.y() - 1.);
     }
     REQUIRE(pass_starts > 0);
+}
+
+TEST_CASE("Every sub-layered pass puts its seam on a painted seam enforcer", "[WallSublayers]")
+{
+    // The +X face of the block is painted as a seam enforcer. The seam placer knows only the layer's own
+    // walls; a pass's outer wall takes its seam from them, and still has to start on the painted face,
+    // as the full-height outer wall does without sub-layers.
+    const auto seam_starts = [](const char *sublayer_height) {
+        Print print;
+        Model model;
+        init_object(print, model, plain_config({{"wall_sublayer_height", sublayer_height}}), make_cube(20., 20., 4.), {},
+                    [](ModelObject &object) {
+                        paint(*object.volumes.front(), object.volumes.front()->seam_facets, EnforcerBlockerType::ENFORCER, false);
+                    });
+        const std::string gcode = Slic3r::Test::gcode(print);
+        BoundingBoxf object_box;
+        for_each_move_of_type(gcode, "Outer wall", [&](const GCodeReader &self, int) { object_box.merge(Vec2d(self.x(), self.y())); });
+        std::vector<std::pair<double, bool>> out; // (z, starts on the painted face)
+        for (const SeamPoint &start : outer_wall_starts(gcode))
+            if (start.z > 0.2 + EPSILON)
+                out.emplace_back(start.z, start.x > object_box.max.x() - 1.);
+        return out;
+    };
+    // The control: without sub-layers the enforcer holds the outer wall's seam.
+    for (const auto &[z, on_face] : seam_starts("0")) {
+        INFO("full-height outer wall at z " << z);
+        REQUIRE(on_face);
+    }
+    size_t pass_starts = 0;
+    for (const auto &[z, on_face] : seam_starts("0.05")) {
+        INFO("outer wall at z " << z);
+        CHECK(on_face);
+        pass_starts += ! on_layer_top(z, 0.2);
+    }
+    REQUIRE(pass_starts > 0);
+}
+
+TEST_CASE("A prime tower does not bring the nozzle down onto the object within a layer", "[WallSublayers]")
+{
+    // Two filaments, outer walls in filament 2, with a prime tower. The tower prints at the layer's
+    // print_z on a tool change, away from the object, and the passes come down to their heights only
+    // over the object - where, within a layer, Z still never drops.
+    DynamicPrintConfig config = multifilament_config(2, {{"layer_height", "0.2"},
+                                                         {"initial_layer_print_height", "0.2"},
+                                                         {"wall_loops", "3"},
+                                                         {"z_hop", "0"},
+                                                         {"skirt_loops", "0"},
+                                                         {"enable_prime_tower", "1"},
+                                                         {"wipe_tower_x", "120"}, // inside the 200x200 test bed
+                                                         {"wipe_tower_y", "120"},
+                                                         {"outer_wall_filament_id", "2"},
+                                                         {"inner_wall_filament_id", "1"},
+                                                         {"sparse_infill_filament_id", "1"},
+                                                         {"internal_solid_filament_id", "1"},
+                                                         {"wall_sublayer_height", "0.05"}});
+    config.set_key_value("gcode_comments", new ConfigOptionBool(true));
+    Print print;
+    Model model;
+    init_print({cube(20)}, print, model, config);
+    // The first apply counts the filaments in use before it has built the regions that carry the
+    // per-feature filaments, sees one, and turns the tower off. Applying again, as the GUI does on
+    // the next change, counts both.
+    print.apply(model, config);
+    const std::string gcode = Slic3r::Test::gcode(print);
+    // The passes are on: the outer wall lands at the 4 pass heights of each 0.2mm layer above the first.
+    const std::set<double> wall_zs = zs_of_type(gcode, "Outer wall");
+    REQUIRE(std::any_of(wall_zs.begin(), wall_zs.end(), [](double z) { return std::abs(z - 0.25) < 1e-4; }));
+    // The tower prints at whole layer heights only, never at a pass height.
+    const std::set<double> tower_zs = zs_of_type(gcode, "Prime tower");
+    REQUIRE(! tower_zs.empty());
+    for (double z : tower_zs) {
+        INFO("prime tower at z " << z);
+        CHECK_THAT(z - 0.2 * std::round(z / 0.2), Catch::Matchers::WithinAbs(0., 1e-4));
+    }
+
+    BoundingBoxf object_box;
+    for_each_move_of_type(gcode, "Outer wall", [&](const GCodeReader &self, int) { object_box.merge(Vec2d(self.x(), self.y())); });
+    object_box.offset(1.);
+    std::vector<std::vector<double>> layers;
+    GCodeReader                      reader;
+    reader.parse_buffer(gcode, [&](GCodeReader &self, const GCodeReader::GCodeLine &line) {
+        if (line.comment().find("LAYER_CHANGE") != std::string_view::npos)
+            layers.emplace_back();
+        else if (! layers.empty() && line.extruding(self) && line.dist_XY(self) > 0 && object_box.contains(Vec2d(self.x(), self.y())))
+            layers.back().emplace_back(self.z());
+    });
+    REQUIRE(layers.size() > 2);
+    for (size_t i = 0; i < layers.size(); ++ i)
+        for (size_t k = 1; k < layers[i].size(); ++ k) {
+            INFO("layer " << i << " step " << k << ": " << layers[i][k - 1] << " -> " << layers[i][k]);
+            REQUIRE(layers[i][k] >= layers[i][k - 1] - EPSILON);
+        }
 }
 
 TEST_CASE("Sub-layered walls extrude only at their pass heights with z-hop on", "[WallSublayers]")
