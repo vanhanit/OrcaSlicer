@@ -9775,6 +9775,10 @@ std::string GCode::_extrude(const ExtrusionPath &path, const std::string &path_d
         comment = ";_EXTRUDE_SET_SPEED";
         if (is_external_perimeter(path.role()))
             comment += ";_EXTERNAL_PERIMETER";
+        // Orca: the cooling buffer slows a pass down no further than the flow a full-height wall has
+        // at the filament's minimum speed.
+        if (m_in_sublayer_wall_pass)
+            comment += ";_SUBLAYER_PASS";
     }
 
     // Open and close a cooling-marker fan region. The caller owns the pair of state variables, so a

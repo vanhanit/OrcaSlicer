@@ -369,24 +369,41 @@ std::string CoolingBuffer::process_layer(std::string &&gcode, size_t layer_id, b
 // Return the list of parsed lines, bucketed by an extruder.
 std::vector<PerExtruderAdjustments> CoolingBuffer::parse_layer_gcode(const std::string &gcode, std::vector<float> &current_pos) const
 {
-    std::vector<PerExtruderAdjustments> per_extruder_adjustments(m_extruder_ids.size());
+    // Orca: with sub-layered walls every extruder gets a second bucket, behind the first m_extruder_ids.size(),
+    // holding the extrusions of the passes. See sublayer_pass_adjustment below.
+    const size_t                        num_extruders = m_extruder_ids.size();
+    std::vector<PerExtruderAdjustments> per_extruder_adjustments(m_sublayer_passes > 1 ? 2 * num_extruders : num_extruders);
     std::vector<size_t>                 map_extruder_to_per_extruder_adjustment(m_num_extruders, 0);
-    for (size_t i = 0; i < m_extruder_ids.size(); ++ i) {
+    for (size_t i = 0; i < per_extruder_adjustments.size(); ++ i) {
         PerExtruderAdjustments &adj         = per_extruder_adjustments[i];
-        unsigned int            extruder_id = m_extruder_ids[i];
+        unsigned int            extruder_id = m_extruder_ids[i % num_extruders];
         adj.extruder_id               = extruder_id;
         adj.cooling_slow_down_enabled = m_config.slow_down_for_layer_cooling.get_at(extruder_id);
         // Orca: with sub-layered walls the layer time is shared between the passes, so the whole
         // layer has to last as many minimum layer times as there are passes for each pass to get one.
         adj.slow_down_layer_time = float(m_config.slow_down_layer_time.get_at(extruder_id)) * float(m_sublayer_passes);
         adj.slow_down_min_speed           = float(m_config.slow_down_min_speed.get_at(extruder_id));
+        // Orca: a pass is 1/m_sublayer_passes of a layer tall, so at slow_down_min_speed it would extrude that
+        // fraction of what the filament's slowest wall does. At such a trickle the extruder no longer meters
+        // the plastic - ooze and the pressure in the nozzle add more than is asked for - and the nozzle sits
+        // over the thin pass long enough to remelt it, which is the stretched layer time showing up as a
+        // swollen, fuzzy outer wall. The passes are held to the filament's minimum volumetric flow instead,
+        // and the rest of the layer takes the slowdown they cannot.
+        if (i >= num_extruders)
+            adj.slow_down_min_speed *= float(m_sublayer_passes);
         // ORCA: To enable dont slow down external perimeters feature per filament (extruder)
         adj.dont_slow_down_outer_wall   = m_config.dont_slow_down_outer_wall.get_at(extruder_id);
-        map_extruder_to_per_extruder_adjustment[extruder_id] = i;
+        if (i < num_extruders)
+            map_extruder_to_per_extruder_adjustment[extruder_id] = i;
     }
+    const auto sublayer_pass_adjustment = [&](const PerExtruderAdjustments *adj) {
+        return &per_extruder_adjustments[size_t(adj - per_extruder_adjustments.data()) + num_extruders];
+    };
 
     unsigned int      current_extruder  = m_current_extruder;
     PerExtruderAdjustments *adjustment  = &per_extruder_adjustments[map_extruder_to_per_extruder_adjustment[current_extruder]];
+    // The bucket the extrusion block opened by the last ";_EXTRUDE_SET_SPEED" is collected into.
+    PerExtruderAdjustments *speed_adjustment = adjustment;
     const char       *line_start = gcode.c_str();
     const char       *line_end   = line_start;
     // Index of an existing CoolingLine of the current adjustment, which holds the feedrate setting command
@@ -469,7 +486,10 @@ std::vector<PerExtruderAdjustments> CoolingBuffer::parse_layer_gcode(const std::
             // hence the slowdown algorithm ignores it.
             if (boost::contains(sline, ";_EXTRUDE_SET_SPEED") && ! wipe && adjust_external) {
                 line.type |= CoolingLine::TYPE_ADJUSTABLE;
-                active_speed_modifier = adjustment->lines.size();
+                // Orca: sub-layered walls
+                speed_adjustment = per_extruder_adjustments.size() > num_extruders && boost::contains(sline, ";_SUBLAYER_PASS") ?
+                    sublayer_pass_adjustment(adjustment) : adjustment;
+                active_speed_modifier = speed_adjustment->lines.size();
             }
             if ((line.type & CoolingLine::TYPE_G92) == 0) {
                 //BBS: G0, G1, G2, G3. Calculate the duration.
@@ -505,14 +525,14 @@ std::vector<PerExtruderAdjustments> CoolingBuffer::parse_layer_gcode(const std::
                     line.time = line.length / line.feedrate;
                 line.time_max = line.time;
                 if ((line.type & CoolingLine::TYPE_ADJUSTABLE) || active_speed_modifier != size_t(-1))
-                    line.time_max = (adjustment->slow_down_min_speed == 0.f) ? FLT_MAX : std::max(line.time, line.length / adjustment->slow_down_min_speed);
+                    line.time_max = (speed_adjustment->slow_down_min_speed == 0.f) ? FLT_MAX : std::max(line.time, line.length / speed_adjustment->slow_down_min_speed);
                 // BBS: add G2 and G3 support
-                if (active_speed_modifier < adjustment->lines.size() && ((line.type & CoolingLine::TYPE_G1) ||
-                                                                         (line.type & CoolingLine::TYPE_G2) ||
-                                                                         (line.type & CoolingLine::TYPE_G3))) {
+                if (active_speed_modifier < speed_adjustment->lines.size() && ((line.type & CoolingLine::TYPE_G1) ||
+                                                                               (line.type & CoolingLine::TYPE_G2) ||
+                                                                               (line.type & CoolingLine::TYPE_G3))) {
                     // Inside the ";_EXTRUDE_SET_SPEED" blocks, there must not be a G1 Fxx entry.
                     assert((line.type & CoolingLine::TYPE_HAS_F) == 0);
-                    CoolingLine &sm = adjustment->lines[active_speed_modifier];
+                    CoolingLine &sm = speed_adjustment->lines[active_speed_modifier];
                     assert(sm.feedrate > 0.f);
                     sm.length   += line.length;
                     sm.time     += line.time;
@@ -530,6 +550,7 @@ std::vector<PerExtruderAdjustments> CoolingBuffer::parse_layer_gcode(const std::
         } else if (boost::starts_with(sline, ";_EXTRUDE_END")) {
             line.type = CoolingLine::TYPE_EXTRUDE_END;
             active_speed_modifier = size_t(-1);
+            speed_adjustment      = adjustment;
         } else if (boost::starts_with(sline, m_toolchange_prefix)) {
             unsigned int new_extruder = 0;
             auto ret = std::from_chars(sline.data() + m_toolchange_prefix.size(), sline.data() + sline.size(), new_extruder);
@@ -542,6 +563,7 @@ std::vector<PerExtruderAdjustments> CoolingBuffer::parse_layer_gcode(const std::
                         line.type        = CoolingLine::TYPE_SET_TOOL;
                         current_extruder = new_extruder;
                         adjustment       = &per_extruder_adjustments[map_extruder_to_per_extruder_adjustment[current_extruder]];
+                        speed_adjustment = adjustment;
                     }
                 } else {
                     // Only log the error in case of MM printer. Single extruder printers likely ignore any T anyway.
@@ -592,7 +614,7 @@ std::vector<PerExtruderAdjustments> CoolingBuffer::parse_layer_gcode(const std::
         }
 
         if (line.type != 0)
-            adjustment->lines.emplace_back(std::move(line));
+            ((line.type & CoolingLine::TYPE_ADJUSTABLE) ? speed_adjustment : adjustment)->lines.emplace_back(std::move(line));
     }
 
     return per_extruder_adjustments;
@@ -1092,6 +1114,7 @@ std::string CoolingBuffer::apply_layer_cooldown(
                         boost::replace_all(comment, ";_EXTERNAL_PERIMETER", "");
                     if (line->type & CoolingLine::TYPE_WIPE)
                         boost::replace_all(comment, ";_WIPE", "");
+                    boost::replace_all(comment, ";_SUBLAYER_PASS", ""); // Orca: sub-layered walls
                     new_gcode += comment;
                 } else {
                     // Just attach the rest of the source line.

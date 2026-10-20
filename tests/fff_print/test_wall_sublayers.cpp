@@ -1184,36 +1184,60 @@ TEST_CASE("Sub-layered walls take their own speed", "[WallSublayers]")
     CHECK(slowest(full, "Inner wall") > 0.);
 }
 
+// The slowest feedrate of each extrusion type, over every layer past the first few, whose speeds are
+// dictated by the initial layer settings, of a small block sliced with the layer time regulator on.
+static std::map<std::string, double> slowest_feedrates_under_cooling(const char *sublayer_height, const char *min_speed)
+{
+    DynamicPrintConfig config = base_config(sublayer_height, "arachne");
+    config.set_deserialize_strict({{"wall_loops", "2"},
+                                   {"slow_down_for_layer_cooling", "1"},
+                                   {"slow_down_layer_time", "5"},
+                                   {"slow_down_min_speed", min_speed},
+                                   {"outer_wall_speed", "100"},
+                                   {"inner_wall_speed", "100"},
+                                   {"enable_overhang_speed", "0"}});
+    // Small enough that a layer is well under the minimum layer time and the regulator has to act.
+    const std::string gcode = slice({cube(5)}, config);
+    REQUIRE(! gcode.empty());
+    std::map<std::string, double> out;
+    for (const char *type : {"Outer wall", "Inner wall"}) {
+        double     f      = std::numeric_limits<double>::max();
+        const auto layers = slowest_feedrate_of_type_per_layer_z(gcode, type);
+        REQUIRE(layers.size() > 4);
+        for (size_t i = 3; i < layers.size(); ++ i)
+            for (const auto &[z, feedrate] : layers[i])
+                f = std::min(f, feedrate);
+        out[type] = f;
+    }
+    return out;
+}
+
 TEST_CASE("Sub-layered walls are given a minimum layer time per pass", "[WallSublayers]")
 {
     // The nozzle comes back to the same spot once per pass, so the layer has to last as many minimum
     // layer times as it has passes for each of those intervals to be one. Splitting a layer into more
     // passes therefore has to slow it down further, not less - even though more passes also means
-    // more material and so a longer layer to begin with.
-    auto slowest_feedrate = [](const char *sublayer_height) {
-        DynamicPrintConfig config = base_config(sublayer_height, "arachne");
-        config.set_deserialize_strict({{"wall_loops", "2"},
-                                       {"slow_down_for_layer_cooling", "1"},
-                                       {"slow_down_layer_time", "5"},
-                                       {"slow_down_min_speed", "1"},
-                                       {"enable_overhang_speed", "0"}});
-        // Small enough that a layer is well under the minimum layer time and the regulator has to act.
-        const std::string gcode = slice({cube(5)}, config);
-        REQUIRE(! gcode.empty());
-        double f = std::numeric_limits<double>::max();
-        const auto layers = slowest_feedrate_of_type_per_layer_z(gcode, "Outer wall");
-        REQUIRE(layers.size() > 4);
-        // Skip the first layers, whose speeds are dictated by the initial layer settings.
-        for (size_t i = 3; i < layers.size(); ++ i)
-            for (const auto &[z, feedrate] : layers[i])
-                f = std::min(f, feedrate);
-        return f;
-    };
-
-    const double two_passes  = slowest_feedrate("0.1");
-    const double four_passes = slowest_feedrate("0.05");
-    INFO("2 passes slowest " << two_passes << ", 4 passes slowest " << four_passes);
+    // more material and so a longer layer to begin with. The walls the layer prints at its own height
+    // take that slowdown; the passes are held at a flow of their own, see below.
+    const double two_passes  = slowest_feedrates_under_cooling("0.1", "1").at("Inner wall");
+    const double four_passes = slowest_feedrates_under_cooling("0.05", "1").at("Inner wall");
+    INFO("2 passes slowest inner wall " << two_passes << ", 4 passes slowest inner wall " << four_passes);
     CHECK(four_passes < two_passes);
+}
+
+TEST_CASE("Sub-layered walls are not slowed below the flow of a full-height wall at the minimum speed", "[WallSublayers]")
+{
+    // A pass 0.05mm tall at slow_down_min_speed extrudes a quarter of what the slowest 0.2mm wall does.
+    // At such a trickle ooze and the pressure in the nozzle decide what comes out, not the extruder, and
+    // the outer wall comes out swollen and fuzzy. 4 passes per layer at 10mm/s minimum hold the passes
+    // at 40mm/s, the flow of a full-height wall at 10mm/s, while the rest of the layer slows down further.
+    const std::map<std::string, double> slowest = slowest_feedrates_under_cooling("0.05", "10");
+    INFO("slowest outer wall pass " << slowest.at("Outer wall") << ", slowest inner wall " << slowest.at("Inner wall"));
+    // Feedrates are in mm/min and rounded to whole numbers.
+    CHECK(slowest.at("Outer wall") > 4. * 10. * 60. - 1.);
+    // The regulator did slow the layer down, and took it out of the walls printed at full height.
+    CHECK(slowest.at("Inner wall") < 4. * 10. * 60.);
+    CHECK(slowest.at("Inner wall") > 10. * 60. - 1.);
 }
 
 TEST_CASE("Sub-layered walls take their own fan speed", "[WallSublayers]")
@@ -1464,6 +1488,59 @@ TEST_CASE("Sub-layered walls stay joined to the walls the layer keeps", "[WallSu
     // printed this was 0.58mm - a void right behind the outer wall over most of the surface.
     CHECK(median < 0.45);
     CHECK(gaps.front() < 0.42);
+}
+
+TEST_CASE("Sub-layered walls lay no gap fill too thin or too small to print", "[WallSublayers]")
+{
+    // A sphere's flanks give every pass a sliver of tread and a strip between its walls and the walls
+    // the layer keeps, a fraction of a line wide and varying along the wall. A pass is a quarter of a
+    // layer tall, so the gap fill an ordinary layer would lay there asks the extruder for a few steps of
+    // its motor - less than ooze adds or takes away - and comes out as blobs on the outer wall. A run
+    // has to be at least 0.3 nozzle diameters wide somewhere, and carry half a cubic nozzle diameter.
+    const auto wall_generator = GENERATE("arachne", "classic");
+    Print print;
+    Model model;
+    init_print({mesh(TestMesh::sphere_50mm)}, print, model, {{"layer_height", "0.2"},
+        {"initial_layer_print_height", "0.2"}, {"wall_loops", "3"}, {"skirt_loops", "0"},
+        {"nozzle_diameter", "0.4"}, {"wall_generator", wall_generator}, {"wall_sublayer_height", "0.05"}});
+    print.process();
+
+    const double nozzle = 0.4;
+    size_t runs = 0, starved = 0;
+    for (const Layer *layer : print.objects().front()->layers())
+        for (const LayerRegion *layerm : layer->regions())
+            for (const ExtrusionEntityCollection &pass : layerm->sublayer_perimeters) {
+                // variable_width() lays a run as one path per width step, chained end to start.
+                const ExtrusionEntitiesPtr &entities = pass.entities;
+                for (size_t begin = 0; begin < entities.size();) {
+                    size_t end = begin + 1;
+                    if (entities[begin]->role() != erGapFill) {
+                        begin = end;
+                        continue;
+                    }
+                    if (dynamic_cast<const ExtrusionPath*>(entities[begin]) != nullptr)
+                        while (end < entities.size() && entities[end]->role() == erGapFill &&
+                               dynamic_cast<const ExtrusionPath*>(entities[end]) != nullptr &&
+                               entities[end]->first_point() == entities[end - 1]->last_point())
+                            ++ end;
+                    double volume = 0., width = 0.;
+                    for (size_t i = begin; i < end; ++ i) {
+                        volume += entities[i]->total_volume();
+                        if (const auto *path = dynamic_cast<const ExtrusionPath*>(entities[i]))
+                            width = std::max(width, double(path->width));
+                        else if (const auto *loop = dynamic_cast<const ExtrusionLoop*>(entities[i]))
+                            for (const ExtrusionPath &path : loop->paths)
+                                width = std::max(width, double(path.width));
+                    }
+                    ++ runs;
+                    if (volume < 0.5 * nozzle * nozzle * nozzle || width < 0.3 * nozzle)
+                        ++ starved;
+                    begin = end;
+                }
+            }
+
+    INFO("wall_generator=" << wall_generator << ": " << runs << " gap fill runs in the passes, " << starved << " starved");
+    CHECK(starved == 0);
 }
 
 TEST_CASE("A sub-layered thin feature is covered end to end", "[WallSublayers]")
@@ -2291,11 +2368,33 @@ TEST_CASE("Every sub-layered pass puts its seam where seam_position asks", "[Wal
     REQUIRE(pass_starts > 0);
 }
 
+TEST_CASE("Every sub-layered pass puts its seam where seam_position asks when the passes take every wall", "[WallSublayers]")
+{
+    // With as many sub-layered loops as walls, the layer's own run prints no wall at all, and the seam
+    // placer used to have nothing to score: every pass started at the point of its loop nearest the
+    // origin, the front left corner, whatever seam_position said.
+    const std::string gcode = slice({cube(20)}, plain_config({{"wall_loops", "2"},
+                                                              {"wall_sublayer_height", "0.05"},
+                                                              {"wall_sublayer_loops", "2"},
+                                                              {"seam_position", "back"}}));
+    REQUIRE(! gcode.empty());
+
+    const std::map<double, BoundingBoxf> boxes = bbox_of_type_by_z(gcode, "Outer wall");
+    size_t pass_starts = 0;
+    for (const SeamPoint &start : outer_wall_starts(gcode)) {
+        if (start.z <= 0.2 + EPSILON)
+            continue;
+        ++ pass_starts;
+        INFO("outer wall pass at z " << start.z << " starts at y " << start.y << ", back face at y " << boxes.at(start.z).max.y());
+        CHECK(start.y > boxes.at(start.z).max.y() - 1.);
+    }
+    REQUIRE(pass_starts > 0);
+}
+
 TEST_CASE("Every sub-layered pass puts its seam on a painted seam enforcer", "[WallSublayers]")
 {
-    // The +X face of the block is painted as a seam enforcer. The seam placer knows only the layer's own
-    // walls; a pass's outer wall takes its seam from them, and still has to start on the painted face,
-    // as the full-height outer wall does without sub-layers.
+    // The +X face of the block is painted as a seam enforcer. A pass's outer wall has to start on the
+    // painted face, as the full-height outer wall does without sub-layers.
     const auto seam_starts = [](const char *sublayer_height) {
         Print print;
         Model model;

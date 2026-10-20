@@ -47,6 +47,13 @@ static constexpr double SUBLAYER_MIN_SUPPORT_AREA = 12.;  // x solid infill widt
 // A gap fill run shorter than this is a dab: it holds nothing together and costs a travel, a stop and
 // a start, which on a curved wall is repeated thousands of times over.
 static constexpr double SUBLAYER_MIN_GAP_FILL = 2.;  // x solid infill width
+// Gap fill inside a pass is a fraction of a layer tall, so a gap the ordinary rules keep asks the
+// extruder for almost nothing. A bead much narrower than the nozzle is not shaped by it, and a run
+// carrying less than a small dab of plastic is a few steps of the extruder motor, well inside what ooze
+// and the pressure in the nozzle add or take away anyway. Neither fills the gap it is meant for; what
+// comes out is a blob on the pass.
+static constexpr double SUBLAYER_MIN_GAP_FILL_WIDTH  = 0.3;  // x nozzle diameter
+static constexpr double SUBLAYER_MIN_GAP_FILL_VOLUME = 0.5;  // x nozzle diameter^3
 // How far beside or under a wall the model below has to reach for the wall to be carried by it. On a
 // surface rolling outward - a hull flaring out of the bilge, a gunwale, the lower lip of a hole -
 // every pass lands outside the one below by design, and a wall's width of reach is what lets that
@@ -104,6 +111,50 @@ int wall_sublayer_count(const PrintObject &object, const PrintRegion &region, co
     while (n > 1 && layer_height / n < MIN_WALL_SUBLAYER_HEIGHT)
         -- n;
     return n;
+}
+
+// Drop the gap fill too thin, or carrying too little plastic, to print. See SUBLAYER_MIN_GAP_FILL_WIDTH
+// and SUBLAYER_MIN_GAP_FILL_VOLUME. variable_width() emits a run as one path per width step, chained
+// end to start, so a run is judged as a whole: by the plastic all of it carries, and kept if any part
+// of it is wide enough, since its narrow ends are where it tapers into the walls beside it.
+static void drop_starved_gap_fill(ExtrusionEntitiesPtr &entities, double nozzle_diameter)
+{
+    const double min_width  = SUBLAYER_MIN_GAP_FILL_WIDTH * nozzle_diameter;
+    const double min_volume = SUBLAYER_MIN_GAP_FILL_VOLUME * nozzle_diameter * nozzle_diameter * nozzle_diameter;
+    const auto   widest     = [](const ExtrusionEntity *entity) {
+        double width = 0.;
+        if (const auto *path = dynamic_cast<const ExtrusionPath*>(entity))
+            width = path->width;
+        else if (const auto *loop = dynamic_cast<const ExtrusionLoop*>(entity))
+            for (const ExtrusionPath &path : loop->paths)
+                width = std::max(width, double(path.width));
+        return width;
+    };
+
+    ExtrusionEntitiesPtr kept;
+    kept.reserve(entities.size());
+    for (size_t begin = 0; begin < entities.size();) {
+        size_t end = begin + 1;
+        if (entities[begin]->role() == erGapFill && dynamic_cast<const ExtrusionPath*>(entities[begin]) != nullptr)
+            while (end < entities.size() && entities[end]->role() == erGapFill &&
+                   dynamic_cast<const ExtrusionPath*>(entities[end]) != nullptr &&
+                   entities[end]->first_point() == entities[end - 1]->last_point())
+                ++ end;
+        double volume = 0.;
+        double width  = 0.;
+        for (size_t i = begin; i < end; ++ i) {
+            volume += entities[i]->total_volume();
+            width   = std::max(width, widest(entities[i]));
+        }
+        const bool starved = entities[begin]->role() == erGapFill && (volume < min_volume || width < min_width);
+        for (size_t i = begin; i < end; ++ i)
+            if (starved)
+                delete entities[i];
+            else
+                kept.emplace_back(entities[i]);
+        begin = end;
+    }
+    entities = std::move(kept);
 }
 
 // Solid fill printed inside a wall pass, on the strip the pass above it would otherwise land on with
@@ -165,7 +216,8 @@ static void append_sublayer_gap_fill(ExtrusionEntityCollection &out,
 {
     if (areas.empty())
         return;
-    const double   min = 0.2 * flow.scaled_width() * (1 - INSET_OVERLAP_TOLERANCE);
+    const double   min = std::max(0.2 * flow.scaled_width() * (1 - INSET_OVERLAP_TOLERANCE),
+                                  scale_(SUBLAYER_MIN_GAP_FILL_WIDTH * flow.nozzle_diameter()));
     const double   max = 2. * flow.scaled_spacing();
     ThickPolylines polylines;
     for (ExPolygon &ex : diff_ex(opening_ex(areas, float(min / 2.)),
@@ -181,8 +233,12 @@ static void append_sublayer_gap_fill(ExtrusionEntityCollection &out,
     polylines.erase(std::remove_if(polylines.begin(), polylines.end(),
                                    [min_length](const ThickPolyline &p) { return p.length() < min_length; }),
                     polylines.end());
-    if (! polylines.empty())
-        variable_width(polylines, erGapFill, flow, out.entities);
+    if (polylines.empty())
+        return;
+    ExtrusionEntitiesPtr gap_fill;
+    variable_width(polylines, erGapFill, flow, gap_fill);
+    drop_starved_gap_fill(gap_fill, flow.nozzle_diameter());
+    out.append(std::move(gap_fill));
 }
 
 // Tidy the overhang paths the wall generator split each loop into against the material below the
@@ -633,6 +689,7 @@ void wall_sublayer_generate(LayerRegion               &layerm,
         tidy_pass_overhangs(layerm.sublayer_perimeters[k], SUBLAYER_MIN_OVERHANG * ext_width,
                             SUBLAYER_MAX_BRIDGE_CHORD * ext_width);
 
+        drop_starved_gap_fill(band_gap_fill.entities, bg.solid_infill_flow.nozzle_diameter());
         layerm.sublayer_perimeters[k].append(std::move(band_gap_fill.entities));
 
         // Whatever the generator left standing that still has nothing under it: everything it has

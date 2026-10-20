@@ -65,7 +65,9 @@ a perimeter run (`WallSublayerContext`):
   `wall_sublayer_generate()` runs the perimeter generator once per pass on it
   (`LayerRegion::sublayer_perimeters`), then fills the tread a sloped surface
   leaves between the band and the core with solid fill and gap fill at the
-  sub-layer height.
+  sub-layer height. Gap fill at that height carries a fraction of what it does
+  in a full layer, so a run in a pass narrower than 0.3 nozzle diameters
+  throughout, or carrying less than half a cubic nozzle diameter, is dropped.
 
 Each pass is classified against what actually exists under it: the passes
 below it and the top of the layer below, not the model re-sliced at its height.
@@ -85,6 +87,15 @@ own (`GCodeProcessor::Sub_Layer_Tag`), while the printer and the time estimate
 still see one layer. The overhang estimator measures a pass against the
 sub-slice below it (`Layer::wall_sublayer_support()`), and the cooling buffer
 asks for the minimum layer time once per pass of the most finely split region.
+It slows a pass down no further than the flow a full-height wall has at the
+filament's minimum speed, `slow_down_min_speed` times the pass count: below
+that the extruder no longer meters the plastic, and the rest of the layer takes
+the slowdown instead.
+
+The seam placer scores the outer walls of a split region on the pass nearest the
+layer's `slice_z`, since the layer's own perimeters hold only its inner walls.
+Every pass then starts at the point of its loop nearest that seam, so the seams
+of the passes stack.
 
 A pass can still be lower than something printed before it: the prime tower,
 printed at `print_z` on the tool change that brings in the pass filament, or

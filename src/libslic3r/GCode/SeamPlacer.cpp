@@ -25,6 +25,7 @@
 #include <optional>
 #include <cassert>
 #include <functional>
+#include <limits>
 #include <numeric>
 #include <memory>
 #include <random>
@@ -437,31 +438,70 @@ struct GlobalModelInfo {
 }
 ;
 
+// Collect the external perimeters of one island's collection of inner, outer, and overhang perimeters.
+void extract_external_perimeters(const ExtrusionEntityCollection &island, const LayerRegion *layer_region, Polygons &polygons,
+                                 std::vector<const LayerRegion*> &corresponding_regions_out) {
+  for (const ExtrusionEntity *perimeter : island.entities) {
+    ExtrusionRole role = perimeter->role();
+    if (perimeter->is_loop()) {
+      for (const ExtrusionPath &path : static_cast<const ExtrusionLoop*>(perimeter)->paths) {
+        if (path.role() == ExtrusionRole::erExternalPerimeter) {
+          role = ExtrusionRole::erExternalPerimeter;
+        }
+      }
+    }
+
+    if (role == ExtrusionRole::erExternalPerimeter) {
+      Points p;
+      perimeter->collect_points(p);
+      polygons.emplace_back(std::move(p));
+      corresponding_regions_out.push_back(layer_region);
+    }
+  }
+}
+
+// Orca: sub-layered walls. The outer walls of such a region are printed as a stack of passes, and its
+// own perimeters hold only the inner walls. The seams are placed on the pass nearest the layer's
+// slice_z, the height the seam placer evaluates the model at; place_seam() then puts every pass's seam
+// at the point of its loop nearest that one, so the passes stack their seams on top of each other.
+// Without the passes the placer had no outer wall to score on such a layer and took the seam of
+// whatever candidate lay nearest - the inner walls of some island strung together into one
+// polygon - so seams landed in the middle of flat faces and on embossed text.
+const ExtrusionEntityCollection *sublayer_seam_pass(const Layer &layer, const LayerRegion &layer_region) {
+  const std::vector<WallSubSlice> *split = layer.wall_sublayer_split(layer_region.sublayer_perimeters.size());
+  if (split == nullptr)
+    return nullptr;
+  const ExtrusionEntityCollection *best = nullptr;
+  double best_dist = std::numeric_limits<double>::max();
+  for (size_t pass = 0; pass < split->size(); ++pass) {
+    const ExtrusionEntityCollection &walls = layer_region.sublayer_perimeters[pass];
+    const double dist = std::abs((*split)[pass].slice_z - layer.slice_z);
+    if (! walls.empty() && dist < best_dist) {
+      best      = &walls;
+      best_dist = dist;
+    }
+  }
+  return best;
+}
+
 //Extract perimeter polygons of the given layer
 Polygons extract_perimeter_polygons(const Layer *layer, std::vector<const LayerRegion*> &corresponding_regions_out,
                                    bool has_precise_seam_modifiers) {
   Polygons polygons;
   for (const LayerRegion *layer_region : layer->regions()) {
+    const ExtrusionEntityCollection *seam_pass = sublayer_seam_pass(*layer, *layer_region);
+    if (seam_pass != nullptr)
+      // One collection per island, then the gap and tread fill of the pass, which carry no seam.
+      for (const ExtrusionEntity *ex_entity : seam_pass->entities)
+        if (ex_entity->is_collection())
+          extract_external_perimeters(*static_cast<const ExtrusionEntityCollection*>(ex_entity), layer_region, polygons,
+                                      corresponding_regions_out);
     for (const ExtrusionEntity *ex_entity : layer_region->perimeters.entities) {
       if (ex_entity->is_collection()) { //collection of inner, outer, and overhang perimeters
-        for (const ExtrusionEntity *perimeter : static_cast<const ExtrusionEntityCollection*>(ex_entity)->entities) {
-          ExtrusionRole role = perimeter->role();
-          if (perimeter->is_loop()) {
-            for (const ExtrusionPath &path : static_cast<const ExtrusionLoop*>(perimeter)->paths) {
-              if (path.role() == ExtrusionRole::erExternalPerimeter) {
-                role = ExtrusionRole::erExternalPerimeter;
-              }
-            }
-          }
-
-          if (role == ExtrusionRole::erExternalPerimeter) {
-            Points p;
-            perimeter->collect_points(p);
-            polygons.emplace_back(std::move(p));
-            corresponding_regions_out.push_back(layer_region);
-          }
-        }
-        if (polygons.empty()) {
+        extract_external_perimeters(*static_cast<const ExtrusionEntityCollection*>(ex_entity), layer_region, polygons,
+                                    corresponding_regions_out);
+        // An island the passes took the outer walls of has none here, and its inner walls are not one.
+        if (polygons.empty() && seam_pass == nullptr) {
           Points p;
           ex_entity->collect_points(p);
           polygons.emplace_back(std::move(p));
