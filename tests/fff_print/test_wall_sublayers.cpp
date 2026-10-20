@@ -979,8 +979,14 @@ TEST_CASE("A sub-layered pass keeps a wall that crosses an opening", "[WallSubla
         const double above_first = self.z() - first_layer;
         if (std::abs(above_first / layer_height - std::round(above_first / layer_height)) < 1e-4)
             return;
-        if (self.z() > 8.15 && self.z() < 8.3 && std::abs(self.x() - mid_x) < 3.)
-            over_opening += line.dist_XY(self);
+        if (self.z() <= 8.15 || self.z() >= 8.3)
+            return;
+        // The part of the move over the middle of the opening: a move along the wall may start on a
+        // jamb and cross the whole span, depending on where the seam falls.
+        const double x0 = self.x(), x1 = line.new_X(self);
+        const double over = std::min(std::max(x0, x1), mid_x + 3.) - std::max(std::min(x0, x1), mid_x - 3.);
+        if (over > 0.)
+            over_opening += std::abs(x1 - x0) > EPSILON ? line.dist_XY(self) * over / std::abs(x1 - x0) : line.dist_XY(self);
     });
 
     INFO("wall crossing the opening at a sub-layer height: " << over_opening << "mm");
@@ -2340,7 +2346,12 @@ std::vector<SeamPoint> outer_wall_starts(const std::string &gcode)
             started  = false;
             return;
         }
-        if (in_outer && ! started && line.extruding(self) && line.dist_XY(self) > 0) {
+        if (line.dist_XY(self) <= 0)
+            return;
+        if (! line.extruding(self))
+            // A travel ends the run: the next island's wall may follow under the same type tag.
+            started = false;
+        else if (in_outer && ! started) {
             starts.push_back({self.z(), self.x(), self.y()});
             started = true;
         }
@@ -2368,27 +2379,39 @@ TEST_CASE("Every sub-layered pass puts its seam where seam_position asks", "[Wal
     REQUIRE(pass_starts > 0);
 }
 
-TEST_CASE("Every sub-layered pass puts its seam where seam_position asks when the passes take every wall", "[WallSublayers]")
+TEST_CASE("Every island's sub-layered passes put their seams where seam_position asks", "[WallSublayers]")
 {
-    // With as many sub-layered loops as walls, the layer's own run prints no wall at all, and the seam
-    // placer used to have nothing to score: every pass started at the point of its loop nearest the
-    // origin, the front left corner, whatever seam_position said.
-    const std::string gcode = slice({cube(20)}, plain_config({{"wall_loops", "2"},
-                                                              {"wall_sublayer_height", "0.05"},
-                                                              {"wall_sublayer_loops", "2"},
-                                                              {"seam_position", "back"}}));
+    // Two blocks of one object, one behind the other. The layer's own perimeters hold no outer wall on
+    // a split layer, so the seam placer used to string the inner walls of the first island into one
+    // polygon and give the other island nothing: the passes of the rear block took their seam from the
+    // front block, and started on the rear block's front face.
+    TriangleMesh blocks = make_cube(10., 10., 4.);
+    TriangleMesh rear   = make_cube(10., 10., 4.);
+    rear.translate(0., 20., 0.);
+    blocks.merge(rear);
+    const auto        wall_generator = GENERATE("arachne", "classic");
+    const std::string gcode          = slice({blocks}, plain_config({{"wall_generator", wall_generator},
+                                                                     {"wall_sublayer_height", "0.05"},
+                                                                     {"seam_position", "back"}}));
     REQUIRE(! gcode.empty());
 
-    const std::map<double, BoundingBoxf> boxes = bbox_of_type_by_z(gcode, "Outer wall");
-    size_t pass_starts = 0;
+    INFO("wall_generator=" << wall_generator);
+    BoundingBoxf all;
+    for_each_move_of_type(gcode, "Outer wall", [&all](const GCodeReader &self, int) { all.merge(Vec2d(self.x(), self.y())); });
+    // The blocks span 10mm each with a 10mm gap, so the gap is centred on the middle of the whole.
+    const double gap = all.center().y();
+    size_t pass_starts[2] = {0, 0};
     for (const SeamPoint &start : outer_wall_starts(gcode)) {
-        if (start.z <= 0.2 + EPSILON)
+        if (start.z <= 0.2 + EPSILON || on_layer_top(start.z, 0.2))
             continue;
-        ++ pass_starts;
-        INFO("outer wall pass at z " << start.z << " starts at y " << start.y << ", back face at y " << boxes.at(start.z).max.y());
-        CHECK(start.y > boxes.at(start.z).max.y() - 1.);
+        const bool   is_rear   = start.y > gap;
+        const double back_face = is_rear ? all.max.y() : gap - 5.;
+        ++ pass_starts[is_rear];
+        INFO((is_rear ? "rear" : "front") << " block pass at z " << start.z << " starts at y " << start.y << ", back face at y " << back_face);
+        CHECK(start.y > back_face - 1.);
     }
-    REQUIRE(pass_starts > 0);
+    CHECK(pass_starts[0] > 0);
+    CHECK(pass_starts[1] > 0);
 }
 
 TEST_CASE("Every sub-layered pass puts its seam on a painted seam enforcer", "[WallSublayers]")
